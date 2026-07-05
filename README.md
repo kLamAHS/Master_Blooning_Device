@@ -32,11 +32,21 @@ Accessibility + Screen Recording permissions so it can click and screenshot.
 
 ## 2. Game settings
 
-1. Run BTD6 **fullscreen on your primary monitor** (simplest). If you play
-   windowed instead, put the window's `[left, top, width, height]` in pixels
-   into `"region"` in `config.json` (use `locate` to measure the corners).
-2. Settings → Gameplay: turn **Auto Start ON** so rounds flow without the bot
-   needing to press anything between them.
+1. **The bot finds the game window automatically on Windows** — windowed or
+   fullscreen, any resolution (1920×1080 is perfect). It looks for a window
+   whose title contains `BloonsTD6` and locks onto its client area (the game
+   pixels, excluding the title bar). Every command prints what it detected,
+   e.g. `Game area: auto-detected window 'BloonsTD6' -> (0, 0, 1920x1080)` —
+   glance at that line to confirm it grabbed the right thing. If your window
+   title differs (check the title bar or Task Manager), change
+   `"window_title"` in `config.json`. On macOS, or if detection ever fails,
+   play fullscreen or set `"region": [left, top, width, height]` in pixels
+   as a manual override.
+2. Settings → Gameplay: turn **Auto Start ON**, and turn **Disable Nudge
+   Mode ON** — with nudge mode active, a failed placement leaves the ghost
+   in a stuck confirm-state that ignores the cursor, which wrecks the
+   bot's retry-at-the-next-spot behavior (worst for big towers like the
+   super monkey).
 3. Keep default hotkeys (or edit `TOWER_HOTKEYS` in `btd6_bot.py` to match
    yours).
 4. Don't move or resize the window after calibrating — every coordinate
@@ -44,19 +54,22 @@ Accessibility + Screen Recording permissions so it can click and screenshot.
 
 ## 3. Workflow
 
-**Step 1 — find your coordinates.** With the game open on your map:
+**Step 1 — plan coordinates are just hints.** With a mask scanned, `play`
+snaps every placement to the nearest safe green point automatically, and
+upgrades follow their tower — so the template's rough coordinates work
+as-is. To move a tower, nudge its hint toward where you want it (eyeball
+fractions from the preview image, or use `python btd6_bot.py locate` to
+hover for exact values). `locate` is also handy for one-off points like
+`"deselect_point"` in config.json.
 
-```
-python btd6_bot.py locate
-```
-
-Hover over each spot where you want a tower and write down the
-`norm=[x, y]` values. Normalized coordinates (fractions of the game area)
-mean your plan keeps working if you later change resolution.
-
-**Step 2 — edit the plan.** Open `plans/monkey_meadow_easy.json` and replace
-the placeholder coordinates with yours. The strategy notes in the file explain
-the intended build.
+**Step 2 — check the plan.** Open `plans/monkey_meadow_easy.json`. The
+`"mask"` field points at your scanned mask, but it's optional: if it's
+missing, the bot auto-discovers a `masks/*.json` matching the plan's
+`"map"` name (or the only mask present). If no mask can be found at all,
+`play` prints an unmissable warning, because raw un-snapped coordinates
+are how towers end up wrestling with the path. Placement *retries* also
+come from the mask — every retry is a spot the game itself approved
+during the scan.
 
 **Step 3 — check the round OCR.** Load into the map (Monkey Meadow → Easy →
 Standard) but don't start the round, then run:
@@ -65,10 +78,15 @@ Standard) but don't start the round, then run:
 python btd6_bot.py watch
 ```
 
-You want `parsed=1`. If it prints garbage, open `debug/round_crop.png` — if
-the crop doesn't show exactly the round text, nudge the `"round_box"` values
-in `config.json` (`[x, y, width, height]` as fractions of the game area) and
-re-run until it locks on.
+`watch` now **recalibrates every time it starts**: it finds the blue
+settings-gear button (an unmistakable color blob) and derives the counter's
+position from pure geometry — the number always sits at a fixed offset to
+the gear's left — with an OCR pattern search as fallback. Every candidate
+box is verified by an actual stable read (two consecutive matching parses)
+before being saved to `config.json`, so a lucky garbage read can't fake a
+pass. `play` runs the same check before starting, so a run can never launch
+blind. You want `parsed=1`; manual `"round_box"` tweaking should never be
+needed anymore.
 
 **Step 4 — let it play.**
 
@@ -76,10 +94,76 @@ re-run until it locks on.
 python btd6_bot.py play plans/monkey_meadow_easy.json
 ```
 
-Click onto the game window during the 5-second countdown, then hands off.
+On Windows the bot brings the game window to the front by itself and starts
+after a 3-second countdown — completely hands-off. (If auto-focus ever fails,
+it falls back to a 5-second countdown and asks you to click the game.)
 
 **Emergency stop:** slam the mouse into the **top-left corner** of the screen
 (pyautogui's failsafe), or Ctrl+C in the terminal.
+
+## Emergent mode: `scan` finds the spots itself
+
+For the emergent pipeline, no human should be choosing tower spots — and the
+machine doesn't need to "understand" the map to know where it can build,
+because the game already knows. While the bot holds a tower ghost, BTD6
+tints invalid locations red. `scan` exploits that: it takes a clean
+reference screenshot, picks up a ghost (and verifies the game actually
+received the key press — it aborts with a checklist if not), then sweeps
+the cursor across a ~1,000-point grid. At each point it measures how much
+*redder* a ring around the cursor got compared to the clean frame. The
+ring sits outside the monkey's body — fur is brown, which is red-heavy and
+fools naive color checks — and the before/after comparison cancels out red
+map decorations too. Every legal placement gets written out.
+
+```
+python btd6_bot.py scan monkey_meadow                # land spots (dart ghost)
+python btd6_bot.py scan monkey_meadow --tower sub    # add a water pass
+```
+
+Run it with the map loaded and round 1 not yet started (empty map, no bloons
+to confuse the colors). It takes a couple of minutes and produces:
+
+- `masks/monkey_meadow_dart.json` — the list of placeable `[x, y]` points.
+  This is exactly what Stage 2's random-layout generator and the genetic
+  algorithm sample from. One scan per map = full placement knowledge.
+- `debug/scan_monkey_meadow_dart_preview.png` — your screenshot with green
+  dots on placeable points, red on blocked ones. Eyeball it once; if it
+  disagrees with the map, adjust `"scan_red_shift"` in `config.json`
+  (invalid spots typically score 20–60, valid ground near 0; default
+  threshold 12) and rescan — rescanning overwrites the old mask. That
+  30-second glance replaces all the hovering.
+
+The red-tint check is a heuristic, so a stray dot or two near map edges is
+normal — the GA doesn't care, since bad spots just evolve away.
+
+Where does that leave `locate`? It's only needed for hand-written baseline
+plans (your control experiment that proves the clicking pipeline works) and
+for one-off points like `deselect_point`. The emergent pipeline never uses it.
+
+## Stage 2: `farm` — the bot starts learning
+
+`farm` plays **random layouts** end-to-end, unattended: towers on random
+mask points (large-footprint towers like the super monkey only use extra-
+roomy points), random upgrade paths, bought greedily as cash allows so
+timing emerges from the economy. Every episode appends one labeled row to
+`runs_log.jsonl` — layout, final round reached, survived-or-died. That
+file is the training set for the outcome model.
+
+One-time calibration (three clicks worth of `locate`): lose a game on
+purpose and hover the defeat screen's **RESTART** button, press Esc in a
+game and hover the pause menu's **RESTART**, and hover the confirm
+dialog's OK. Put them in `config.json` as `defeat_restart`,
+`pause_restart`, `restart_confirm`. Then:
+
+```
+python btd6_bot.py farm monkey_meadow --episodes 15 --towers 4
+```
+
+Load the map fresh and walk away. Random layouts mostly *die* — that's
+the point: the model needs both classes. Expect early rounds to survive
+and leads/MOABs to filter the weak. After a few dozen episodes across an
+evening or two, the dataset is ready for training, and learned prices
+accumulate as a free side effect.
 
 ## Plan file format
 
@@ -88,18 +172,94 @@ Each entry in `"actions"` fires as soon as the round counter reaches its
 
 | action | fields | what it does |
 |---|---|---|
-| `place` | `tower`, `at` | presses the tower's hotkey, clicks at `at` |
+| `place` | `tower`, `at` | self-verifying placement: waits until affordable, confirms the tower landed, auto-nudges nearby if the exact spot is invalid |
 | `upgrade` | `at`, `path` | clicks the tower, buys `[top, mid, bot]` upgrade tiers |
 | `press` | `key` | presses any key (e.g. `"1"` for an ability) |
 
+Optional fields on any action: `"wait_cash": 2000` blocks until cash reaches
+that amount first (useful before expensive upgrades); `"timeout": 90` changes
+how long a `place` keeps retrying (default 60 s).
+
 `"fast_forward": true` makes the bot toggle triple-speed at the start.
+
+## Troubleshooting
+
+**Keys you press work, keys the bot presses don't.** Unity games (BTD6
+included) read keyboard input at the scan-code level and ignore the
+virtual-key events `pyautogui` sends — the failure is completely silent.
+That's why all input now goes through `pydirectinput`, which sends real
+scan codes. It installs automatically from `requirements.txt` on Windows;
+if you set up before it was added, run `pip install pydirectinput`. The
+bot prints a loud warning at startup if it's missing.
+
+**Hotkeys: BTD6 only.** The wiki's BTD4/BTD5 hotkey tables do **not**
+apply to BTD6 (in BTD5, W is Tack Shooter; in BTD6, W is Boomerang). The
+`TOWER_HOTKEYS` dict already matches BTD6 defaults — verify against your
+own Settings → Hotkeys screen, not old wiki pages.
+
+**Scan shows green dots on the track / everywhere.** That means no ghost
+was held during the sweep — with nothing on the cursor there's no red tint
+anywhere, so everything reads "placeable." The scan now checks for the
+ghost right after pressing the hotkey and aborts with a checklist instead
+of producing a garbage mask.
+
+**Scan shows red dots everywhere (even open grass).** The old detector
+counted red-ish pixels near the cursor, and monkey fur is brown — which is
+red-heavy — so merely holding a monkey looked "invalid." The current
+detector measures the red *shift* on a ring around the cursor versus the
+clean frame, which is immune to fur, red flowers, and crates.
+
+**Scan is speckled with random red/orange on open grass.** Seasonal map
+skins (holiday events) add falling confetti and firework flashes — moving
+red things that pollute frame comparisons. The detector judges each point
+by the *median* per-pixel red-shift and resamples borderline readings, so
+transients can't flip a verdict; if a skin still causes trouble, check the
+game's settings for an option to disable seasonal decorations and rescan.
+
+## Bookkeeping the bot does for you
+
+- **`prices.json` — a self-learned price book.** Every purchase records
+  what it actually cost (cash before minus after), keyed by
+  difficulty/tower/path/tier. Nothing is hardcoded, so game rebalances
+  can't make it wrong. Once a price is learned, upgrades wait for the
+  exact amount before pressing, and `play` prints your plan's total
+  estimated cost at startup with a count of not-yet-learned purchases.
+- **`runs_log.jsonl` — one line per run**: final round reached, outcome
+  (`victory` / `defeat` / `interrupted`), and the full tower layout
+  with each tower's real position and upgrade tiers. Farm episodes also
+  record `lives_by_round` — lives at the start of every round, so the
+  model can learn *which round* a layout leaks on, not just whether it
+  died. Defeat is detected by the lives counter (auto-located from the
+  red heart icon) hitting 0, because the round counter stays visible on
+  the defeat screen and can't be the signal.
+- **Stuck-panel recovery.** Upgrades verify the tower got selected and the
+  panel closed afterwards, deselect clicks go to mask points far from
+  every tower, and if the HUD ever stays dark mid-run the main loop
+  actively clears UI at ~20 s and ~40 s before giving up at ~65 s.
+
+- **`locked.json` — upgrades the bot must not buy.** The bot now reads the
+  upgrade panel *visually* before pressing anything: a green button with a
+  `$` price is buyable (and the price is recorded — no purchase needed), a
+  button showing `XP` is an unlock you haven't bought — recorded here and
+  never pressed, so **your XP is never spent** — and a padlocked
+  `PATH CLOSED` row is remembered per tower. Text the OCR can't confidently
+  read is treated as unpressable, erring on the side of your XP. You can
+  also **pre-seed this file by hand** to reserve XP decisions for yourself:
+  add `"easy:dartling:0:1": true` or any `difficulty:tower:path:tier` key.
+  Because every panel-open harvests all three visible prices, the price
+  book fills fast and menus soon open only to actually buy.
 
 ## Known limitations (a.k.a. why Stage 2 exists)
 
-- **The bot is blind to cash.** If an action fires before you can afford it,
-  the purchase silently fails (the bot right-clicks to clear the stuck tower
-  ghost). Fix: schedule actions a round or two later. Reading the cash number
-  with the same OCR trick is a great first extension.
+- **Placement is now self-verifying.** The round counter is hidden whenever
+  a ghost is held, which the bot uses as a sensor: hotkey pressed but the
+  counter is still visible → no ghost → can't afford yet, so it waits;
+  clicked but the counter stays hidden → ghost stuck → invalid spot, so it
+  cancels and retries a small spiral of nearby offsets. Cash is also read
+  directly (auto-located from the gold coin icon) for `wait_cash` gating
+  and richer logs. **Pick plan coordinates from the GREEN dots** in the
+  scan preview — orange dots are valid but hug an edge, where the tower's
+  footprint may overhang the track.
 - **No defeat detection.** If the defense leaks out, the bot just sits there.
   Detecting the defeat screen (its colors are very distinctive — compare
   screenshots) is exactly the label you need for Stage 2's
