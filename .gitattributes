@@ -1,0 +1,9 @@
+# Store text as LF in the repo; Windows checkouts still get native
+# endings per core.autocrlf. (mk.py was CRLF until 4008db0 silently
+# normalized it -- this file makes endings deliberate instead.)
+* text=auto
+*.py text
+*.json text
+*.md text
+*.png binary
+*.xlsx binary
