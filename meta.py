@@ -373,15 +373,22 @@ class MetaBrain:
             want = {main: main_target, cross: cross_target}
             for p_i, min_tier in need.items():
                 want[p_i] = max(want.get(p_i, 0), min_tier)
-            # Two-path rule: only one path past tier 2.
+            # Two-path rule: only one path past tier 2. A threat answer
+            # that itself needs tier 3+ (e.g. Signal Flare) outranks the
+            # carry main; tier-2 needs survive being capped anyway.
             deep = [p for p, t in want.items() if t > 2]
             if len(deep) > 1:
-                keep = main if main in deep else deep[0]
+                deep_need = [p for p in deep if need.get(p, 0) > 2]
+                keep = deep_need[0] if deep_need else \
+                    (main if main in deep else deep[0])
                 for p in deep:
                     if p != keep:
                         want[p] = 2
             if len(want) > 2:                     # at most two open paths
-                keep = sorted(want, key=lambda p: -want[p])[:2]
+                # Never trim away a threat-coverage path: a dropped camo
+                # answer is exactly how layouts die blind at round 24.
+                keep = sorted(want, key=lambda p: (0 if p in need else 1,
+                                                   -want[p]))[:2]
                 want = {p: want[p] for p in keep}
             tiers = {p: 0 for p in want}
             for p_i in sorted(want):
@@ -442,7 +449,10 @@ class MetaBrain:
                     t["path"] = [0, 0, 0]
                     mutations.append(f"swap:{old}->{alt}")
             elif roll < 0.47:                     # push the build deeper
-                path = t.get("path") or [0, 0, 0]
+                # list() matters: dict(t) was a shallow copy, so without
+                # it this would mutate the history row's own path list
+                # and corrupt the elite pool for every later episode.
+                path = list(t.get("path") or [0, 0, 0])
                 main = path.index(max(path)) if max(path) else \
                     self._pick_build(rng, t["tower"])[0]
                 path[main] = min(5, max(path[main], 0) + rng.randint(1, 2))
@@ -504,9 +514,9 @@ class MetaBrain:
         kinds = ", ".join(g["tower"] for g in places)
         s = self.last_strategy
         extra = ""
-        if s.get("mutations"):
+        if "mutations" in s:
             extra = f" [{', '.join(s['mutations'])}]" if s["mutations"] \
-                else " [no mutations]"
+                else " [clone, no mutations]"
         elif s.get("roles"):
             extra = f" [{', '.join(s['roles'])}]"
         return (f"   strategy={s.get('kind', '?')}{extra}\n"
@@ -638,7 +648,11 @@ def _selftest():
     assert ta / (ta + tb) > 0.85, "tack posterior should be high"
     assert da / (da + db) < 0.35, "dart posterior should have dropped"
 
-    # Evolution engages once elites exist, and produces valid genomes.
+    # Evolution engages once elites exist, produces valid genomes, and
+    # never mutates the history rows it breeds from (the elite pool must
+    # stay exactly what was actually played and logged).
+    frozen = json.dumps([r["towers"] for _rw, r in brain.elites()],
+                        sort_keys=True)
     kinds = set()
     for i in range(60):
         g = brain.next_genome(rng, 4, pools, tower_pool=pool)
@@ -646,6 +660,9 @@ def _selftest():
         assert any(x["do"] == "place" for x in g)
     assert "evolve" in kinds or "crossover" in kinds, \
         f"evolution never engaged: {kinds}"
+    assert json.dumps([r["towers"] for _rw, r in brain.elites()],
+                      sort_keys=True) == frozen, \
+        "evolution mutated the history rows it bred from"
 
     # Position learning: successful bucket beats the dead one.
     good = brain.pos_post.get(_bucket([0.3, 0.3]))
@@ -676,7 +693,7 @@ def _selftest():
             elif req != "absent" and tiers.get((ref, req[0]), 0) >= req[1]:
                 ok = True
         misses += 0 if ok else 1
-    assert misses <= 2, f"camo uncovered in {misses}/50 exploit genomes"
+    assert misses == 0, f"camo uncovered in {misses}/50 exploit genomes"
 
     print("selftest OK: genome format, two-path rule, exploration floor,")
     print("posterior learning, evolution engagement, spot learning, and")
