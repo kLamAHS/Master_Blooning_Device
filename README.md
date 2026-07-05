@@ -360,6 +360,21 @@ game's settings for an option to disable seasonal decorations and rescan.
   can't make it wrong. Once a price is learned, upgrades wait for the
   exact amount before pressing, and `play` prints your plan's total
   estimated cost at startup with a count of not-yet-learned purchases.
+  **Poisoned prices heal themselves:** any price that wasn't verified in
+  the current session (loaded from disk, or read off a red row) gets
+  re-checked visually after ~45 s of blocking a buy — one menu open, and
+  a green-row sighting overwrites the bad value (a `$210` recorded as
+  `$2105` no longer gates the upgrade forever).
+- **Money-failure watermarks are misread-proof.** When a buy fails on
+  cash, the bot notes the cash level and holds spending until income
+  clears it — but the noted level is capped at the item's known price
+  (being broke for a `$110` upgrade *means* cash < $110, whatever the
+  counter OCR claims), and every watermark expires after 40 s. A junk
+  read like `$6005` when the real cash is `$600` can stall buys for
+  seconds, not rounds. A press that "didn't take" on a green (affordable)
+  row also re-reads the row itself before judging: if the row moved on to
+  the next tier, the purchase actually landed and the cash reads were
+  noise.
 - **`runs_log.jsonl` — one line per run**: final round reached, outcome
   (`victory` / `defeat` / `interrupted`), and the full tower layout
   with each tower's real position and upgrade tiers. Farm episodes also

@@ -974,9 +974,11 @@ def read_cash(screen, cfg):
 
 def read_cash_confirmed(screen, cfg):
     """Two reads that must corroborate: equal -> that value; one a clean
-    SUFFIX of the other (prepended-junk signature) -> the shorter; else
-    None. Used where a single bad read does lasting damage (watermarks,
-    price recording)."""
+    AFFIX of the other -> the shorter. A junk glyph can attach at either
+    end of the digit run ('851' inside '6851' = prepended, '600' inside
+    '6005' = appended), and both signatures poison watermarks the same
+    way, so both resolve to the shorter read. Else None. Used where a
+    single bad read does lasting damage (watermarks, price recording)."""
     a = read_cash(screen, cfg)
     time.sleep(0.15)
     b = read_cash(screen, cfg)
@@ -985,9 +987,9 @@ def read_cash_confirmed(screen, cfg):
     if a == b:
         return a
     sa, sb = str(a), str(b)
-    if sa.endswith(sb):
+    if sa.endswith(sb) or sa.startswith(sb):
         return b
-    if sb.endswith(sa):
+    if sb.endswith(sa) or sb.startswith(sa):
         return a
     return None
 
@@ -1782,10 +1784,32 @@ def act_upgrade(screen, cfg, action, tower=None, timeout=8):
                     tower["path"][i] += 1
             else:
                 if info and info[0] == "cash":
-                    # The row VISUALLY showed a cash price, so a press that
-                    # moves nothing means we couldn't afford it (likely a
-                    # bad price read, e.g. '$' OCR'd as '5') -- it is NOT
-                    # an XP lock, and marking it as one would be poison.
+                    # A GREEN row is the game itself saying "affordable",
+                    # and the no-move verdict rests on the same cash reads
+                    # that misread in the first place. Ask the ROW before
+                    # judging: if its price/state moved on, the purchase
+                    # actually landed and the cash reads were noise --
+                    # missing that would desync the tier tracking AND
+                    # poison the watermark.
+                    re_read = None
+                    if side:
+                        scan = scan_panel_rows(screen, side)
+                        re_read = (scan or {}).get(i) \
+                            or read_upgrade_row(screen, side, i)
+                    if re_read is not None and re_read[0] != "unread" \
+                            and re_read != info:
+                        dbg(f"cash read missed a landed buy (path {i + 1}:"
+                            f" row moved {info} -> {re_read})")
+                        if pkey and info[1]:
+                            record_price(pkey, info[1], src="seen")
+                        if tower:
+                            tower["path"][i] += 1
+                        if rows is not None:
+                            rows[i] = re_read
+                        continue
+                    # Row unchanged: the press really didn't take (stale
+                    # green after cash dropped, or an input hiccup) --
+                    # NOT an XP lock; marking it locked would be poison.
                     dbg(f"press didn't take on a cash row (path {i + 1}) "
                         f"-- treating as broke")
                     status = "broke"
@@ -2316,7 +2340,31 @@ def run_episode(screen, cfg, genome, final_round, abort_lives=50):
     queue = list(genome)
     landed_by_ref, towers = {}, {}
     lives_by_round = {}
-    broke_at = [None]     # cash watermark: level of the last money-failure
+    broke_at = [None, 0.0]   # cash watermark: level + time of last set
+
+    def set_watermark(price=None):
+        """Record the cash level of a money-failure. Being broke for a
+        KNOWN price means cash < price BY DEFINITION, so the watermark is
+        capped at price-5 -- a junk read like $6005 (real $600) can then
+        never freeze the whole build behind an unreachable level."""
+        lvl = read_cash_confirmed(screen, cfg)
+        if price and (lvl is None or lvl >= price):
+            lvl = price - 5
+        broke_at[0] = lvl
+        broke_at[1] = time.time()
+
+    def watermark_holds(cash):
+        """Should this buy wait for income to grow past the watermark?
+        Watermarks EXPIRE after 40s: income only rises, so a hold that
+        old has done its job -- and if the level itself was a misread,
+        expiry is what un-sticks the run (each item also has its own
+        _wake cooldown, so retries stay cheap)."""
+        if broke_at[0] is None or cash is None:
+            return False
+        if time.time() - broke_at[1] > 40:
+            broke_at[0] = None
+            return False
+        return cash <= broke_at[0] + 100
     round_seen_at = time.time()   # for the frozen-defeat-screen net
     observing = False             # queue empty: just watching the run
     # Safe deselect spots for THIS episode: mask points farthest from every
@@ -2425,8 +2473,7 @@ def run_episode(screen, cfg, genome, final_round, abort_lives=50):
                         item["_dbg"] = msg
                         dbg(msg)
                     item["_wake"] = time.time() + 3    # saving up: silent
-                elif broke_at[0] is not None and cash is not None \
-                        and cash <= broke_at[0] + 100:
+                elif watermark_holds(cash):
                     msg = f"{ttype}: watermark hold (${cash} <= " \
                           f"${broke_at[0]}+100)"
                     if item.get("_dbg") != msg:
@@ -2449,7 +2496,7 @@ def run_episode(screen, cfg, genome, final_round, abort_lives=50):
                         queue.pop(idx)
                         broke_at[0] = None
                     elif st == "broke":
-                        broke_at[0] = read_cash_confirmed(screen, cfg)
+                        set_watermark(base)
                         item["_wake"] = time.time() + 5
                     else:                              # no_spot: real fail
                         item["_fails"] = item.get("_fails", 0) + 1
@@ -2494,13 +2541,17 @@ def run_episode(screen, cfg, genome, final_round, abort_lives=50):
                             dbg(msg)
                         item["_saving"] = item.get("_saving", time.time())
                         pk = price_key(ttype, pi, tier)
-                        if PRICES_SRC.get(pk) == "short" \
+                        if PRICES_SRC.get(pk) not in ("seen", "buy") \
                                 and time.time() - item["_saving"] > 45 \
-                                and not item.get("_rechecked"):
-                            # Unverified red-read price: one menu open to
-                            # re-read it -- a green sighting overwrites and
-                            # heals a poisoned value (e.g. $340 -> $7340).
-                            item["_rechecked"] = True
+                                and time.time() >= item.get("_recheck_at",
+                                                            0):
+                            # This price was never verified THIS session
+                            # (red-row read, or loaded from prices.json --
+                            # possibly poisoned, e.g. $210 recorded as
+                            # $2105 gates the buy forever). One menu open
+                            # re-reads it; a green sighting overwrites and
+                            # heals. Repeats every 60s while still stuck.
+                            item["_recheck_at"] = time.time() + 60
                             dbg(f"{ttype} path{pi + 1}: re-checking "
                                 f"unverified ${known}")
                             st = act_upgrade(screen, cfg,
@@ -2521,7 +2572,7 @@ def run_episode(screen, cfg, genome, final_round, abort_lives=50):
                             item["_wake"] = time.time() + 3
                     elif broke_at[0] is not None \
                             and (cash := read_cash(screen, cfg)) is not None \
-                            and cash <= broke_at[0] + 100:
+                            and watermark_holds(cash):
                         msg = (f"{ttype} path{pi + 1}: watermark hold "
                                f"(${cash} <= ${broke_at[0]}+100)")
                         if item.get("_dbg") != msg:
@@ -2539,7 +2590,8 @@ def run_episode(screen, cfg, genome, final_round, abort_lives=50):
                         elif st in ("locked", "closed"):
                             queue.pop(idx)     # recorded; done with it
                         elif st == "broke":
-                            broke_at[0] = read_cash_confirmed(screen, cfg)
+                            set_watermark(
+                                PRICES.get(price_key(ttype, pi, tier)))
                             item["_fails"] = item.get("_fails", 0) + 1
                             item["_wake"] = time.time() + min(
                                 10 * 2 ** (item["_fails"] - 1), 60)
