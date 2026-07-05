@@ -34,15 +34,26 @@ RUNS_PATH = Path(__file__).parent / "runs_log.jsonl"
 # experience outweighs the spreadsheet.
 PRIOR_STRENGTH = 6.0
 
+# Version handshake with mk.py. A stale meta.py sitting next to a newer
+# mk.py (mixed zip extractions, leftover __pycache__) once CRASHED every
+# episode with a TypeError; mk.py now checks this and degrades politely.
+META_API = 3
+
 # Rough base-cost rank (medium prices) used ONLY to order purchases when
 # the learned price book hasn't seen a tower yet. Being off by $100 just
 # reorders two buys; the greedy executor still waits for real cash.
 ROUGH_COST = {
     "dart": 200, "glue": 275, "tack": 280, "boomerang": 325, "sniper": 350,
     "wizard": 400, "druid": 425, "engineer": 450, "ice": 500, "ninja": 500,
-    "bomb": 525, "alchemist": 550, "mortar": 750, "spike": 1000,
-    "village": 1200, "super": 2500,
+    "bomb": 525, "alchemist": 550, "hero": 600, "mortar": 750,
+    "spike": 1000, "village": 1200, "super": 2500,
 }
+
+# The hero isn't in the knowledge base's tower table (which hero is
+# equipped is chosen in the menu, invisible to the bot), so placement
+# uses this profile: short-range coverage suits Sauda -- the sheet's
+# low-micro early anchor -- and is a sane default for most heroes.
+HERO_PLACEMENT = {"range": 0.045, "style": "coverage"}
 
 # Rough cost of an upgrade TIER, for scheduling and cash reserves when
 # the price book hasn't learned the real number yet. Coarse on purpose:
@@ -57,7 +68,8 @@ def earned_by(r):
     return 650 + 25 * r + 11 * r * r
 
 
-def choose_buy(queue, cur_round, cash, cost_of, now, emergency=False):
+def choose_buy(queue, cur_round, cash, cost_of, now, emergency=False,
+               gate_ok=None):
     """The economy policy: which pending buy may spend money right now?
 
     - Buys unlock at their scheduled "round" (a good player doesn't dump
@@ -69,20 +81,35 @@ def choose_buy(queue, cur_round, cash, cost_of, now, emergency=False):
       big thing is affordable later.
     - A leak emergency drops all gates: buy any affordable defense NOW.
 
+    - When cash comfortably exceeds every due obligation, the NEXT
+      scheduled buy unlocks early: the income model paces the plan, but
+      a rich run accelerates and a poor run waits -- reality decides.
+
     Items missing round/prio (the old uniform-random genomes) default to
     round 0 / prio 1, which reproduces the old first-awake behavior.
     Returns an index into queue, or None to hold every wallet."""
     head_prio = head_cost = None
     for j, it in enumerate(queue):
-        if it.get("round", 0) > cur_round and not emergency:
-            continue
         prio = it.get("prio", 1)
         awake = it.get("_wake", 0) <= now
+        if not emergency and gate_ok is not None and not gate_ok(it):
+            continue        # conditional buy whose condition isn't met
         if emergency:
             if not awake:
                 continue
             c = cost_of(it)
             if cash is None or c is None or c <= cash:
+                return j
+            continue
+        if it.get("round", 0) > cur_round:
+            # Ahead of schedule: allowed only when today's obligations
+            # are covered -- cash must hold the head's reserve AND this
+            # buy in full.
+            if not awake:
+                continue
+            c = cost_of(it)
+            if c is not None and cash is not None \
+                    and cash - c >= (head_cost or 0):
                 return j
             continue
         if head_prio is None:
@@ -131,6 +158,27 @@ ASPECT = 9.0 / 16.0
 
 def _dist(a, b):
     return math.hypot(a[0] - b[0], (a[1] - b[1]) * ASPECT)
+
+
+# Minimum spacing between planned towers, in width-fractions. A tower
+# footprint is ~0.013 wide-radius, so two centers need ~0.028 -- the old
+# 0.015 planned towers ON TOP of each other and the executor burned a
+# minute of retries discovering the game wouldn't allow it.
+SEP = 0.028
+SEP_LARGE = 0.045
+
+
+def _spread(cands, taken, sep):
+    """Candidates at least sep away from every taken spot; if none
+    qualify, the single candidate FARTHEST from the layout (never an
+    overlapping one at random)."""
+    free = [c for c in cands
+            if all(_dist(c, t) >= sep for t in taken)]
+    if free:
+        return free
+    if not taken or not cands:
+        return cands
+    return [max(cands, key=lambda c: min(_dist(c, t) for t in taken))]
 
 
 class TrackModel:
@@ -246,7 +294,7 @@ class TrackModel:
 
 class MetaBrain:
     def __init__(self, map_name, difficulty, target_round=40,
-                 explore=0.30, evolve=True, knowledge=None, runs_path=None):
+                 explore=0.20, evolve=True, knowledge=None, runs_path=None):
         self.map_name = map_name
         self.difficulty = difficulty
         self.target = max(int(target_round), 1)
@@ -354,6 +402,9 @@ class MetaBrain:
                         if c in partners
                         or ttype in self.towers.get(c, {}).get("partners", []))
             w *= 1.0 + 0.25 * mates
+            # Sharply diminishing returns on duplicates: a second glue
+            # is occasionally right, a third 000 glue never is.
+            w *= 0.3 ** sum(1 for c in chosen if c == ttype)
             if w > best_w:
                 best, best_w = ttype, w
         return best
@@ -375,10 +426,7 @@ class MetaBrain:
         if not pool:
             return None
         cands = [rng.choice(pool) for _ in range(min(30, len(pool)))]
-        free = [c for c in cands
-                if all((c[0] - t[0]) ** 2 + (c[1] - t[1]) ** 2 > 0.02 ** 2
-                       for t in taken)]
-        cands = free or cands
+        cands = _spread(cands, taken, SEP_LARGE if large else SEP)
         if rng.random() < self.explore or not self.pos_post:
             return list(rng.choice(cands))
         best, best_w = None, -1.0
@@ -401,9 +449,14 @@ class MetaBrain:
         for debuffers, buff adjacency for alch/village, late track for
         spikes, remoteness for global towers -- multiplied by the learned
         per-region posterior, so experience still bends the geometry."""
-        if track is None or not track.ok or rng.random() < self.explore:
+        if track is None or not track.ok:
+            self._last_spot_src = "no-track"
             return self._pick_spot(rng, pools, taken, large=large)
-        prof = self.towers.get(ttype, {}).get("placement") or {}
+        if rng.random() < self.explore:
+            self._last_spot_src = "explore"
+            return self._pick_spot(rng, pools, taken, large=large)
+        prof = self.towers.get(ttype, {}).get("placement") \
+            or (HERO_PLACEMENT if ttype == "hero" else {})
         style = prof.get("style", "coverage")
         r = prof.get("range") or 0.06
         if large:
@@ -413,7 +466,7 @@ class MetaBrain:
                 or pools.get("all") or []
         if not base:
             return None
-        cands = [rng.choice(base) for _ in range(min(50, len(base)))]
+        cands = [rng.choice(base) for _ in range(min(70, len(base)))]
         if style == "buddy" and placed:
             # A random sample can easily miss the small disc around the
             # teammates a buffer exists to stand in -- guarantee the
@@ -424,9 +477,7 @@ class MetaBrain:
             if nearby:
                 cands = [rng.choice(nearby)
                          for _ in range(min(30, len(nearby)))] + cands[:20]
-        free = [c for c in cands
-                if all(_dist(c, t) > 0.015 for t in taken)]
-        cands = free or cands
+        cands = _spread(cands, taken, SEP_LARGE if large else SEP)
 
         # The carry anchors the geometry for debuffers and buffers.
         carries = set(self.roles.get("carry", []))
@@ -471,11 +522,24 @@ class MetaBrain:
                 s = 1.0 / (1.0 + 40.0 * track.exposure(c, 0.06))
             else:                                    # coverage
                 s = exp
-            s *= 0.5 + self._pos_theta(rng, c)
+                if track.oriented:
+                    sp = track.span(c, r)
+                    if sp:
+                        # All else equal, kill bloons EARLY: damage near
+                        # the entry leaves room for error; a defense
+                        # camped at the exit pops with zero margin.
+                        s *= 1.25 - 0.50 * sp[1]
+            # Learned-region posterior nudges the score +/-20%. (It once
+            # swung 0.5x-1.5x, which drowned out the small absolute
+            # exposure differences of short-range towers -- heroes were
+            # landing on 1%-coverage spots on pure noise.)
+            s *= 0.8 + 0.4 * self._pos_theta(rng, c)
             if s > best_s:
                 best, best_s = c, s
         if best is None:
+            self._last_spot_src = "fallback"
             return self._pick_spot(rng, pools, taken, large=large)
+        self._last_spot_src = "style"
         return list(best)
 
     def _placement_order(self, picks):
@@ -551,7 +615,7 @@ class MetaBrain:
             best = max(solver_types, key=lambda t: self._theta(rng, t))
             carries = set(self.roles.get("carry", []))
             for i in range(len(picks) - 1, -1, -1):
-                if picks[i][0] not in carries:
+                if picks[i][0] not in carries and picks[i][0] != "hero":
                     picks[i] = (best, picks[i][1])
                     req = solvers[best]
                     if req is not None:
@@ -578,40 +642,47 @@ class MetaBrain:
 
     def next_genome(self, rng, n_towers, pools, is_locked=None,
                     large_towers=frozenset(), tower_pool=None,
-                    price_of=None, track=None):
+                    price_of=None, track=None, hero=False):
         """Produce a buy list in run_episode's format. Rolls between a
         fresh meta-templated layout and an evolution of an elite one.
-        `track` (a TrackModel) turns on geometry-aware placement."""
+        `track` (a TrackModel) turns on geometry-aware placement; `hero`
+        adds the equipped hero as an early anchor placement."""
         is_locked = is_locked or (lambda *a: False)
         elites = self.elites() if self.evolve else []
         p_evolve = min(0.5, len(elites) / 10.0) if len(elites) >= 3 else 0.0
         if rng.random() < p_evolve:
             genome = self._evolved_genome(rng, n_towers, pools, is_locked,
                                           large_towers, tower_pool, elites,
-                                          track)
+                                          track, hero)
             if genome:
                 return genome
         return self._fresh_genome(rng, n_towers, pools, is_locked,
-                                  large_towers, tower_pool, price_of, track)
+                                  large_towers, tower_pool, price_of,
+                                  track, hero)
 
-    def _role_slots(self, n):
-        base = ["opener", "carry", "amplifier", "control"]
+    def _role_slots(self, n, hero=False):
+        """Roles for n tower slots. With a hero anchoring, the hero IS
+        the opener -- a separate cheap opener would just split cash away
+        from the carry's first tiers (the second-boomerang trap)."""
         if n <= 0:
             return []
+        if hero:
+            slots = ["carry", "amplifier", "control", "free"]
+            return slots[:n] + ["free"] * max(0, n - 4)
+        slots = ["opener", "carry", "amplifier", "control"]
         if n == 1:
             return ["carry"]
-        if n == 2:
-            return ["opener", "carry"]
-        if n == 3:
-            return ["opener", "carry", "amplifier"]
-        return base + ["free"] * (n - 4)
+        return slots[:n] + ["free"] * max(0, n - 4)
 
     def _fresh_genome(self, rng, n_towers, pools, is_locked,
-                      large_towers, tower_pool, price_of, track=None):
+                      large_towers, tower_pool, price_of, track=None,
+                      hero=False):
         pool = list(tower_pool or
                     [t for t in self.towers if t in ROUGH_COST])
         picks = []       # [(ttype, role), ...]
-        for role in self._role_slots(n_towers):
+        if hero:
+            picks.append(("hero", "hero"))   # free scaling: always early
+        for role in self._role_slots(n_towers, hero=hero):
             cands = pool if role == "free" else \
                 [t for t in self.roles.get(role, []) if t in pool] or pool
             ttype = self._pick_tower(rng, cands, [t for t, _ in picks])
@@ -655,6 +726,17 @@ class MetaBrain:
             e["round"] = min(r, max(1, self.target - 2))
             if e["do"] == "place":
                 place_round[e["ref"]] = e["round"]
+        # A threat-capped upgrade drags its tower's BASE forward too --
+        # a camo upgrade due by r22 is useless on a tower placed at r25.
+        min_by = {}
+        for e in entries:
+            if e.get("by"):
+                min_by[e["ref"]] = min(min_by.get(e["ref"], 99),
+                                       max(1, e["by"]))
+        for e in entries:
+            if e["do"] == "place" and e["ref"] in min_by:
+                e["round"] = min(e["round"], min_by[e["ref"]])
+                place_round[e["ref"]] = e["round"]
         for e in entries:
             if e["do"] == "upgrade":
                 e["round"] = max(e["round"], place_round.get(e["ref"], 1))
@@ -670,7 +752,7 @@ class MetaBrain:
         Spots are assigned in placement order (carry anchors, buffers
         last); places go cheapest-first (early rounds need towers NOW);
         upgrades are sorted by threat deadline with noise for variety."""
-        spots = {}
+        spots, spot_src = {}, {}
         taken, placed_ctx = [], []
         for i in self._placement_order(picks):
             ttype = picks[i][0]
@@ -679,6 +761,7 @@ class MetaBrain:
             if spot is None:
                 continue
             spots[i] = spot
+            spot_src[i] = getattr(self, "_last_spot_src", "?")
             taken.append(spot)
             placed_ctx.append((ttype, spot))
         placed = []      # (ref, ttype, spot, main, cross, label)
@@ -706,12 +789,68 @@ class MetaBrain:
             return TIER_EST.get(tier, 800)
 
         placed.sort(key=lambda p: (base_cost(p[1]), p[0]))
-        entries = []
+        # Upgrade-first economics: a good player does NOT drop four bases
+        # and then start upgrading. The hero and opener anchor, the carry
+        # base follows, then the carry's first tiers -- support bases and
+        # everything else joins the plan AFTER the carry has teeth.
+        place_plan = {"hero": (0, 1.0), "opener": (0, 2.0),
+                      "carry": (0, 3.0), "amplifier": (1, 9.0),
+                      "control": (1, 13.0), "free": (2, 17.0)}
+        # A tower whose BASE answers a threat (ninja = camo, bomb = lead)
+        # must be down before that threat, whatever its role's pacing
+        # says -- the same hard "by" cap upgrades get.
+        base_by = {}
+        for kind in ("camo", "lead"):
+            first = min((r for t in self.threats if t["kind"] == kind
+                         for r in t["rounds"]), default=None)
+            if first is None or first > self.target:
+                continue
+            sol = self.solutions.get(kind, {})
+            for i, (tt, _role) in enumerate(picks):
+                if tt in sol and sol[tt] is None:
+                    base_by[i] = min(base_by.get(i, 99), first - 2)
+                    break
+        # Tower identity: every place gets an unambiguous name so logs
+        # read "boomerang#1(carry) bottom t2", never "upgrade ref2".
+        carry_order = next((o for o, (r, *_x) in enumerate(placed)
+                            if picks[r][1] == "carry"), None)
+        entries, spot_notes = [], []
         for order, (ref, ttype, spot, main, cross, label) in enumerate(placed):
-            entries.append({"do": "place", "tower": ttype,
-                            "at": [spot[0], spot[1]], "ref": order,
-                            "prio": 0, "deadline": 1.0,
-                            "est": base_cost(ttype)})
+            role = picks[ref][1]
+            p_prio, p_dl = place_plan.get(role, (1, 12.0))
+            name = f"{ttype}#{order}({role})"
+            if track and track.ok:
+                prof = self.towers.get(ttype, {}).get("placement") \
+                    or (HERO_PLACEMENT if ttype == "hero" else {})
+                r_t = prof.get("range") or 0.06
+                sp = track.span(spot, r_t)
+                cov = (f"covers path {sp[0]:.2f}-{sp[2]:.2f} "
+                       f"({track.exposure(spot, r_t):.0%} of track)"
+                       if sp else "NO track in range")
+                src = spot_src.get(ref)
+                if src == "explore":
+                    cov += "  [exploration pick]"
+                elif src == "fallback":
+                    cov += "  [no scored spot -- random]"
+                spot_notes.append(
+                    f"{name} @ [{spot[0]:.2f},{spot[1]:.2f}]  {cov}")
+            entry = {"do": "place", "tower": ttype,
+                     "at": [spot[0], spot[1]], "ref": order,
+                     "name": name,
+                     "prio": p_prio, "deadline": p_dl,
+                     "est": base_cost(ttype)}
+            if ref in base_by:
+                entry["by"] = base_by[ref]
+            if role in ("amplifier", "control", "free") \
+                    and carry_order is not None:
+                # Conditional support: these bases wait until the carry
+                # is stable (main path t3). A threat date ("by") or a
+                # leak emergency still overrides -- support arrives when
+                # NEEDED, not on a timer.
+                entry["gate"] = {"ref": carry_order, "tier": 3}
+            entries.append(entry)
+            if ttype == "hero":
+                continue          # heroes level up on their own: no buys
             need = needs.get(ref, {})
             main_target = 5 if rng.random() < 0.10 else rng.randint(3, 4)
             cross_target = rng.randint(1, 2)
@@ -742,23 +881,35 @@ class MetaBrain:
                     vec = [0, 0, 0]
                     vec[p_i] = 1
                     is_need = tier <= need.get(p_i, 0)
+                    early_carry = (role == "carry" and p_i == main
+                                   and tier <= 3)
                     dl = self._deadline(ttype, main, p_i, tier, need)
+                    if early_carry:
+                        # The carry's first tiers outrank every support
+                        # BASE: upgrade the tower you have before buying
+                        # three more. Tight noise -- these must not
+                        # leapfrog the opener/carry bases themselves.
+                        dl = 2.0 + 3.0 * tier
+                    noise = 1.0 if early_carry else 4.0
                     entry = {
                         "do": "upgrade", "ref": order, "path": vec,
-                        "prio": 0 if is_need else (1 if p_i == main else 2),
-                        "deadline": dl + rng.uniform(-4, 4),
+                        "prio": 0 if (is_need or early_carry)
+                        else (1 if p_i == main else 2),
+                        "deadline": dl + rng.uniform(-noise, noise),
                         "est": tier_cost(ttype, p_i, tier)}
                     if is_need:
-                        entry["by"] = dl   # HARD cap: before the threat
+                        entry["by"] = int(dl)  # HARD cap: pre-threat
                     entries.append(entry)
         genome = self._schedule(entries)
-        meta = {"builds": [f"{t} {l}" for _r, t, _s, _m, _c, l in placed]}
+        meta = {"builds": [f"{t} {l}" for _r, t, _s, _m, _c, l in placed],
+                "spots": spot_notes}
         return genome, meta
 
     # --------------------------------------------------------- evolution
 
     def _evolved_genome(self, rng, n_towers, pools, is_locked,
-                        large_towers, tower_pool, elites, track=None):
+                        large_towers, tower_pool, elites, track=None,
+                        hero=False):
         """Mutate (and sometimes cross over) the best layouts found so
         far. This is where genuinely emergent tactics come from: the
         parents are the bot's own discoveries, and mutations are free to
@@ -779,9 +930,25 @@ class MetaBrain:
                      f"+r{other.get('final_round')})")
         if not towers:
             return None
+        # Crossover (and old stacked-parent rows) can put two towers on
+        # the same spot -- the game refuses that, so prune here.
+        pruned = []
+        for t in towers:
+            if all(_dist(t["at"], u["at"]) >= SEP for u in pruned):
+                pruned.append(t)
+        towers = pruned
+        if hero and not any(t["tower"] == "hero" for t in towers):
+            others = [(x["tower"], x["at"]) for x in towers]
+            spot = self._spot_for(rng, "hero", pools,
+                                  [s for _, s in others], others, track)
+            if spot:
+                towers.insert(0, {"tower": "hero", "at": spot,
+                                  "path": [0, 0, 0]})
         mutations = []
         for t in towers:
             roll = rng.random()
+            if t["tower"] == "hero" and roll >= 0.20:
+                continue    # the hero may relocate, never morph
             if roll < 0.20:                       # relocate (style-aware)
                 others = [(x["tower"], x["at"]) for x in towers
                           if x is not t]
@@ -834,8 +1001,11 @@ class MetaBrain:
         for order, t in enumerate(towers):
             entries.append({"do": "place", "tower": t["tower"],
                             "at": list(t["at"]), "ref": order,
+                            "name": f"{t['tower']}#{order}(evolved)",
                             "prio": 0, "deadline": 1.0,
                             "est": ROUGH_COST.get(t["tower"], 600)})
+            if t["tower"] == "hero":
+                continue          # heroes level up on their own: no buys
             path = t.get("path") or [0, 0, 0]
             if max(path) == 0:
                 main, cross, _ = self._pick_build(rng, t["tower"])
@@ -873,7 +1043,7 @@ class MetaBrain:
     def describe_genome(self, genome):
         places = [g for g in genome if g["do"] == "place"]
         ups = sum(1 for g in genome if g["do"] == "upgrade")
-        kinds = ", ".join(g["tower"] for g in places)
+        kinds = ", ".join(g.get("name") or g["tower"] for g in places)
         s = self.last_strategy
         extra = ""
         if "mutations" in s:
@@ -882,8 +1052,11 @@ class MetaBrain:
         elif s.get("roles"):
             extra = f" [{', '.join(s['roles'])}]"
         spots = f" spots={s['placement']}" if s.get("placement") else ""
-        return (f"   strategy={s.get('kind', '?')}{spots}{extra}\n"
-                f"   layout: {kinds} (+{ups} upgrades)")
+        out = (f"   strategy={s.get('kind', '?')}{spots}{extra}\n"
+               f"   layout: {kinds} (+{ups} upgrades)")
+        for note in s.get("spots", []):
+            out += f"\n      {note}"
+        return out
 
     def report(self, track=None, mask_points=None):
         lines = [f"MetaBrain report -- map '{self.map_name}', "
@@ -1096,11 +1269,21 @@ def _selftest():
                  "buddy": 0, "buddy_near": 0,
                  "glue": 0, "glue_upstream": 0}
         carries = set(k["roles"]["carry"])
+        min_gap, triples = 9.9, 0
         for i in range(60):
             g = b3.next_genome(rng, 4, tpools, tower_pool=pool,
                                track=track)
             here = {x["ref"]: (x["tower"], x["at"]) for x in g
                     if x["do"] == "place"}
+            pts_here = [at for _t, at in here.values()]
+            for ai in range(len(pts_here)):
+                for bi in range(ai + 1, len(pts_here)):
+                    min_gap = min(min_gap,
+                                  _dist(pts_here[ai], pts_here[bi]))
+            counts = {}
+            for t, _at in here.values():
+                counts[t] = counts.get(t, 0) + 1
+            triples += any(v >= 3 for v in counts.values())
             spots = {t: at for t, at in here.values()}
             carry = next((t for t, _ in here.values() if t in carries),
                          None)
@@ -1127,6 +1310,10 @@ def _selftest():
                         stats["glue"] += 1
                         if gs[1] <= cs[1] + 0.06:
                             stats["glue_upstream"] += 1
+        assert min_gap >= SEP - 1e-9, \
+            f"towers planned {min_gap:.3f} apart -- stacked on each other"
+        assert triples == 0, \
+            f"{triples} exploit layouts stacked 3+ copies of one tower"
         assert stats["carry_prime"] >= 0.8 * stats["carry"], \
             f"carries not on prime real estate: {stats}"
         assert stats["buddy_near"] >= 0.8 * max(stats["buddy"], 1), \
@@ -1153,8 +1340,10 @@ def _selftest():
                 est=250)]
     assert choose_buy(q, 1, 700, est, now) == 0, "awake head must go first"
     q[0]["_wake"] = now + 30
-    assert choose_buy(q, 1, 700, est, now) is None, \
-        "future-round items must wait"
+    assert choose_buy(q, 1, 700, est, now) == 1, \
+        "rich runs unlock the next scheduled buy early"
+    assert choose_buy(q, 1, 400, est, now) is None, \
+        "future buys wait when the reserve isn't covered"
     assert choose_buy(q, 5, 700, est, now) == 1, \
         "surplus above the reserve may be spent"
     assert choose_buy(q, 5, 350, est, now) is None, \
@@ -1168,6 +1357,16 @@ def _selftest():
           q_item(do="place", tower="b", round=1, prio=0, est=200)]
     assert choose_buy(q2, 1, 250, est, now) == 1, \
         "equal-priority siblings buy while the head saves"
+    q3 = [q_item(do="place", tower="glue", round=1, prio=1, est=275,
+                 gate={"ref": 0, "tier": 3}),
+          q_item(do="upgrade", ref=0, path=[0, 0, 1], round=1, prio=2,
+                 est=300)]
+    gated = lambda it: "gate" not in it
+    assert choose_buy(q3, 1, 900, est, now, gate_ok=gated) == 1, \
+        "a closed gate must skip the item entirely"
+    assert choose_buy(q3, 1, 900, est, now, emergency=True,
+                      gate_ok=gated) == 0, \
+        "emergencies bypass gates"
 
     # ----- buy scheduling: paced by income, threats before deadlines
     if mask_path.exists():
@@ -1212,9 +1411,48 @@ def _selftest():
         assert late_place >= 10, \
             "big buys should be paced, not all placed at round 1"
         assert camo_checked >= 25
+        # Upgrade-first + hero: with a hero anchoring, at most three
+        # bases (hero, opener, carry) may precede the carry's early
+        # tiers -- "upgrade a bit before adding 3 more".
+        early_ok = hero_ok = 0
+        for i in range(30):
+            g = b4.next_genome(rng, 4, tpools, tower_pool=pool,
+                               track=track, hero=True)
+            heroes = [x for x in g if x["do"] == "place"
+                      and x["tower"] == "hero"]
+            hero_refs = {x["ref"] for x in heroes}
+            if len(heroes) == 1 and heroes[0]["round"] <= 2 \
+                    and not any(x["do"] == "upgrade"
+                                and x["ref"] in hero_refs for x in g):
+                hero_ok += 1
+            roles = b4.last_strategy.get("roles", [])
+            if roles:                          # fresh (not evolved) only
+                assert not any(r.startswith("opener:") for r in roles), \
+                    "hero layouts must not also buy a separate opener"
+                names = [x["name"] for x in g if x["do"] == "place"]
+                assert len(names) == len(set(names)) and all(names), \
+                    f"tower names must be unique labels: {names}"
+                gates = [x for x in g if x["do"] == "place"
+                         and x.get("gate")]
+                assert gates, "support bases should be carry-gated"
+                for x in gates:
+                    assert g[[y["ref"] for y in g
+                              if y["do"] == "place"].index(
+                        x["gate"]["ref"])]["tower"] != "hero"
+            second_up = [j for j, x in enumerate(g)
+                         if x["do"] == "upgrade"][1:2]
+            if second_up:
+                before = sum(1 for x in g[:second_up[0]]
+                             if x["do"] == "place")
+                if before <= 3:
+                    early_ok += 1
+        assert hero_ok == 30, f"hero placement broken ({hero_ok}/30)"
+        assert early_ok >= 27, \
+            f"support bases jump ahead of carry tiers ({early_ok}/30)"
         print(f"economy OK: reservation policy verified, schedules paced "
               f"({late_place}/30 layouts hold a big buy past r6), camo "
-              f"answered by r22 in {camo_checked}/30")
+              f"answered by r22 in {camo_checked}/30, hero anchored "
+              f"{hero_ok}/30, upgrade-first {early_ok}/30")
 
     print("selftest OK: genome format, two-path rule, exploration floor,")
     print("posterior learning, evolution engagement, spot learning, and")

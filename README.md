@@ -67,9 +67,11 @@ once; after that your daily loop is just steps 6–8.
    python mk.py farm monkey_meadow --episodes 15 --towers 4
    ```
 
-   Meta-guided layouts are the default. Useful flags: `--explore 0.5`
-   (more randomness), `--no-meta` (pure random, the old Stage 2),
-   `--no-evolve` (no genetic layer), `--pool classic` (original 10
+   Meta-guided layouts are the default, and the equipped hero is placed
+   as the early anchor — equip one (Sauda recommended) in the hero menu
+   first. Useful flags: `--explore 0.5` (more randomness), `--no-meta`
+   (pure random, the old Stage 2), `--no-evolve` (no genetic layer),
+   `--no-hero` (skip hero placement), `--pool classic` (original 10
    towers only), `--final-round 40`, `--abort-lives 50`, `--seed N`.
 
 8. **Review what it learned** (Stage 3 section, no game needed):
@@ -93,6 +95,31 @@ once; after that your daily loop is just steps 6–8.
 
 **Emergency stop, anytime:** slam the mouse into the top-left corner of
 the screen, or Ctrl+C in the terminal.
+
+## Running it while you keep your keyboard
+
+The bot **is** a virtual keyboard and mouse: BTD6 (Unity) only accepts
+scan-code input aimed at the focused window, so every hotkey press and
+click the bot sends goes wherever your OS focus is. There is no way for
+this architecture to drive the game "in the background" of the same
+desktop — minimizing the game breaks both input and screen capture, and
+typing while it runs sends your keystrokes into the game (and its
+clicks into your editor).
+
+To code while it farms, give the bot **its own desktop**:
+
+- **Windows Sandbox** (Windows 10/11 Pro — enable it under "Turn
+  Windows features on or off"): a disposable isolated desktop in a
+  window. Install BTD6 + the bot inside; its keyboard/mouse are
+  virtual, yours stay free. Note the sandbox resets when closed.
+- **A virtual machine** (Hyper-V / VMware / VirtualBox with 3D
+  acceleration): same idea, persistent. BTD6 is light enough for VM
+  graphics.
+- **A second physical machine** — the zero-configuration answer.
+
+What does *not* work: running the game on a second monitor while you
+type on the first (focus and keystrokes are shared), remote-desktop-ing
+into your own running session, or moving the window off-screen.
 
 ## 1. Install
 
@@ -311,6 +338,22 @@ by what it wants:
 - **Snipers / mortars** (global range) stay *off* prime spots that
   range-limited towers need.
 
+Towers keep real spacing: planned spots stay a footprint apart (more
+for supers/villages), placement retries never target a spot another
+tower already holds, and duplicate tower types get sharply diminishing
+sampling weight — a second glue is occasionally right, a third 000 glue
+never is. Coverage towers also prefer *early* track when the flow is
+known: damage near the entry leaves room for error, a defense camped at
+the exit pops with zero margin. Every episode prints its reasoning per
+tower —
+
+```
+glue#0(control) @ [0.70,0.55]  covers path 0.31-0.43 (4% of track)
+boomerang#1(carry) @ [0.58,0.60]  covers path 0.21-0.64 (12% of track)
+```
+
+— so a misplaced tower is visible at a glance instead of a mystery.
+
 One thing pixels can't tell: which end of the track is the entry. So
 `farm` senses it — on its first episode the map is empty, and the first
 thing that moves near the track *is* the bloons entering. The result is
@@ -329,12 +372,26 @@ opposite: *money efficiency and save-up windows matter more than
 theoretical DPS.* So every buy now carries a **round** (when it should
 happen), a **priority**, and a **cost estimate**:
 
-- **Paced by income.** Buys are scheduled along a rough income curve so
-  the plan never wants more money than the game can have produced — an
-  opener goes down at round 1, a $2,500 super is *planned* for ~round
-  15 instead of being dribbled away on trinkets, and threat answers
-  keep hard dates (camo before 24, lead before 28) whatever the curve
-  says.
+- **Paced by income, upgrade-first.** Buys are scheduled along a rough
+  income curve so the plan never wants more money than the game can
+  have produced — and in the order a good player buys: the hero
+  anchors (with a hero placed there is **no separate opener** — that
+  would just split cash away from the carry), the carry base follows,
+  then the **carry's first tiers come before any more bases**. A
+  $2,500 super is *planned* for ~round 15 instead of being dribbled
+  away on trinkets. Threat answers keep hard dates (camo before 24,
+  lead before 28) that cap both the upgrade *and* its tower's
+  placement, whatever the curve says. When cash runs ahead of the
+  model, the next scheduled buy unlocks early — estimates pace,
+  reality decides.
+- **Support is conditional, not on a timer.** Amplifier/control/extra
+  bases are *gated on the carry being stable* (main path at tier 3):
+  glue and buffs arrive when the core can use them, not because a
+  clock ticked. Gates yield to threat dates (camo coverage never waits
+  for a struggling carry), to a leak emergency, and to running 6+
+  rounds late — support arrives when needed either way. Every tower
+  gets an identity label (`boomerang#0(carry)`), so logs and the
+  dataset say exactly which tower each upgrade landed on.
 - **Reservation.** The most important due purchase reserves its price.
   Lower-priority buys (crosspaths, luxuries) only spend the *surplus*
   above the reservation — being efficient now is what makes the big
@@ -345,6 +402,19 @@ happen), a **priority**, and a **cost estimate**:
 
 The executor still verifies everything against real cash — estimates
 pace the plan, reality decides the purchase.
+
+### The hero plays too
+
+Each episode opens by placing your equipped hero (hotkey `u`) as the
+early anchor — free scaling value the meta guide rates highly, with
+**Sauda** the recommended low-micro pick (equip her in the hero menu
+before farming; the bot can't choose heroes, only place them). Heroes
+level on their own, so no upgrade buys are ever attempted on one, and
+placement uses a short-range coverage profile that suits Sauda's melee
+reach. If no hero is equipped, the `u` press produces no ghost — the
+bot notices ("affordable but no ghost ever appears"), drops the hero
+from the plan after a few tries, and plays on. `--no-hero` skips hero
+placement entirely.
 
 To see what the bot currently believes — where its experience confirms
 or contradicts the research, which elite layouts evolution is breeding

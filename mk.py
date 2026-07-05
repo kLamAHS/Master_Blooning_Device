@@ -51,7 +51,7 @@ import numpy as np
 import mss
 import pyautogui
 
-BUILD = "2026-07-05.r8"   # printed at startup: ties every log to a build
+BUILD = "2026-07-06.r9"   # printed at startup: ties every log to a build
 
 DEBUG = True     # verbose decision logging; pass --quiet to farm/play
 
@@ -1604,6 +1604,16 @@ def act_place(screen, cfg, action):
     key = TOWER_HOTKEYS[action["tower"].lower()]
     spot = action["at"]
     candidates = placement_candidates(spot, action["tower"].lower())
+    # Never retry ON another tower this run already placed: those clicks
+    # can only fail (or select the neighbor), and watching the bot try
+    # to stack glue on glue for a minute is silly.
+    avoid = action.get("avoid") or []
+    if avoid:
+        min_d = 0.05 if action["tower"].lower() in LARGE_TOWERS else 0.03
+        far = [c for c in candidates
+               if all((c[0] - a[0]) ** 2 + (c[1] - a[1]) ** 2
+                      >= min_d ** 2 for a in avoid)]
+        candidates = far or candidates
     deadline = time.time() + action.get("timeout", 60)
 
     cash_before = read_cash(screen, cfg)
@@ -1614,9 +1624,14 @@ def act_place(screen, cfg, action):
 
     attempt = 0
     max_tries = min(len(candidates), 12)
+    baseline = cash_before
+    target = [round(spot[0], 4), round(spot[1], 4)]
     while attempt < max_tries and time.time() < deadline:
         target = candidates[attempt]
         target = [round(target[0], 4), round(target[1], 4)]
+        fresh = read_cash_confirmed(screen, cfg)
+        if fresh is not None:
+            baseline = fresh                  # per-click cash baseline
         click_norm(screen, target)
         time.sleep(0.35)
         if counter_steady(screen, cfg):       # ghost truly gone -> placed
@@ -1629,7 +1644,21 @@ def act_place(screen, cfg, action):
                 note = f"  (${cash_before} -> ${cash_after})"
             if attempt:
                 note += f"  [moved to {target}]"
-            print(f"      placed {action['tower']}{note}")
+            print(f"      placed "
+                  f"{action.get('name') or action['tower']}{note}")
+            return "placed", target
+        # The counter says nothing landed -- but CASH is the ground
+        # truth. If money left the wallet right after our click, the
+        # tower IS down (a panel or hover UI was hiding the counter) and
+        # every further "retry" would try to stack a copy on top of it.
+        spent = read_cash_confirmed(screen, cfg)
+        if baseline is not None and spent is not None \
+                and spent <= baseline - 100:
+            record_price(price_key(action["tower"].lower()),
+                         baseline - spent)
+            print(f"      placed {action.get('name') or action['tower']}"
+                  f"  (cash-verified ${baseline} -> ${spent})")
+            clear_ui(screen, cfg)     # whatever hid the counter, clear it
             return "placed", target
         # Rejected: cancel the ghost and VERIFY it's gone -- some game
         # states (e.g. nudge mode) leave a stuck ghost that right-click
@@ -1648,6 +1677,16 @@ def act_place(screen, cfg, action):
             if counter_visible(screen, cfg, tries=1):
                 return "broke", None          # affordability flapped
     click("right")                            # tidy up any held ghost
+    spent = read_cash_confirmed(screen, cfg)
+    if baseline is not None and spent is not None \
+            and spent <= baseline - 100:
+        # Late catch: a placement landed during the attempts without
+        # either sensor seeing it at the time. Better an approximate
+        # position than a phantom retry stacking towers.
+        print(f"      placed {action.get('name') or action['tower']}"
+              f"  (cash-verified late, ${baseline} -> ${spent})")
+        clear_ui(screen, cfg)
+        return "placed", target
     return "no_spot", None
 
 
@@ -2300,14 +2339,14 @@ def sense_flow_entry(screen, clean, track, timeout=7.0):
 # (layout, final_round, outcome) rows in runs_log.jsonl.
 # ---------------------------------------------------------------------------
 
-def random_genome(rng, n_towers):
+def random_genome(rng, n_towers, hero=False):
     """An ordered buy list: towers on random mask points, then shuffled
     single-tier upgrades (a random main path to <=4, a crosspath to <=2).
     Executed greedily as cash allows -- timing emerges from the economy.
     Tiers already known to be XP-locked are never generated."""
     genome = []
     spots = []
-    for _ in range(min(n_towers, len(MASK_POINTS))):
+    for _ in range(min(n_towers + (1 if hero else 0), len(MASK_POINTS))):
         roll = rng.random()
         if roll < 0.70 and MASK_NEAR:
             pool = MASK_NEAR
@@ -2321,11 +2360,15 @@ def random_genome(rng, n_towers):
                 spots.append(cand)
                 break
     types = [rng.choice(FARM_TOWERS) for _ in spots]
+    if hero and types:
+        types[0] = "hero"          # levels on its own; no upgrade rolls
     for ref, (spot, ttype) in enumerate(zip(spots, types)):
         genome.append({"do": "place", "tower": ttype,
                        "at": [spot[0], spot[1]], "ref": ref})
     ups = []
     for ref, ttype in enumerate(types):
+        if ttype == "hero":
+            continue
         main = rng.randrange(3)
         cross = rng.choice([p for p in range(3) if p != main])
         # At least tier 1 on the main path: near-empty genomes finish
@@ -2370,7 +2413,8 @@ def run_episode(screen, cfg, genome, final_round, abort_lives=50,
     try:
         from meta import choose_buy
     except ImportError:                       # no brain: old greedy rule
-        def choose_buy(q, _round, _cash, _cost, now, emergency=False):
+        def choose_buy(q, _round, _cash, _cost, now, emergency=False,
+                       gate_ok=None):
             return next((j for j, it in enumerate(q)
                          if it.get("_wake", 0) <= now), None)
 
@@ -2533,10 +2577,42 @@ def run_episode(screen, cfg, genome, final_round, abort_lives=50,
                             ent["path"][pi] + 1))
                 return known or it.get("est")
 
-            idx = choose_buy(queue, last_round,
-                             read_cash(screen, cfg), _cost_of,
-                             time.time(),
-                             emergency=time.time() < emergency_until[0])
+            def _gate_ok(it):
+                """Conditional buys: support bases gated on the carry
+                being stable (main path at the gate tier). Overrides
+                that keep the gate from becoming a deadlock: a threat
+                date ('by') close at hand, the carry placement having
+                been skipped, or the item running 6+ rounds past its
+                own schedule -- support arrives when NEEDED, and a
+                struggling carry can't strand it forever."""
+                g = it.get("gate")
+                if not g:
+                    return True
+                if it.get("by") and last_round >= it["by"] - 1:
+                    return True
+                if last_round >= it.get("round", 0) + 6:
+                    return True
+                if g["ref"] in landed_by_ref \
+                        and landed_by_ref[g["ref"]] is None:
+                    return True          # carry skipped: gate is void
+                lnd = landed_by_ref.get(g["ref"])
+                ent = towers.get(tuple(lnd)) if lnd else None
+                return bool(ent) and max(ent["path"]) >= g["tier"]
+
+            cash_now = read_cash(screen, cfg)
+            rush = time.time() < emergency_until[0]
+            try:
+                idx = choose_buy(queue, last_round, cash_now, _cost_of,
+                                 time.time(), emergency=rush,
+                                 gate_ok=_gate_ok)
+            except TypeError:
+                # A meta.py from a different version than mk.py (mixed
+                # zip extractions, stale __pycache__). Never crash the
+                # episode over it -- run without gates.
+                dbg("stale meta.choose_buy without gate support -- "
+                    "running ungated (re-download / clear __pycache__)")
+                idx = choose_buy(queue, last_round, cash_now, _cost_of,
+                                 time.time(), emergency=rush)
             item = queue[idx] if idx is not None else None
             if item is None:
                 pass                           # all pending buys cooling down
@@ -2558,8 +2634,10 @@ def run_episode(screen, cfg, genome, final_round, abort_lives=50,
                         dbg(msg)
                     item["_wake"] = time.time() + 4    # watermark gate
                 else:
-                    st, landed = act_place(screen, cfg,
-                                           {**item, "timeout": 10})
+                    st, landed = act_place(
+                        screen, cfg,
+                        {**item, "timeout": 10,
+                         "avoid": [t["at"] for t in towers.values()]})
                     if landed is not None:
                         # Key by the genome's own ref when present: place
                         # items can execute out of order (broke/no-spot
@@ -2568,13 +2646,40 @@ def run_episode(screen, cfg, genome, final_round, abort_lives=50,
                         landed_by_ref[item.get("ref", place_i)] = landed
                         towers[tuple(landed)] = {"tower": item["tower"],
                                                  "at": landed,
-                                                 "path": [0, 0, 0]}
+                                                 "path": [0, 0, 0],
+                                                 **({"name": item["name"]}
+                                                    if item.get("name")
+                                                    else {})}
                         place_i += 1
                         queue.pop(idx)
                         broke_at[0] = None
                     elif st == "broke":
-                        set_watermark(base)
-                        item["_wake"] = time.time() + 5
+                        est_c = base or item.get("est")
+                        lvl = read_cash_confirmed(screen, cfg)
+                        if est_c and lvl is not None and lvl >= est_c:
+                            # "Can't afford" while holding MORE than the
+                            # price: the hotkey isn't producing a ghost
+                            # at all (classic case: hero key with no
+                            # hero equipped). Money won't fix this --
+                            # stop letting it anchor the buy plan.
+                            item["_ghost_fails"] = \
+                                item.get("_ghost_fails", 0) + 1
+                            if item["_ghost_fails"] >= 4:
+                                print(f"   giving up on {item['tower']}: "
+                                      f"affordable (${lvl}) but no ghost "
+                                      f"ever appears"
+                                      + (" -- is a hero equipped?"
+                                         if item["tower"] == "hero"
+                                         else ""))
+                                landed_by_ref[item.get("ref", place_i)] \
+                                    = None
+                                place_i += 1
+                                queue.pop(idx)
+                            else:
+                                item["_wake"] = time.time() + 5
+                        else:
+                            set_watermark(base)
+                            item["_wake"] = time.time() + 5
                     else:                              # no_spot: real fail
                         item["_fails"] = item.get("_fails", 0) + 1
                         if item["_fails"] >= 3:
@@ -2600,24 +2705,26 @@ def run_episode(screen, cfg, genome, final_round, abort_lives=50,
                     entry = towers.get(tuple(landed))
                     pi = item["path"].index(1) if 1 in item["path"] else 0
                     ttype = entry["tower"].lower() if entry else ""
+                    tname = (entry.get("name") if entry else None) \
+                        or ttype
                     tier = (entry["path"][pi] + 1) if entry else 1
                     # Decide WITHOUT opening the menu where possible.
                     if entry and entry.get("_noselect", 0) >= 3:
-                        dbg(f"{ttype}: unselectable tower -- dropping "
+                        dbg(f"{tname}: unselectable tower -- dropping "
                             f"this upgrade")
                         queue.pop(idx)
                     elif entry and is_locked(ttype, pi, tier):
-                        dbg(f"{ttype} path{pi + 1} t{tier}: XP-locked, skip")
+                        dbg(f"{tname} path{pi + 1} t{tier}: XP-locked, skip")
                         queue.pop(idx)         # XP-locked: never touch it
                     elif entry and pi in entry.get("closed_paths", []):
-                        dbg(f"{ttype} path{pi + 1}: closed, skip")
+                        dbg(f"{tname} path{pi + 1}: closed, skip")
                         queue.pop(idx)         # path closed on this tower
                     elif (known := PRICES.get(price_key(ttype, pi, tier))) \
                             and (cash := read_cash(screen, cfg)) is not None \
                             and cash < known:
                         # Known price, can't afford: no menu, just sleep
                         # this item and let income build.
-                        msg = (f"{ttype} path{pi + 1} t{tier}: saving "
+                        msg = (f"{tname} path{pi + 1} t{tier}: saving "
                                f"(${cash}/${known})")
                         if item.get("_dbg") != msg:
                             item["_dbg"] = msg
@@ -2635,11 +2742,11 @@ def run_episode(screen, cfg, genome, final_round, abort_lives=50,
                             # re-reads it; a green sighting overwrites and
                             # heals. Repeats every 60s while still stuck.
                             item["_recheck_at"] = time.time() + 60
-                            dbg(f"{ttype} path{pi + 1}: re-checking "
+                            dbg(f"{tname} path{pi + 1}: re-checking "
                                 f"unverified ${known}")
                             st = act_upgrade(screen, cfg,
                                              {**item, "at": landed}, entry)
-                            dbg(f"{ttype} path{pi + 1} t{tier}: {st}")
+                            dbg(f"{tname} path{pi + 1} t{tier}: {st}")
                             if st == "bought":
                                 queue.pop(idx)
                                 broke_at[0] = None
@@ -2656,7 +2763,7 @@ def run_episode(screen, cfg, genome, final_round, abort_lives=50,
                     elif broke_at[0] is not None \
                             and (cash := read_cash(screen, cfg)) is not None \
                             and watermark_holds(cash):
-                        msg = (f"{ttype} path{pi + 1}: watermark hold "
+                        msg = (f"{tname} path{pi + 1}: watermark hold "
                                f"(${cash} <= ${broke_at[0]}+100)")
                         if item.get("_dbg") != msg:
                             item["_dbg"] = msg
@@ -2665,7 +2772,7 @@ def run_episode(screen, cfg, genome, final_round, abort_lives=50,
                     else:
                         st = act_upgrade(screen, cfg,
                                          {**item, "at": landed}, entry)
-                        dbg(f"{ttype} path{pi + 1} t{tier}: {st}")
+                        dbg(f"{tname} path{pi + 1} t{tier}: {st}")
                         if st == "bought":
                             queue.pop(idx)
                             broke_at[0] = None
@@ -2911,6 +3018,16 @@ def cmd_farm(args):
     if not args.no_meta:
         try:
             import meta as meta_mod
+            api = getattr(meta_mod, "META_API", 0)
+            if api != 3:
+                print("!" * 64)
+                print(f"!! meta.py reports API {api}, this mk.py needs 3.")
+                print("!! You are mixing files from different versions --")
+                print("!! re-download the whole branch and delete any")
+                print("!! __pycache__ folders. Farming WITHOUT the meta")
+                print("!! brain so nothing crashes.")
+                print("!" * 64)
+                raise ImportError(f"meta API {api} != 3")
             brain = meta_mod.MetaBrain(args.name, args.difficulty,
                                        target_round=args.final_round,
                                        explore=args.explore,
@@ -2950,9 +3067,10 @@ def cmd_farm(args):
                 large_towers=LARGE_TOWERS, tower_pool=tower_pool,
                 price_of=lambda t, p=None, tr=None: PRICES.get(
                     price_key(t) if p is None else price_key(t, p, tr)),
-                track=track)
+                track=track, hero=not args.no_hero)
         else:
-            genome = random_genome(rng, args.towers)
+            genome = random_genome(rng, args.towers,
+                                   hero=not args.no_hero)
         sensor = None
         if track is not None and not track.oriented:
             def sensor(clean):
@@ -3292,13 +3410,16 @@ def main():
     p_farm.add_argument("--no-meta", action="store_true", dest="no_meta",
                         help="ignore meta_knowledge.json and play uniform "
                              "random layouts (the old Stage-2 behavior)")
-    p_farm.add_argument("--explore", type=float, default=0.30,
+    p_farm.add_argument("--explore", type=float, default=0.20,
                         help="fraction of decisions that ignore the meta "
                              "and go uniform random; 1.0 = pure random, "
-                             "0.0 = pure exploit (default: 0.30)")
+                             "0.0 = pure exploit (default: 0.20)")
     p_farm.add_argument("--no-evolve", action="store_true", dest="no_evolve",
                         help="disable the genetic layer that mutates and "
                              "crosses over the best layouts found so far")
+    p_farm.add_argument("--no-hero", action="store_true", dest="no_hero",
+                        help="don't place the equipped hero (hotkey u) "
+                             "as the early anchor of each episode")
     p_farm.add_argument("--pool", choices=["classic", "full"],
                         default="full",
                         help="tower pool for meta layouts: classic = the "
