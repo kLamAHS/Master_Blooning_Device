@@ -294,7 +294,7 @@ class TrackModel:
 
 class MetaBrain:
     def __init__(self, map_name, difficulty, target_round=40,
-                 explore=0.30, evolve=True, knowledge=None, runs_path=None):
+                 explore=0.20, evolve=True, knowledge=None, runs_path=None):
         self.map_name = map_name
         self.difficulty = difficulty
         self.target = max(int(target_round), 1)
@@ -449,7 +449,11 @@ class MetaBrain:
         for debuffers, buff adjacency for alch/village, late track for
         spikes, remoteness for global towers -- multiplied by the learned
         per-region posterior, so experience still bends the geometry."""
-        if track is None or not track.ok or rng.random() < self.explore:
+        if track is None or not track.ok:
+            self._last_spot_src = "no-track"
+            return self._pick_spot(rng, pools, taken, large=large)
+        if rng.random() < self.explore:
+            self._last_spot_src = "explore"
             return self._pick_spot(rng, pools, taken, large=large)
         prof = self.towers.get(ttype, {}).get("placement") \
             or (HERO_PLACEMENT if ttype == "hero" else {})
@@ -533,7 +537,9 @@ class MetaBrain:
             if s > best_s:
                 best, best_s = c, s
         if best is None:
+            self._last_spot_src = "fallback"
             return self._pick_spot(rng, pools, taken, large=large)
+        self._last_spot_src = "style"
         return list(best)
 
     def _placement_order(self, picks):
@@ -746,7 +752,7 @@ class MetaBrain:
         Spots are assigned in placement order (carry anchors, buffers
         last); places go cheapest-first (early rounds need towers NOW);
         upgrades are sorted by threat deadline with noise for variety."""
-        spots = {}
+        spots, spot_src = {}, {}
         taken, placed_ctx = [], []
         for i in self._placement_order(picks):
             ttype = picks[i][0]
@@ -755,6 +761,7 @@ class MetaBrain:
             if spot is None:
                 continue
             spots[i] = spot
+            spot_src[i] = getattr(self, "_last_spot_src", "?")
             taken.append(spot)
             placed_ctx.append((ttype, spot))
         placed = []      # (ref, ttype, spot, main, cross, label)
@@ -820,6 +827,11 @@ class MetaBrain:
                 cov = (f"covers path {sp[0]:.2f}-{sp[2]:.2f} "
                        f"({track.exposure(spot, r_t):.0%} of track)"
                        if sp else "NO track in range")
+                src = spot_src.get(ref)
+                if src == "explore":
+                    cov += "  [exploration pick]"
+                elif src == "fallback":
+                    cov += "  [no scored spot -- random]"
                 spot_notes.append(
                     f"{name} @ [{spot[0]:.2f},{spot[1]:.2f}]  {cov}")
             entry = {"do": "place", "tower": ttype,

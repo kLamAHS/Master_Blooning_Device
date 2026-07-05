@@ -1609,7 +1609,7 @@ def act_place(screen, cfg, action):
     # to stack glue on glue for a minute is silly.
     avoid = action.get("avoid") or []
     if avoid:
-        min_d = 0.045 if action["tower"].lower() in LARGE_TOWERS else 0.024
+        min_d = 0.05 if action["tower"].lower() in LARGE_TOWERS else 0.03
         far = [c for c in candidates
                if all((c[0] - a[0]) ** 2 + (c[1] - a[1]) ** 2
                       >= min_d ** 2 for a in avoid)]
@@ -1624,9 +1624,14 @@ def act_place(screen, cfg, action):
 
     attempt = 0
     max_tries = min(len(candidates), 12)
+    baseline = cash_before
+    target = [round(spot[0], 4), round(spot[1], 4)]
     while attempt < max_tries and time.time() < deadline:
         target = candidates[attempt]
         target = [round(target[0], 4), round(target[1], 4)]
+        fresh = read_cash_confirmed(screen, cfg)
+        if fresh is not None:
+            baseline = fresh                  # per-click cash baseline
         click_norm(screen, target)
         time.sleep(0.35)
         if counter_steady(screen, cfg):       # ghost truly gone -> placed
@@ -1641,6 +1646,19 @@ def act_place(screen, cfg, action):
                 note += f"  [moved to {target}]"
             print(f"      placed "
                   f"{action.get('name') or action['tower']}{note}")
+            return "placed", target
+        # The counter says nothing landed -- but CASH is the ground
+        # truth. If money left the wallet right after our click, the
+        # tower IS down (a panel or hover UI was hiding the counter) and
+        # every further "retry" would try to stack a copy on top of it.
+        spent = read_cash_confirmed(screen, cfg)
+        if baseline is not None and spent is not None \
+                and spent <= baseline - 100:
+            record_price(price_key(action["tower"].lower()),
+                         baseline - spent)
+            print(f"      placed {action.get('name') or action['tower']}"
+                  f"  (cash-verified ${baseline} -> ${spent})")
+            clear_ui(screen, cfg)     # whatever hid the counter, clear it
             return "placed", target
         # Rejected: cancel the ghost and VERIFY it's gone -- some game
         # states (e.g. nudge mode) leave a stuck ghost that right-click
@@ -1659,6 +1677,16 @@ def act_place(screen, cfg, action):
             if counter_visible(screen, cfg, tries=1):
                 return "broke", None          # affordability flapped
     click("right")                            # tidy up any held ghost
+    spent = read_cash_confirmed(screen, cfg)
+    if baseline is not None and spent is not None \
+            and spent <= baseline - 100:
+        # Late catch: a placement landed during the attempts without
+        # either sensor seeing it at the time. Better an approximate
+        # position than a phantom retry stacking towers.
+        print(f"      placed {action.get('name') or action['tower']}"
+              f"  (cash-verified late, ${baseline} -> ${spent})")
+        clear_ui(screen, cfg)
+        return "placed", target
     return "no_spot", None
 
 
@@ -3382,10 +3410,10 @@ def main():
     p_farm.add_argument("--no-meta", action="store_true", dest="no_meta",
                         help="ignore meta_knowledge.json and play uniform "
                              "random layouts (the old Stage-2 behavior)")
-    p_farm.add_argument("--explore", type=float, default=0.30,
+    p_farm.add_argument("--explore", type=float, default=0.20,
                         help="fraction of decisions that ignore the meta "
                              "and go uniform random; 1.0 = pure random, "
-                             "0.0 = pure exploit (default: 0.30)")
+                             "0.0 = pure exploit (default: 0.20)")
     p_farm.add_argument("--no-evolve", action="store_true", dest="no_evolve",
                         help="disable the genetic layer that mutates and "
                              "crosses over the best layouts found so far")

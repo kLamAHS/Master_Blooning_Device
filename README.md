@@ -96,6 +96,31 @@ once; after that your daily loop is just steps 6–8.
 **Emergency stop, anytime:** slam the mouse into the top-left corner of
 the screen, or Ctrl+C in the terminal.
 
+## Running it while you keep your keyboard
+
+The bot **is** a virtual keyboard and mouse: BTD6 (Unity) only accepts
+scan-code input aimed at the focused window, so every hotkey press and
+click the bot sends goes wherever your OS focus is. There is no way for
+this architecture to drive the game "in the background" of the same
+desktop — minimizing the game breaks both input and screen capture, and
+typing while it runs sends your keystrokes into the game (and its
+clicks into your editor).
+
+To code while it farms, give the bot **its own desktop**:
+
+- **Windows Sandbox** (Windows 10/11 Pro — enable it under "Turn
+  Windows features on or off"): a disposable isolated desktop in a
+  window. Install BTD6 + the bot inside; its keyboard/mouse are
+  virtual, yours stay free. Note the sandbox resets when closed.
+- **A virtual machine** (Hyper-V / VMware / VirtualBox with 3D
+  acceleration): same idea, persistent. BTD6 is light enough for VM
+  graphics.
+- **A second physical machine** — the zero-configuration answer.
+
+What does *not* work: running the game on a second monitor while you
+type on the first (focus and keystrokes are shared), remote-desktop-ing
+into your own running session, or moving the window off-screen.
+
 ## 1. Install
 
 You need Python 3.10+.
