@@ -51,6 +51,8 @@ import numpy as np
 import mss
 import pyautogui
 
+BUILD = "2026-07-05.r8"   # printed at startup: ties every log to a build
+
 DEBUG = True     # verbose decision logging; pass --quiet to farm/play
 
 
@@ -400,6 +402,7 @@ def save_config_value(key, value):
 PRICES_PATH = Path(__file__).parent / "prices.json"
 PRICES = json.loads(PRICES_PATH.read_text()) if PRICES_PATH.exists() else {}
 PRICE_DIFFICULTY = "medium"      # set from the plan's mode when playing
+PRICES_SRC = {}                  # key -> "buy" | "seen" | "short" (session)
 
 # Upgrades you haven't unlocked with XP. The bot must NOT press these --
 # doing so spends your limited XP. Auto-detected (an affordable press that
@@ -426,15 +429,18 @@ def price_key(*parts):
     return ":".join([PRICE_DIFFICULTY, *map(str, parts)])
 
 
-def record_price(key, cost):
+def record_price(key, cost, src="buy"):
     """Persist a learned price -- with poison filters: every real BTD6
     price is a multiple of 5, and deltas computed from corrupted cash
-    reads almost never are. Implausibly huge costs are rejected too."""
+    reads almost never are. Implausibly huge costs are rejected too.
+    src tags provenance: 'buy' (cash-verified) / 'seen' (green panel) /
+    'short' (red panel -- unverified, eligible for a re-check)."""
     if cost is None or cost <= 0 or cost > 120000:
         return
     if cost % 5 != 0:              # every real BTD6 price ends in 0 or 5
         return
     cost = int(cost)
+    PRICES_SRC[key] = src
     if PRICES.get(key) != cost:
         PRICES[key] = cost
         PRICES_PATH.write_text(json.dumps(PRICES, indent=1, sort_keys=True))
@@ -675,13 +681,15 @@ def _cash_box_from_text(screen, cfg=None):
             round(2.0 * bh / screen.h, 4)]
 
 
-def _snap_cash_box_to_digits(screen, box):
+def _snap_cash_box_to_digits(screen, box, min_x=0.0):
     """Char-level refinement: given a roughly-right cash box, use
     tesseract's per-character boxes on a widened crop to trim it to the
     DIGITS ONLY -- excluding the '$', the glyph that keeps OCR-ing as a
-    leading 5/3, and any coin sliver to its left."""
+    leading 5/3, and any coin sliver to its left. min_x fences the
+    widened window so it can never grow leftward into the LIVES digits
+    (which once produced a lives-overlapping 'refit')."""
     x, y, w, h = box
-    wide = [max(0.0, x - h), max(0.0, y - 0.3 * h), w + 2 * h, h * 1.6]
+    wide = [max(min_x, x - h), max(0.0, y - 0.3 * h), w + 2 * h, h * 1.6]
     crop = screen.grab(wide)
     proc = preprocess_round_crop(crop)
     try:
@@ -740,25 +748,197 @@ def _cash_boxes_from_heart(screen):
     return boxes
 
 
-def read_cash(screen, cfg):
-    """Current cash as an int, or None if unknown/unreadable. When a '$'
-    is recognized, only digits AFTER it count -- otherwise the glyph
-    OCRs as a leading 5/3 and inflates the value. Implausibly huge
-    readings return None rather than poisoning the economy."""
-    box = cfg.get("cash_box")
-    if not box or pytesseract is None:
+# ---------------------------------------------------------------------------
+# Exact-font HUD number reader. The templates below are rendered from the
+# game's own font (LuckiestGuy) and embedded -- no font file and no OCR at
+# runtime. Tesseract mangles cartoon display fonts (the source of every
+# '$'->'5' prepend and dropped leading digit); shape-matching the true
+# glyphs does not. Reads are exact or None, never "close".
+# ---------------------------------------------------------------------------
+
+_TEMPLATES_B64 = (
+    "eNqVVj1vHDcQnc0C2k5MFdiBgDUCV0GKSxwnccW/cpXd+gcEIA2nV+vCgP9HGq2gIo0B"
+    "t+m8hgqVpqHiVjDNyXtDrnIWYCQ64Z3Iub354Lx5vM3me8kiOol0WgQrnfmGZVBYveoi"
+    "o6qKw9s84G3plHu+zYF7fqz8WM9UvV6p9lqCxqCvdHJ6oanXT3ATNBT4eqvS49mJbhID"
+    "ZPMN4w4B8WSqTzo+OcA4d/CZhT7x+LHOo77TPGpi9MzohQ4ZUBkQeXHPgNV3EcYS1iGM"
+    "HVlc5FLkx8238hJuo9c0mjfU+Jfqpe69doq0WBuiI7YuQYs70efI5QxxEAAOHMP+r83A"
+    "MyzMYfyPjfj80+aeTBImFJKtAl8rnUI9f57CwlNsKOM+UO1Rx7KJcANmLwZG7RGAGNAB"
+    "ByAFPIaWaERDYWL+WvSWALPKAyviK5KM/pWFxP0CGjJQ/B5GJHckoXwtHo5WBCadkRzB"
+    "Pqf2n/tyjSdr4d6wBX4HAiKTKoy1gkxqWBqY1+yMmJgQN8nPm+/kNVmEHY6GLbXj8/pM"
+    "36Afl5p81uzAk54GcCiFTE55kOpYT/UchgWGQoOD4UwT/rJH4xz+zpphCTiIt5V4xjzL"
+    "dzVcv8iHiOOccaxLPZXPDDW5eDNbGibpRR7WglzmWHNEyKlE3tDwrA348gVD7DtqRYDf"
+    "EQc0KLtrnSB7Na1O169wsPQ8cjD7mshkVCMl8KUtpQGZ7fDsdcmvgAvgShs36Oe4Ko3O"
+    "bJJjSLXiJvllc1/+lq5K2Ey2kmz83BiXKAvMj9+y3FhsXXj9UDh9M09xsMKsKAgjnTtE"
+    "jWQzv5m0ZUG66PtGdCxszyCQKCpWlSMsdmRSKB0WqZLvXCvDKSdVxCbybmgZQvMQ1lGr"
+    "vCUzy682Q2JieftXCm1u2uwQnWExbhCDITUBmA2jXQL/gsJJtNHqDMU6Sgw23xXOKuD1"
+    "QSRknuQ361CfpU6VmsxQX2x0bd6sH0YYNpmSRj3mmPIumXwJucMiYorQ2XMoavZQzVN8"
+    "hMkCL3mFDGoasOfQm8Mr+MEz8DNqWNgPCDK1uZI2N8Ly6tqtJLz8rFWu3TRLryaKdh7o"
+    "kJ/lkRU3lBvFDY0L17kkOnveKG3F5VBYXAyFft9D5NsieiPFjuwI6/yvSenYyGjjOXur"
+    "+R2S2XrLoZEY0w46ZTd5G+HFKtC9KZjXym1uO7oZ1YS/jSp/ItzffCN/9Hfk8Kk8muRC"
+    "+hdyuJW7UR5L90IObBkwYSjulD8HUNsHhQwqDsYuEMd8cY7QeYzd1OvWfbKCTjg+l5wo"
+    "CNEEbhzc9PtEupdy8FTuTrD+sBnlT+mQ1SBGW3LMWw/5O4ANYrPtSkFNH283Jyf1ni/t"
+    "YpqbKsb6kydbIG8qFyv/eUTJFMPBNFLYFptXVI2bT4zsA7aHyPhI5B8EdTWh")
+_TEMPLATES = None
+
+
+def _digit_templates():
+    global _TEMPLATES
+    if _TEMPLATES is None:
+        import base64
+        import zlib
+        raw = zlib.decompress(base64.b64decode(_TEMPLATES_B64))
+        t, i = {}, 0
+        while i < len(raw):
+            ch = chr(raw[i])
+            h, w = raw[i + 1], raw[i + 2]
+            n = int.from_bytes(raw[i + 3:i + 5], "big")
+            bits = np.unpackbits(np.frombuffer(raw[i + 5:i + 5 + n],
+                                               np.uint8))
+            t[ch] = bits[:h * w].reshape(h, w).astype(bool)
+            i += 5 + n
+        _TEMPLATES = t
+    return _TEMPLATES
+
+
+def _shave_comma(glyph):
+    """A fused comma leaves edge columns whose ink sits ONLY in the lower
+    half of the line -- every digit column reaches the upper half. Trim
+    such columns from the edges; the digit underneath emerges clean.
+    Pure-comma blobs are left untouched (guarded) so they still classify
+    as ',' and get skipped."""
+    h = glyph.shape[0]
+    has_ink = glyph.any(axis=0)
+    tops = np.where(has_ink, np.argmax(glyph, axis=0), h)
+    keep = has_ink & (tops < 0.5 * h)
+    cols = np.where(keep)[0]
+    if len(cols) >= 2 and len(cols) < glyph.shape[1]:
+        glyph = glyph[:, cols[0]:cols[-1] + 1]
+        rows = np.where(glyph.any(axis=1))[0]
+        if len(rows) >= 2:
+            glyph = glyph[rows[0]:rows[-1] + 1]
+    return glyph
+
+
+def _split_wide_glyph(glyph, h):
+    """At small scales adjacent digit fills can touch and merge into one
+    component. Every LuckiestGuy digit is taller than wide, so anything
+    wider than its height is a fusion -- split it at the thinnest
+    vertical columns (the junctions)."""
+    w = glyph.shape[1]
+    if w <= 0.92 * h:          # widest single glyph ('0') is 0.88 * h
+        return [glyph]
+    k = max(2, int(round(w / (0.72 * h))))
+    proj = glyph.sum(axis=0)
+    cuts = []
+    for j in range(1, k):
+        c = int(round(w * j / k))
+        lo = max(1, c - max(2, w // (2 * k)))
+        hi = min(w - 1, c + max(2, w // (2 * k)))
+        cuts.append(lo + int(np.argmin(proj[lo:hi])))
+    pieces, prev = [], 0
+    for c in sorted(set(cuts)):
+        if c - prev >= 3:
+            pieces.append(glyph[:, prev:c])
+            prev = c
+    pieces.append(glyph[:, prev:])
+    out = []
+    for p in pieces:
+        cols = np.where(p.any(axis=0))[0]
+        rows = np.where(p.any(axis=1))[0]
+        if len(cols) >= 2 and len(rows) >= 2:
+            out.append(p[rows[0]:rows[-1] + 1, cols[0]:cols[-1] + 1])
+    return out or [glyph]
+
+
+def _read_number_image(crop):
+    """Read a white LuckiestGuy number from a BGR crop by template
+    matching. The dark glyph outline separates characters into clean
+    connected components; short components (commas, flowers, confetti)
+    are filtered by relative height; '$' classifies as itself and is
+    skipped. Returns int or None -- exact or nothing."""
+    if crop.size == 0:
         return None
-    crop = screen.grab(box)
-    processed = preprocess_round_crop(crop)
-    text = pytesseract.image_to_string(
-        processed,
-        config="--psm 7 -c tessedit_char_whitelist=0123456789$,").strip()
-    if "$" in text:
-        text = text.rsplit("$", 1)[1]
-    digits = re.sub(r"\D", "", text)
+    white = (crop > 165).all(axis=2).astype(np.uint8)
+    n, lab, stats, _ = cv2.connectedComponentsWithStats(white, 8)
+    comps = [(stats[i, 0], stats[i, 1], stats[i, 2], stats[i, 3], i)
+             for i in range(1, n) if stats[i, 4] >= 12]
+    if not comps:
+        return None
+    hmed = float(np.median([c[3] for c in comps]))
+    templates = _digit_templates()
+    digits = []
+    for x, y, w, h, i in sorted(comps):
+        if h < 0.55 * hmed or w < 2:
+            continue
+        glyph = (lab[y:y + h, x:x + w] == i)
+        glyph = _shave_comma(glyph)
+        pieces = _split_wide_glyph(glyph, glyph.shape[0])
+        if len(pieces) > 1:
+            # Insurance: a noise-widened single digit must not be halved.
+            # If the UNSPLIT blob already matches a digit strongly, trust
+            # that reading instead of the split.
+            whole_best, whole_score = None, 0.0
+            for ch, tpl in templates.items():
+                g = cv2.resize(glyph.astype(np.uint8) * 255,
+                               (tpl.shape[1], tpl.shape[0]),
+                               interpolation=cv2.INTER_AREA) > 90
+                union = np.logical_or(g, tpl).sum()
+                s = (np.logical_and(g, tpl).sum() / union) if union else 0.0
+                if s > whole_score:
+                    whole_best, whole_score = ch, s
+            if whole_best and whole_best.isdigit() and whole_score >= 0.70:
+                pieces = [glyph]
+        for piece in pieces:
+            best, score, second = None, 0.0, 0.0
+            for ch, tpl in templates.items():
+                g = cv2.resize(piece.astype(np.uint8) * 255,
+                               (tpl.shape[1], tpl.shape[0]),
+                               interpolation=cv2.INTER_AREA) > 90
+                union = np.logical_or(g, tpl).sum()
+                s = (np.logical_and(g, tpl).sum() / union) if union else 0.0
+                if s > score:
+                    best, score, second = ch, s, score
+                elif s > second:
+                    second = s
+            # Thin glyphs (4/7/9) score lower at small scales; accept a
+            # lower score only when the winner clearly beats the runner-up.
+            confident = score >= 0.70 or (score >= 0.52
+                                          and score - second >= 0.05)
+            if best and best.isdigit() and confident:
+                digits.append((best, piece.shape[0], y + h / 2))
     if not digits:
         return None
-    value = int(digits)
+    # Coherence: real digits share a height AND a baseline. Confetti
+    # flecks fail the first; cross-row fragments fail the second.
+    hm = float(np.median([h for _, h, _ in digits]))
+    ym = float(np.median([yc for _, _, yc in digits]))
+    kept = [c for c, h, yc in digits
+            if abs(h - hm) <= 0.18 * hm and abs(yc - ym) <= 0.45 * hm]
+    return int("".join(kept)) if kept else None
+
+
+def read_cash(screen, cfg):
+    """Current cash as an int, or None. Primary reader: exact-font
+    template matching (see _read_number_image) -- reads are exact or
+    None. Tesseract remains only as a fallback, with '$'-anchored
+    parsing. Implausibly huge readings return None."""
+    box = cfg.get("cash_box")
+    if not box:
+        return None
+    crop = screen.grab(box)
+    value = _read_number_image(crop)
+    if value is None and pytesseract is not None:
+        processed = preprocess_round_crop(crop)
+        text = pytesseract.image_to_string(
+            processed,
+            config="--psm 7 -c tessedit_char_whitelist=0123456789$,"
+        ).strip()
+        if "$" in text:
+            text = text.rsplit("$", 1)[1]
+        digits = re.sub(r"\D", "", text)
+        value = int(digits) if digits else None
+    if value is None:
+        return None
     return value if value <= 150000 else None
 
 
@@ -807,7 +987,9 @@ def preflight_cash_box(screen, cfg, recalibrate=False):
         # The box reads -- but a box that clips the leading digit ALSO
         # reads ('$2,851' -> 851) and would stay wrong forever. Always try
         # the digit snap; adopt it when it reads and differs.
-        snapped = _snap_cash_box_to_digits(screen, original)
+        lb = cfg.get("lives_box")
+        fence = (lb[0] + lb[2]) if lb else 0.0
+        snapped = _snap_cash_box_to_digits(screen, original, min_x=fence)
         if snapped and snapped != original:
             cfg["cash_box"] = snapped
             if read_cash(screen, cfg) is not None:
@@ -836,7 +1018,9 @@ def preflight_cash_box(screen, cfg, recalibrate=False):
                 break
             time.sleep(0.15)
         if ok:
-            snapped = _snap_cash_box_to_digits(screen, box)
+            lb = cfg.get("lives_box")
+            fence = (lb[0] + lb[2]) if lb else 0.0
+            snapped = _snap_cash_box_to_digits(screen, box, min_x=fence)
             if snapped:
                 cfg["cash_box"] = snapped
                 if read_cash(screen, cfg) is not None:
@@ -893,19 +1077,22 @@ def _lives_box_from_heart(screen):
 
 
 def read_lives(screen, cfg):
-    """Current lives as an int, or None if unknown/unreadable."""
+    """Current lives as an int, or None. Same exact-font template reader
+    as cash; tesseract fallback."""
     box = cfg.get("lives_box")
-    if not box or pytesseract is None:
+    if not box:
         return None
     crop = screen.grab(box)
-    processed = preprocess_round_crop(crop)
-    text = pytesseract.image_to_string(
-        processed,
-        config="--psm 7 -c tessedit_char_whitelist=0123456789").strip()
-    digits = re.sub(r"\D", "", text)
-    if not digits:
+    value = _read_number_image(crop)
+    if value is None and pytesseract is not None:
+        processed = preprocess_round_crop(crop)
+        text = pytesseract.image_to_string(
+            processed,
+            config="--psm 7 -c tessedit_char_whitelist=0123456789").strip()
+        digits = re.sub(r"\D", "", text)
+        value = int(digits) if digits else None
+    if value is None:
         return None
-    value = int(digits)
     return value if value <= 1000 else None    # '2001' = coin-sliver junk
 
 
@@ -1016,37 +1203,41 @@ def clear_ui(screen, cfg):
 # ---------------------------------------------------------------------------
 
 PANEL_GEOM = {
-    # x, y, w, h of the big tower portrait, per panel side. NOTE: the
-    # portrait BACKGROUND is category-colored (Primary=blue, Magic=purple,
-    # ...) so detection must be color-agnostic -- see detect_panel_side.
-    "portrait": {"left": [0.016, 0.171, 0.201, 0.242],
-                 "right": [0.638, 0.171, 0.203, 0.242]},
-    # the brown title band ("NINJA MONKEY") at the panel's top, per side
-    "title_band": {"left": [0.031, 0.078, 0.165, 0.045],
-                   "right": [0.655, 0.078, 0.165, 0.045]},
-    # panel WOOD is sampled at three heights (title band, the gap under
-    # the portrait, the sell bar) -- see detect_panel_side for why
-    "brown_strips": [(0.078, 0.045), (0.416, 0.020), (0.845, 0.045)],
-    # x, w of the green price-button column, per panel side
+    # All y-values re-measured from in-game screenshots with the window
+    # TITLE BAR subtracted -- the original table skipped that subtraction
+    # and sat ~31px (0.026) low, which made the price strips sample the
+    # next row's NAME text and clip glyphs into garbage prices.
+    "portrait": {"left": [0.017, 0.143, 0.198, 0.244],
+                 "right": [0.640, 0.141, 0.200, 0.246]},
+    "title_band": {"left": [0.031, 0.052, 0.165, 0.050],
+                   "right": [0.655, 0.052, 0.165, 0.050]},
+    "brown_strips": [(0.052, 0.050), (0.386, 0.018), (0.833, 0.050)],
     "button_x": {"left": [0.130, 0.092], "right": [0.752, 0.092]},
-    # y, h of each of the three upgrade rows' button areas
-    "rows_y": [[0.440, 0.112], [0.577, 0.113], [0.715, 0.114]],
-    # within a button: where the price text strip sits (y-frac, h-frac)
-    "text_strip": [0.56, 0.34],
-    # the panel's X close button, per side (a deterministic way to close)
+    "rows_y": [[0.402, 0.114], [0.539, 0.113], [0.677, 0.113]],
+    "text_strip": [0.58, 0.40],
     "close_x": {"left": [0.2156, 0.0883], "right": [0.8417, 0.0883]},
-    # where the white 'PAUSE' header text sits when the pause menu is open,
-    # the tan menu body below it (second factor -- flowers can't fake it),
-    # and the CONTINUE button that closes it (harmless grass if not paused)
-    "pause_band": [0.44, 0.042, 0.12, 0.045],
-    "pause_body": [0.30, 0.115, 0.40, 0.060],
+    "pause_band": [0.44, 0.018, 0.12, 0.050],
+    "pause_body": [0.30, 0.220, 0.40, 0.060],
     "continue_btn": [0.695, 0.776],
 }
 
 
-def _brown_fraction(img):
+def _white_fraction(img):
+    """Fraction of near-white pixels -- the XP button's big up-arrow."""
+    return float((img > 185).all(axis=2).mean())
+
+
+def _blue_fraction(img):
     hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-    mask = cv2.inRange(hsv, (10, 60, 80), (28, 220, 230))
+    mask = cv2.inRange(hsv, (90, 60, 150), (112, 255, 255))
+    return float((mask > 0).mean())
+
+
+def _lightblue_fraction(img):
+    """The defeat dialog's BODY blue -- lighter and less saturated than
+    the gear/portrait blues, so it gets its own range."""
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    mask = cv2.inRange(hsv, (90, 40, 120), (118, 220, 255))
     return float((mask > 0).mean())
 
 
@@ -1061,6 +1252,12 @@ def looks_paused(screen):
     return _brown_fraction(body) > 0.45
 
 
+def _brown_fraction(img):
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    mask = cv2.inRange(hsv, (10, 60, 80), (28, 220, 230))
+    return float((mask > 0).mean())
+
+
 def unpause_if_needed(screen, cfg):
     if looks_paused(screen):
         dbg("pause menu detected -- clicking CONTINUE")
@@ -1070,20 +1267,12 @@ def unpause_if_needed(screen, cfg):
     return False
 
 
-def _lightblue_fraction(img):
-    """The defeat dialog's BODY blue -- lighter and less saturated than
-    the gear/portrait blues, so it gets its own range."""
-    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-    mask = cv2.inRange(hsv, (90, 40, 120), (118, 220, 255))
-    return float((mask > 0).mean())
-
-
 def looks_defeated(screen):
-    """Is the DEFEAT screen up? v2: the first version sampled the middle
-    of the dialog -- which is mostly its DARK navy inner panels -- with a
-    bright-blue test, so it never fired. Now: two light-blue body strips
-    (above the ROUND box, and the gap between the inner boxes, measured
-    from a real defeat frame) plus the orange DEFEAT title."""
+    """Is the DEFEAT screen up? Two light-blue body strips (above the
+    ROUND box and in the gap between the dialog's inner panels) plus the
+    orange DEFEAT title. Decoupled from OCR: on the defeat screen lives
+    is a lone '0' that reads unreliably while the round counter stays
+    readable, so digit-based exits can all fail at once."""
     strip_a = screen.grab([0.32, 0.310, 0.36, 0.050])
     strip_b = screen.grab([0.32, 0.506, 0.36, 0.020])
     if _lightblue_fraction(strip_a) < 0.45 \
@@ -1093,17 +1282,6 @@ def looks_defeated(screen):
     hsv = cv2.cvtColor(title, cv2.COLOR_BGR2HSV)
     orange = cv2.inRange(hsv, (3, 120, 120), (24, 255, 255))
     return float((orange > 0).mean()) > 0.08
-
-
-def _white_fraction(img):
-    """Fraction of near-white pixels -- the XP button's big up-arrow."""
-    return float((img > 185).all(axis=2).mean())
-
-
-def _blue_fraction(img):
-    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-    mask = cv2.inRange(hsv, (90, 60, 150), (112, 255, 255))
-    return float((mask > 0).mean())
 
 
 def _green_fraction(img):
@@ -1161,17 +1339,92 @@ def detect_panel_side(screen):
     return None
 
 
+
+def _hsv_blobs(img, lo, hi, min_area):
+    """Connected-component blobs of an HSV range. NOT contour-based:
+    RETR_EXTERNAL hides a button whose surroundings (the grass field
+    wrapping the panel) form an enclosing ring."""
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    mask = cv2.inRange(hsv, lo, hi)
+    n, _, stats, _ = cv2.connectedComponentsWithStats(mask, 8)
+    out = []
+    for i in range(1, n):
+        x, y, w, h, area = stats[i]
+        if area >= min_area:
+            out.append((int(x), int(y), int(w), int(h)))
+    return out
+
+
+def scan_panel_rows(screen, side):
+    """Judge each upgrade row's STATE by colored evidence at the KNOWN
+    row positions (static geometry, measured from real screenshots).
+    The previous version inferred a row grid from the SELL button plus
+    pitch constants; those constants were wrong for the real panel and
+    shifted every read by one slot -- rows are no longer inferred at all.
+      green button blob at the row -> ('cash', price) or ('xp', None)
+      red price text at the row    -> ('short', price)
+      neither                      -> closed (absent from the dict)"""
+    result = {}
+    bx, bw = PANEL_GEOM["button_x"][side]
+    for k, (ry, rh) in enumerate(PANEL_GEOM["rows_y"]):
+        band_box = [max(0.0, bx - 0.010), max(0.0, ry - 0.30 * rh),
+                    bw + 0.020, rh * 1.60]
+        band = screen.grab(band_box)
+        bh_px, bw_px = band.shape[:2]
+        greens = [b for b in _hsv_blobs(band, (40, 90, 90), (85, 255, 255),
+                                        min_area=0.10 * bh_px * bw_px)
+                  if 0.45 <= b[2] / max(b[3], 1) <= 1.8]
+        if greens:
+            x, y, w, h = max(greens, key=lambda b: b[2] * b[3])
+            btn = band[y:y + h, x:x + w]
+            upper = btn[:max(1, int(h * 0.55))]
+            if _white_fraction(upper) > 0.22:
+                result[k] = ("xp", None)
+                continue
+            strip = band[y + int(0.52 * h):y + int(0.97 * h), x:x + w]
+            price = _read_number_image(strip)
+            result[k] = ("cash", price) if price else ("unread", None)
+            continue
+        # RED price check, self-aligning: a fixed core slice decapitated
+        # off-nominal rows into strings of '1's. Instead, find red
+        # components across the FULL band, cluster them by baseline, and
+        # read only the cluster nearest the row's own center -- neighbor
+        # rows' fragments live in other clusters and are ignored.
+        b, g, r = (band[..., 0].astype(int), band[..., 1].astype(int),
+                   band[..., 2].astype(int))
+        red_mask = ((r > 150) & (r > g + 90)
+                    & (r > b + 90)).astype(np.uint8)
+        if red_mask.mean() > 0.008:
+            ncc, lab, stats, _ = cv2.connectedComponentsWithStats(red_mask, 8)
+            comps = [(stats[i, 1] + stats[i, 3] / 2, i)
+                     for i in range(1, ncc) if stats[i, 4] >= 10]
+            if comps:
+                comps.sort()
+                clusters, cur = [], [comps[0]]
+                for yc, i in comps[1:]:
+                    if yc - cur[-1][0] <= 0.22 * bh_px:
+                        cur.append((yc, i))
+                    else:
+                        clusters.append(cur)
+                        cur = [(yc, i)]
+                clusters.append(cur)
+                row_center = 0.65 * bh_px      # where this row's text sits
+                best = min(clusters, key=lambda cl: abs(
+                    float(np.mean([yy for yy, _ in cl])) - row_center))
+                keep = {i for _, i in best}
+                iso = np.zeros_like(band)
+                iso[np.isin(lab, list(keep))] = 255
+                result[k] = ("short", _read_number_image(iso))
+    return result
+
+
 def read_upgrade_row(screen, side, row_i):
-    """Classify one upgrade row:
-      ('cash', price)  -- green button, white price: buyable now
-      ('short', price) -- GREYED button, RED price: a real upgrade we
-                          can't afford yet. The red digits still OCR, so
-                          the price is learned without buying anything.
-      ('xp', None)     -- white unlock arrow: XP-locked, never press
-      ('closed', None) -- no button, no price text at all
-      ('unread', None) -- something's there but unreadable
-    Price OCR is majority-voted across thresholds ('$' sometimes reads as
-    a leading '5')."""
+    """Classify one upgrade row (static-geometry fallback path; the
+    self-locating scanner is preferred). All price reading goes through
+    the exact-font template reader -- tesseract read a red '$340' as
+    '7340' and poisoned the price book, so it is out of every money path.
+      ('cash', price) / ('short', price) / ('xp', None) /
+      ('closed', None) / ('unread', None)"""
     bx, bw = PANEL_GEOM["button_x"][side]
     ry, rh = PANEL_GEOM["rows_y"][row_i]
     button = screen.grab([bx, ry, bw, rh])
@@ -1183,51 +1436,18 @@ def read_upgrade_row(screen, side, row_i):
         upper = button[:max(1, int(button.shape[0] * 0.55))]
         if _white_fraction(upper) > 0.22:
             return "xp", None            # the big white unlock arrow
-        prices = []
-        for lo in (175, 190, 205):
-            white = (crop > lo).all(axis=2).astype(np.uint8) * 255
-            big = cv2.resize(white, None, fx=3, fy=3,
-                             interpolation=cv2.INTER_CUBIC)
-            text = pytesseract.image_to_string(
-                cv2.bitwise_not(big),
-                config="--psm 7 -c tessedit_char_whitelist=0123456789$,XP"
-            ).strip()
-            state, price = _classify_price_text(text)
-            if state == "xp":
-                return "xp", None
-            if state == "cash" and price:
-                prices.append(price)
-        if prices:
-            best = max(set(prices), key=prices.count)
-            if prices.count(best) == 1 and len(set(prices)) > 1:
-                best = min(prices)       # '$'->'5' only ever ADDS digits
-            return "cash", best
+        price = _read_number_image(crop)
+        if price:
+            return "cash", price
 
-    # No (readable) green button: check for the RED price of an
-    # unaffordable upgrade before concluding the path is closed. The
-    # channel gap must be LARGE (+90): panel-wood brown is reddish enough
-    # to sneak past a looser filter.
+    # No (readable) green: a RED price means a real-but-unaffordable row.
     b, g, r = (crop[..., 0].astype(int), crop[..., 1].astype(int),
                crop[..., 2].astype(int))
     red_mask = (r > 150) & (r > g + 90) & (r > b + 90)
     if red_mask.mean() > 0.02:
-        reads = []
-        for fx in (3, 4):                     # two scales vote: the '$'
-            big = cv2.resize(red_mask.astype(np.uint8) * 255, None,
-                             fx=fx, fy=fx, interpolation=cv2.INTER_CUBIC)
-            text = pytesseract.image_to_string(
-                cv2.bitwise_not(big),
-                config="--psm 7 -c tessedit_char_whitelist=0123456789$,"
-            ).strip()
-            digits = re.sub(r"\D", "", text)
-            if digits:
-                reads.append(int(digits))
-        price = None
-        if reads:
-            price = reads[0] if len(set(reads)) == 1 else min(reads)
-            if price % 5:                     # all BTD6 prices end in 0/5
-                price = None
-        return "short", price
+        iso = np.zeros_like(crop)
+        iso[red_mask] = 255
+        return "short", _read_number_image(iso)
 
     if green < 0.10:
         return "closed", None
@@ -1393,18 +1613,23 @@ def act_upgrade(screen, cfg, action, tower=None, timeout=8):
         clear_ui(screen, cfg)      # close anything half-open before leaving
         return "no_select"
 
-    # One full three-row harvest per tower (prices + locks recorded); after
-    # that, only the row being bought is read -- OCR is the expensive part.
+    # One full harvest per tower (prices + locks recorded); the
+    # SELF-LOCATING scanner runs first (aspect/resolution independent),
+    # static geometry only as fallback.
     if tower is not None and not tower.get("_scanned"):
-        rows = [read_upgrade_row(screen, side, i) for i in range(3)]
+        scan = scan_panel_rows(screen, side)
+        if scan is not None:
+            rows = [scan.get(i, ("closed", None)) for i in range(3)]
+        else:
+            rows = [read_upgrade_row(screen, side, i) for i in range(3)]
         ttype_l = tower["tower"].lower()
         for i, (state, price) in enumerate(rows):
             t = tower["path"][i] + 1
             k = price_key(ttype_l, i, t)
             if state == "cash" and price:
-                record_price(k, price)          # green: cleanest source
+                record_price(k, price, src="seen")   # green: cleanest
             elif state == "short" and price and k not in PRICES:
-                record_price(k, price)          # red: fill blanks only
+                record_price(k, price, src="short")  # red: unverified
             elif state == "xp":
                 mark_locked(ttype_l, i, t)
         tower["_side"] = side
@@ -1424,14 +1649,18 @@ def act_upgrade(screen, cfg, action, tower=None, timeout=8):
                 status = "locked"
                 break
             if rows is not None and rows[i] is None and side:
-                rows[i] = read_upgrade_row(screen, side, i)
+                scan = scan_panel_rows(screen, side)
+                if scan is not None:
+                    rows[i] = scan.get(i, ("closed", None))
+                else:
+                    rows[i] = read_upgrade_row(screen, side, i)
                 if tower:                       # book the lazy read too
                     state, seen_price = rows[i]
                     if state == "cash" and seen_price:
-                        record_price(pkey, seen_price)
+                        record_price(pkey, seen_price, src="seen")
                     elif state == "short" and seen_price \
                             and pkey not in PRICES:
-                        record_price(pkey, seen_price)
+                        record_price(pkey, seen_price, src="short")
                     elif state == "xp":
                         mark_locked(ttype, i, tier)
             info = rows[i] if rows else None
@@ -1576,6 +1805,17 @@ def cmd_watch(args):
             print(f"  raw={text!r:<12} parsed={value}   "
                   f"cash={read_cash(screen, cfg)}   "
                   f"lives={read_lives(screen, cfg)}")
+            la = _lightblue_fraction(
+                screen.grab([0.32, 0.310, 0.36, 0.050]))
+            lb2 = _lightblue_fraction(
+                screen.grab([0.32, 0.506, 0.36, 0.020]))
+            tt = screen.grab([0.38, 0.285, 0.24, 0.065])
+            oo = float((cv2.inRange(cv2.cvtColor(tt, cv2.COLOR_BGR2HSV),
+                                    (3, 120, 120),
+                                    (24, 255, 255)) > 0).mean())
+            print(f"    defeat-signals: blueA={la:.2f} blueB={lb2:.2f} "
+                  f"orange={oo:.2f} (need A,B>=0.45, orange>0.08) -> "
+                  f"{looks_defeated(screen)}")
             time.sleep(1.0)
     except KeyboardInterrupt:
         print("\nDone.")
@@ -1742,6 +1982,8 @@ def cmd_scan(args):
 
 MASK_POINTS = []     # strict points from the loaded mask; retries use these
 MASK_ROOMY = []      # strict points eroded once more: room for BIG towers
+MASK_NEAR = []       # strict points within 2 steps of the track
+MASK_MID = []        # strict points 3-4 steps from the track
 SAFE_CLICKS = []     # mask points far from every tower -- safe to deselect on
 
 # Towers with footprints larger than the dart used for scanning. They only
@@ -1755,10 +1997,13 @@ FARM_TOWERS = ["dart", "tack", "bomb", "sniper", "ninja", "wizard",
 
 
 def load_mask(mask_path):
-    """Load a scan mask and derive both placement pools: strict points for
-    normal towers, and once-more-eroded 'roomy' points for big-footprint
-    towers whose base needs extra clearance."""
-    global MASK_POINTS, MASK_ROOMY
+    """Load a scan mask and derive the placement pools. The mask already
+    encodes the TRACK: it's the largest connected blob of INVALID lattice
+    cells in the interior (the path rejects placement; trees hug the
+    border and are excluded). Each strict point's distance to that blob
+    feeds MASK_NEAR/MASK_MID so sampling can prefer spots that can
+    actually hit bloons instead of decorating corners."""
+    global MASK_POINTS, MASK_ROOMY, MASK_NEAR, MASK_MID
     data = json.loads(mask_path.read_text())
     points = data.get("valid_strict") or data.get("valid") or []
     step = data.get("step", 0.025)
@@ -1768,6 +2013,58 @@ def load_mask(mask_path):
                          for dx, dy in ((step, 0), (-step, 0),
                                         (0, step), (0, -step)))] or points
     MASK_POINTS = points
+
+    every = {(round(p[0], 3), round(p[1], 3))
+             for p in (data.get("valid") or points)}
+    strict = {(round(p[0], 3), round(p[1], 3)) for p in points}
+
+    def nb(c):
+        return [(round(c[0] + dx, 3), round(c[1] + dy, 3))
+                for dx, dy in ((step, 0), (-step, 0), (0, step), (0, -step))]
+
+    MASK_NEAR, MASK_MID = [], []
+    if every:
+        xs = sorted({c[0] for c in every})
+        ys = sorted({c[1] for c in every})
+        lattice = {(round(float(x), 3), round(float(y), 3))
+                   for x in np.arange(xs[0], xs[-1] + step / 2, step)
+                   for y in np.arange(ys[0], ys[-1] + step / 2, step)}
+        invalid = lattice - every
+        ring = {c for c in lattice
+                if c[0] < xs[0] + 1.5 * step or c[0] > xs[-1] - 1.5 * step
+                or c[1] < ys[0] + 1.5 * step or c[1] > ys[-1] - 1.5 * step}
+        interior = invalid - ring
+        seen, track = set(), set()
+        for c in interior:
+            if c in seen:
+                continue
+            comp, stack = set(), [c]
+            while stack:
+                q = stack.pop()
+                if q in comp:
+                    continue
+                comp.add(q)
+                stack += [n for n in nb(q) if n in interior and n not in comp]
+            seen |= comp
+            if len(comp) > len(track):
+                track = comp
+        dist = {c: 0 for c in track}
+        frontier, d = list(track), 0
+        while frontier and d < 5:
+            d += 1
+            nxt = []
+            for c in frontier:
+                for n in nb(c):
+                    if n in lattice and n not in dist:
+                        dist[n] = d
+                        nxt.append(n)
+            frontier = nxt
+        MASK_NEAR = [list(c) for c in strict if dist.get(c, 99) <= 2]
+        MASK_MID = [list(c) for c in strict if 2 < dist.get(c, 99) <= 4]
+        if track:
+            dbg(f"mask: track blob {len(track)} cells; pools "
+                f"{len(MASK_NEAR)} near / {len(MASK_MID)} mid / "
+                f"{len(points)} strict")
     return points
 
 
@@ -1878,7 +2175,20 @@ def random_genome(rng, n_towers):
     Executed greedily as cash allows -- timing emerges from the economy.
     Tiers already known to be XP-locked are never generated."""
     genome = []
-    spots = rng.sample(MASK_POINTS, min(n_towers, len(MASK_POINTS)))
+    spots = []
+    for _ in range(min(n_towers, len(MASK_POINTS))):
+        roll = rng.random()
+        if roll < 0.70 and MASK_NEAR:
+            pool = MASK_NEAR
+        elif roll < 0.95 and (MASK_MID or MASK_NEAR):
+            pool = MASK_MID or MASK_NEAR
+        else:
+            pool = MASK_POINTS
+        for _ in range(40):
+            cand = rng.choice(pool)
+            if cand not in spots:
+                spots.append(cand)
+                break
     types = [rng.choice(FARM_TOWERS) for _ in spots]
     for spot, ttype in zip(spots, types):
         genome.append({"do": "place", "tower": ttype,
@@ -1887,7 +2197,9 @@ def random_genome(rng, n_towers):
     for ref, ttype in enumerate(types):
         main = rng.randrange(3)
         cross = rng.choice([p for p in range(3) if p != main])
-        want = ([main] * rng.randint(0, 4)) + ([cross] * rng.randint(0, 2))
+        # At least tier 1 on the main path: near-empty genomes finish
+        # buying by round 7 and spend the rest of the run just observing.
+        want = ([main] * rng.randint(1, 4)) + ([cross] * rng.randint(0, 2))
         tiers = {main: 0, cross: 0}
         for path_i in want:
             tiers[path_i] += 1
@@ -1903,7 +2215,7 @@ def random_genome(rng, n_towers):
     return genome
 
 
-def run_episode(screen, cfg, genome, final_round):
+def run_episode(screen, cfg, genome, final_round, abort_lives=50):
     """Play one random layout to survival or defeat. Returns
     (outcome, final_round_reached, towers, lives_by_round)."""
     # (Re)calibrate sensors on the clean, un-started map -- the best frame
@@ -1926,6 +2238,8 @@ def run_episode(screen, cfg, genome, final_round):
     landed_by_ref, towers = {}, {}
     lives_by_round = {}
     broke_at = [None]     # cash watermark: level of the last money-failure
+    round_seen_at = time.time()   # for the frozen-defeat-screen net
+    observing = False             # queue empty: just watching the run
     # Safe deselect spots for THIS episode: mask points farthest from every
     # tower this genome will place, so a panel-closing click can't select
     # a monkey. (The genome differs per episode, so recompute each time.)
@@ -1956,7 +2270,12 @@ def run_episode(screen, cfg, genome, final_round):
                 accepted = value
             prev_read = value
         if accepted is None:
-            misreads += 1
+            if detect_panel_side(screen):
+                # A counter hidden behind an OPEN PANEL isn't a lost HUD
+                # -- close the panel instead of counting toward hud_lost.
+                clear_ui(screen, cfg)
+            else:
+                misreads += 1
         else:
             misreads = 0
             if accepted != last_round:
@@ -1982,6 +2301,25 @@ def run_episode(screen, cfg, genome, final_round):
         if (lives == 0 and prev_lives == 0) or zero_streak >= 3:
             outcome = "defeat"                # defeat screen (HUD stays!)
             break
+        if abort_lives and lives is not None and 0 < lives < abort_lives:
+            # A lost cause: abort while the game is LIVE, so the restart
+            # takes the pause route -- the one with a proven field record.
+            print(f"   lives {lives} < {abort_lives}: aborting this "
+                  f"episode early")
+            outcome = "defeat"
+            break
+        if accepted is not None and accepted != last_round:
+            pass
+        if accepted is not None:
+            round_seen_at = time.time()
+        if not queue and time.time() - round_seen_at > 60 \
+                and (lives is None or lives < 40):
+            # Round frozen for a minute, nothing to buy, critical lives:
+            # that is the defeat screen, whatever the pixels say.
+            dbg("round frozen 60s with critical lives -- treating as "
+                "defeat")
+            outcome = "defeat"
+            break
         if looks_defeated(screen):
             time.sleep(0.4)
             if looks_defeated(screen):        # confirmed on two samples
@@ -2003,12 +2341,18 @@ def run_episode(screen, cfg, genome, final_round):
                 base = PRICES.get(price_key(ttype))
                 cash = read_cash(screen, cfg)
                 if base and cash is not None and cash < base:
-                    dbg(f"{ttype}: saving up (${cash}/${base})")
+                    msg = f"{ttype}: saving up (${cash}/${base})"
+                    if item.get("_dbg") != msg:
+                        item["_dbg"] = msg
+                        dbg(msg)
                     item["_wake"] = time.time() + 3    # saving up: silent
                 elif broke_at[0] is not None and cash is not None \
                         and cash <= broke_at[0] + 100:
-                    dbg(f"{ttype}: watermark hold (${cash} <= "
-                        f"${broke_at[0]}+100)")
+                    msg = f"{ttype}: watermark hold (${cash} <= " \
+                          f"${broke_at[0]}+100)"
+                    if item.get("_dbg") != msg:
+                        item["_dbg"] = msg
+                        dbg(msg)
                     item["_wake"] = time.time() + 4    # watermark gate
                 else:
                     st, landed = act_place(screen, cfg,
@@ -2060,10 +2404,33 @@ def run_episode(screen, cfg, genome, final_round):
                             and cash < known:
                         # Known price, can't afford: no menu, just sleep
                         # this item and let income build.
-                        dbg(f"{ttype} path{pi + 1} t{tier}: saving "
-                            f"(${cash}/${known})")
+                        msg = (f"{ttype} path{pi + 1} t{tier}: saving "
+                               f"(${cash}/${known})")
+                        if item.get("_dbg") != msg:
+                            item["_dbg"] = msg
+                            dbg(msg)
                         item["_saving"] = item.get("_saving", time.time())
-                        if time.time() - item["_saving"] > 120:
+                        pk = price_key(ttype, pi, tier)
+                        if PRICES_SRC.get(pk) == "short" \
+                                and time.time() - item["_saving"] > 45 \
+                                and not item.get("_rechecked"):
+                            # Unverified red-read price: one menu open to
+                            # re-read it -- a green sighting overwrites and
+                            # heals a poisoned value (e.g. $340 -> $7340).
+                            item["_rechecked"] = True
+                            dbg(f"{ttype} path{pi + 1}: re-checking "
+                                f"unverified ${known}")
+                            st = act_upgrade(screen, cfg,
+                                             {**item, "at": landed}, entry)
+                            dbg(f"{ttype} path{pi + 1} t{tier}: {st}")
+                            if st == "bought":
+                                queue.pop(idx)
+                                broke_at[0] = None
+                            elif st in ("locked", "closed"):
+                                queue.pop(idx)
+                            else:
+                                item["_wake"] = time.time() + 5
+                        elif time.time() - item["_saving"] > 120:
                             print(f"   skipping ${known} upgrade -- income "
                                   f"too slow")
                             queue.pop(idx)
@@ -2072,8 +2439,11 @@ def run_episode(screen, cfg, genome, final_round):
                     elif broke_at[0] is not None \
                             and (cash := read_cash(screen, cfg)) is not None \
                             and cash <= broke_at[0] + 100:
-                        dbg(f"{ttype} path{pi + 1}: watermark hold "
-                            f"(${cash} <= ${broke_at[0]}+100)")
+                        msg = (f"{ttype} path{pi + 1}: watermark hold "
+                               f"(${cash} <= ${broke_at[0]}+100)")
+                        if item.get("_dbg") != msg:
+                            item["_dbg"] = msg
+                            dbg(msg)
                         item["_wake"] = time.time() + 5
                     else:
                         st = act_upgrade(screen, cfg,
@@ -2100,6 +2470,10 @@ def run_episode(screen, cfg, genome, final_round):
                                 queue.pop(idx)
 
         if misreads == 12:                    # stuck panel? try to clear
+            if looks_defeated(screen):
+                dbg("DEFEAT screen recognized (via dark counter)")
+                outcome = "defeat"
+                break
             dbg("counter dark for a while -- clearing UI")
             clear_ui(screen, cfg)
         if last_round is not None and last_round >= final_round:
@@ -2107,13 +2481,16 @@ def run_episode(screen, cfg, genome, final_round):
             break
         if misreads >= 25:                    # HUD truly gone: unknown state
             break
-        time.sleep(0.6)
+        if not queue and not observing:
+            observing = True
+            print("   build complete -- observing until survive/abort")
+        time.sleep(1.2 if observing else 0.6)
     clean = [{k: v for k, v in t.items() if not k.startswith("_")}
              for t in towers.values()]
     return outcome, last_round, clean, lives_by_round
 
 
-def restart_game(screen, cfg, outcome):
+def restart_game(screen, cfg, outcome, start_round=1):
     """Get back to a fresh round 1. The path is chosen from the CURRENT
     screen state, not the outcome label: a live game (counter readable)
     must go through the pause menu; a defeat screen through its own
@@ -2135,10 +2512,28 @@ def restart_game(screen, cfg, outcome):
         click_norm(screen, cfg["restart_confirm"])
         time.sleep(2.0)
         for _ in range(12):
-            if read_round(screen, cfg)[0] == 1:
+            value = read_round(screen, cfg)[0]
+            # Hard mode starts at round 3 -- 'fresh game' means the
+            # detected start round, not literally 1.
+            if value is not None and value <= max(1, start_round):
                 return True
             time.sleep(1.0)
     return False
+
+
+def _log_crash(where):
+    """Print AND append the current exception to crash_log.txt, so a
+    cut-off console paste can never lose the evidence again."""
+    err = traceback.format_exc()
+    print(err)
+    try:
+        with open(Path(__file__).parent / "crash_log.txt", "a") as f:
+            f.write(f"\n=== {datetime.now().isoformat()} {where} "
+                    f"(build {BUILD})\n")
+            f.write(err)
+    except Exception:
+        pass
+    print(f"Crash in {where} -- logged to crash_log.txt.")
 
 
 def cmd_farm(args):
@@ -2164,13 +2559,13 @@ def cmd_farm(args):
     # (safe deselect spots are computed per episode, from each genome)
 
     global PRICE_DIFFICULTY
-    PRICE_DIFFICULTY = args.difficulty
+    PRICE_DIFFICULTY = args.difficulty or "easy"
     rng = random.Random(args.seed)
     runs_path = Path(__file__).parent / "runs_log.jsonl"
 
     print(f"Farming {args.episodes} episodes on '{args.name}' "
           f"({args.towers} towers, to round {args.final_round}, "
-          f"difficulty {args.difficulty}).")
+          f"difficulty {args.difficulty or 'auto-detect'}).")
     print("Load the map fresh (round 1, no towers). Starting in 5 "
           "seconds...")
     focus_game_window(hwnd)
@@ -2185,6 +2580,31 @@ def cmd_farm(args):
               "start. Defeat detection needs it, so if episode 1 still "
               "can't read lives, stop and debug with `watch`.")
 
+    lv = read_lives(screen, cfg)
+    detected = None
+    if lv is not None:
+        for base, name in ((200, "easy"), (150, "medium"),
+                           (100, "hard"), (1, "impoppable")):
+            if abs(lv - base) <= 5:
+                detected = name
+                break
+    if args.difficulty is None:
+        args.difficulty = detected or "easy"
+        PRICE_DIFFICULTY = args.difficulty
+        print(f"Difficulty auto-detected from {lv} starting lives: "
+              f"{args.difficulty}")
+    elif detected and detected != args.difficulty:
+        print(f"NOTE: {lv} starting lives suggests '{detected}' but "
+              f"--difficulty {args.difficulty} was given -- using the flag.")
+
+    r1 = read_round(screen, cfg)[0]
+    time.sleep(0.3)
+    r2 = read_round(screen, cfg)[0]
+    start_round = r1 if (r1 is not None and r1 == r2 and r1 <= 6) else 1
+    if start_round != 1:
+        print(f"Game starts at round {start_round} on this difficulty -- "
+              f"restart verification will expect it.")
+
     for ep in range(1, args.episodes + 1):
         genome = random_genome(rng, args.towers)
         print(f"\n=== Episode {ep}/{args.episodes}: "
@@ -2192,31 +2612,39 @@ def cmd_farm(args):
               f"{sum(1 for g in genome if g['do'] == 'upgrade')} upgrades")
         try:
             outcome, reached, towers, lives_by_round = run_episode(
-                screen, cfg, genome, args.final_round)
+                screen, cfg, genome, args.final_round,
+                abort_lives=args.abort_lives)
         except KeyboardInterrupt:
             raise
         except Exception:
-            err = traceback.format_exc()
-            print(err)
-            with open(Path(__file__).parent / "crash_log.txt", "a") as f:
-                f.write(f"\n=== {datetime.now().isoformat()} episode {ep}\n")
-                f.write(err)
-            print("Episode crashed -- logged to crash_log.txt, attempting "
-                  "to recover and continue.")
+            _log_crash(f"episode {ep}")
+            print("Attempting to recover and continue.")
             outcome, reached, towers, lives_by_round = ("crashed", None,
                                                         [], {})
-            clear_ui(screen, cfg)
+            try:
+                clear_ui(screen, cfg)
+            except Exception:
+                _log_crash(f"episode {ep} (recovery clear_ui)")
         print(f"=== Episode {ep}: {outcome} at round {reached}")
-        with open(runs_path, "a") as f:
-            f.write(json.dumps({
-                "time": datetime.now().isoformat(timespec="seconds"),
-                "mode": "farm", "map": args.name,
-                "difficulty": args.difficulty,
-                "final_round": reached, "outcome": outcome,
-                "lives_by_round": lives_by_round,
-                "towers": towers}) + "\n")
+        try:
+            with open(runs_path, "a") as f:
+                f.write(json.dumps({
+                    "time": datetime.now().isoformat(timespec="seconds"),
+                    "mode": "farm", "map": args.name,
+                    "difficulty": args.difficulty,
+                    "final_round": reached, "outcome": outcome,
+                    "lives_by_round": lives_by_round,
+                    "towers": towers}) + "\n")
+        except Exception:
+            _log_crash(f"episode {ep} (dataset write)")
         if ep < args.episodes:
-            if not restart_game(screen, cfg, outcome):
+            try:
+                ok = restart_game(screen, cfg, outcome,
+                                  start_round=start_round)
+            except Exception:
+                _log_crash(f"episode {ep} (restart)")
+                ok = False
+            if not ok:
                 sys.exit("Couldn't restart into a fresh game -- check the "
                          "restart calibration points in config.json.")
     print(f"\nDone. {args.episodes} labeled episodes appended to "
@@ -2456,13 +2884,20 @@ def main():
     p_farm.add_argument("--final-round", type=int, default=40,
                         dest="final_round",
                         help="round that counts as survival (default: 40)")
-    p_farm.add_argument("--difficulty", default="easy",
-                        choices=["easy", "medium", "hard", "impoppable"])
+    p_farm.add_argument("--difficulty", default=None,
+                        choices=["easy", "medium", "hard", "impoppable"],
+                        help="price-book key; auto-detected from starting "
+                             "lives when omitted")
+    p_farm.add_argument("--abort-lives", type=int, default=50,
+                        help="abort an episode once lives drop below "
+                             "this (0 disables); live-game restarts are "
+                             "the reliable ones")
     p_farm.add_argument("--seed", type=int, default=None,
                         help="RNG seed for reproducible layouts")
     p_farm.add_argument("-q", "--quiet", action="store_true",
                         help="suppress per-decision debug output")
     args = parser.parse_args()
+    print(f"btd6_bot build {BUILD}")
     global DEBUG
     DEBUG = not getattr(args, "quiet", False)
     {"locate": cmd_locate, "watch": cmd_watch,
@@ -2470,4 +2905,12 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\nStopped by user.")
+    except SystemExit:
+        raise
+    except Exception:
+        _log_crash("main")
+        raise
