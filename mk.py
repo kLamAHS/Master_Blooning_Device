@@ -1,0 +1,2473 @@
+#!/usr/bin/env python3
+"""
+BTD6 Stage-1 bot -- screen capture, clicking, and round detection.
+
+This is the "hands" of the ML project. No machine learning lives in this
+file; it is the reliable pipeline that will later collect training data
+(Stage 2) and execute the plans your genetic algorithm finds (Stage 3).
+
+Subcommands
+-----------
+  locate               Print live mouse coordinates (pixels + normalized).
+                       Use this to find coordinates for your plan file.
+  watch                Continuously OCR the round counter and print what
+                       the bot sees. Saves debug images so you can tune
+                       "round_box" in config.json.
+  play <plan.json>     Execute a gameplan against the running game.
+  scan <map_name>      Sweep a tower ghost across the map and record every
+                       placeable spot (the game paints invalid spots red).
+                       Writes masks/<map>_<tower>.json -- this is what the
+                       emergent layout generator samples from in Stage 2.
+  farm <map_name>      STAGE 2: play random layouts unattended, restarting
+                       between games, logging (layout, final_round,
+                       outcome) to runs_log.jsonl -- the training dataset.
+
+Safety
+------
+  * pyautogui's failsafe is ON: slam the mouse into the TOP-LEFT corner
+    of the screen to abort instantly.
+  * Ctrl+C in the terminal also stops the bot.
+
+Ninja Kiwi's terms of service forbid automation. Use this offline, in
+single player only, ideally on a throwaway account. Never in races,
+co-op, or events.
+"""
+
+import argparse
+import csv
+import ctypes
+import json
+import random
+import re
+import shutil
+import sys
+import time
+import traceback
+from datetime import datetime
+from pathlib import Path
+
+import cv2
+import numpy as np
+import mss
+import pyautogui
+
+DEBUG = True     # verbose decision logging; pass --quiet to farm/play
+
+
+def dbg(msg):
+    if DEBUG:
+        print(f"      . {msg}")
+
+try:
+    import pytesseract
+except ImportError:
+    pytesseract = None
+
+# BTD6 (like most Unity games) reads keyboard input at the scan-code level
+# and IGNORES the virtual-key events pyautogui sends -- keys typed by a
+# human work, keys sent by pyautogui silently do nothing. pydirectinput
+# sends real scan codes, so all key presses and clicks go through it.
+# pyautogui is still used for cursor movement (games read the real OS
+# cursor position) and for its corner-failsafe.
+try:
+    import pydirectinput
+    pydirectinput.PAUSE = 0.05
+    pydirectinput.FAILSAFE = True
+except ImportError:
+    pydirectinput = None
+    if sys.platform == "win32":
+        print("WARNING: pydirectinput is not installed, so BTD6 will most "
+              "likely IGNORE every key press this bot sends.\n"
+              "Fix: pip install pydirectinput\n")
+
+pyautogui.FAILSAFE = True   # mouse to top-left corner = emergency stop
+pyautogui.PAUSE = 0.05      # tiny pause after every pyautogui call
+
+
+def press_key(key):
+    """Send a key press the game will actually register."""
+    (pydirectinput or pyautogui).press(key)
+
+
+def click(button="left"):
+    """Send a mouse click the game will actually register."""
+    (pydirectinput or pyautogui).click(button=button)
+
+if sys.platform == "win32":
+    # Without this, Windows display scaling (125%, 150%...) puts clicks and
+    # screenshots in different coordinate systems and everything misses.
+    try:
+        ctypes.windll.user32.SetProcessDPIAware()
+    except Exception:
+        pass
+
+# ---------------------------------------------------------------------------
+# Configuration (per-machine settings live in config.json, created on first
+# run; per-map strategy lives in the plan .json files)
+# ---------------------------------------------------------------------------
+
+CONFIG_PATH = Path(__file__).parent / "config.json"
+
+DEFAULT_CONFIG = {
+    # How the bot finds the game on screen, in priority order:
+    #   1. "region": [left, top, width, height] in pixels -- manual override.
+    #      Leave null to use auto-detection (recommended).
+    #   2. Auto-detect: the visible window whose title contains
+    #      "window_title" (Windows only). Works windowed OR fullscreen,
+    #      at any resolution -- 1920x1080, 1440p, whatever.
+    #   3. Fallback: the whole primary monitor.
+    "region": None,
+    "window_title": "BloonsTD6",
+
+    # Where the round counter ("13/40") sits, as fractions of the game
+    # area: [x, y, width, height]. Tune with `watch` if OCR reads garbage.
+    "round_box": [0.695, 0.012, 0.125, 0.052],
+
+    # Where the cash number sits. null = auto-located (the bot finds the
+    # gold coin icon and takes the box to its right).
+    "cash_box": None,
+
+    # Where the lives number sits. null = auto-located (red heart icon).
+    # Lives reaching 0 is how the bot detects defeat -- the round counter
+    # stays visible on the defeat screen, so it can't be the signal.
+    "lives_box": None,
+
+    # A patch of open ground with no towers on it. Clicking here closes
+    # upgrade panels without selecting anything new.
+    "deselect_point": [0.50, 0.92],
+
+    # One-time calibration for `farm` (unattended restarts). Use `locate`:
+    #   defeat_restart: the RESTART button on the defeat screen
+    #                   (lose a game once on purpose to see it)
+    #   pause_restart:  the RESTART button in the pause menu (press Esc)
+    #   restart_confirm: the confirm/OK button on the "restart?" dialog
+    "defeat_restart": None,
+    "pause_restart": None,
+    "restart_confirm": None,
+
+    # Seconds to wait between the individual clicks/keys of one action.
+    "action_delay": 0.40,
+
+    # `scan`: how much redder (vs. the clean map) the ring around the
+    # cursor must get before a grid point counts as NOT placeable. The
+    # invalid-tint typically scores 20-60, valid ground scores near 0.
+    # Tune only if the scan preview disagrees with the map.
+    "scan_red_shift": 12.0,
+
+    # Full path to the tesseract binary if it is not on PATH (Windows
+    # usually needs this). null = try to auto-detect.
+    "tesseract_cmd": None,
+}
+
+# Default BTD6 hotkeys. If you changed yours in Settings -> Hotkeys,
+# update this dict to match. Newer towers may use other keys -- add them.
+TOWER_HOTKEYS = {
+    "dart": "q", "boomerang": "w", "bomb": "e", "tack": "r",
+    "ice": "t", "glue": "y",
+    "sniper": "z", "sub": "x", "buccaneer": "c", "ace": "v",
+    "heli": "b", "mortar": "n", "dartling": "m",
+    "wizard": "a", "super": "s", "ninja": "d", "alchemist": "f",
+    "druid": "g",
+    "farm": "h", "spike": "j", "village": "k", "engineer": "l",
+    "beast": "i",
+    "hero": "u",
+}
+
+# Upgrade hotkeys for [top path, middle path, bottom path]
+UPGRADE_KEYS = [",", ".", "/"]
+
+
+def load_config():
+    if CONFIG_PATH.exists():
+        cfg = dict(DEFAULT_CONFIG)
+        cfg.update(json.loads(CONFIG_PATH.read_text()))
+        return cfg
+    CONFIG_PATH.write_text(json.dumps(DEFAULT_CONFIG, indent=2))
+    print(f"Created {CONFIG_PATH.name} with default settings -- edit it if "
+          f"you play windowed or if `watch` can't read the round counter.\n")
+    return dict(DEFAULT_CONFIG)
+
+
+# ---------------------------------------------------------------------------
+# Screen: capture + coordinate conversion
+# ---------------------------------------------------------------------------
+# All plan coordinates are *normalized*: fractions of the game area from
+# 0.0 to 1.0. That way a plan written at 1920x1080 still works at 2560x1440.
+
+class Screen:
+    def __init__(self, region):
+        self.sct = mss.MSS() if hasattr(mss, "MSS") else mss.mss()
+        if region:
+            self.left, self.top, self.w, self.h = region
+        else:
+            mon = self.sct.monitors[1]  # primary monitor
+            self.left, self.top = mon["left"], mon["top"]
+            self.w, self.h = mon["width"], mon["height"]
+
+    def to_pixels(self, nx, ny):
+        return self.left + int(nx * self.w), self.top + int(ny * self.h)
+
+    def to_norm(self, px, py):
+        return (px - self.left) / self.w, (py - self.top) / self.h
+
+    def grab(self, norm_box=None):
+        """Screenshot the whole game area, or a normalized sub-box, as BGR."""
+        if norm_box is None:
+            box = {"left": self.left, "top": self.top,
+                   "width": self.w, "height": self.h}
+        else:
+            x, y, w, h = norm_box
+            box = {"left": self.left + int(x * self.w),
+                   "top": self.top + int(y * self.h),
+                   "width": max(1, int(w * self.w)),
+                   "height": max(1, int(h * self.h))}
+        shot = self.sct.grab(box)
+        return np.asarray(shot)[:, :, :3].copy()  # BGRA -> BGR
+
+
+# ---------------------------------------------------------------------------
+# Game window auto-detection (Windows)
+# ---------------------------------------------------------------------------
+
+class _RECT(ctypes.Structure):
+    _fields_ = [("left", ctypes.c_long), ("top", ctypes.c_long),
+                ("right", ctypes.c_long), ("bottom", ctypes.c_long)]
+
+
+class _POINT(ctypes.Structure):
+    _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+
+
+def find_game_window(title_fragment):
+    """Find the game window by title. Returns (hwnd, title, region) where
+    region = [left, top, width, height] of the CLIENT area -- the actual
+    game pixels, excluding the title bar and borders -- or None if no match.
+    Windows only; on other platforms this quietly returns None."""
+    if sys.platform != "win32":
+        return None
+    user32 = ctypes.windll.user32
+    matches = []
+
+    @ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+    def _collect(hwnd, _lparam):
+        if user32.IsWindowVisible(hwnd):
+            n = user32.GetWindowTextLengthW(hwnd)
+            if n:
+                buf = ctypes.create_unicode_buffer(n + 1)
+                user32.GetWindowTextW(hwnd, buf, n + 1)
+                if title_fragment.lower() in buf.value.lower():
+                    matches.append((hwnd, buf.value))
+        return True
+
+    user32.EnumWindows(_collect, 0)
+    if not matches:
+        return None
+    # Prefer an exact title match over "some browser tab mentioning bloons".
+    matches.sort(key=lambda m: m[1].lower() != title_fragment.lower())
+    hwnd, title = matches[0]
+
+    def client_region():
+        rect = _RECT()
+        user32.GetClientRect(hwnd, ctypes.byref(rect))
+        origin = _POINT(0, 0)
+        user32.ClientToScreen(hwnd, ctypes.byref(origin))
+        return [origin.x, origin.y,
+                rect.right - rect.left, rect.bottom - rect.top]
+
+    region = client_region()
+    if region[2] <= 0 or region[3] <= 0:   # minimized -- restore and retry
+        user32.ShowWindow(hwnd, 9)          # SW_RESTORE
+        time.sleep(0.6)
+        region = client_region()
+    if region[2] <= 0 or region[3] <= 0:
+        return None
+    return hwnd, title, region
+
+
+def focus_game_window(hwnd):
+    """Best-effort: bring the game to the foreground so clicks land in it."""
+    if hwnd is None or sys.platform != "win32":
+        return False
+    try:
+        user32 = ctypes.windll.user32
+        user32.ShowWindow(hwnd, 9)          # SW_RESTORE
+        user32.SetForegroundWindow(hwnd)
+        time.sleep(0.4)
+        return True
+    except Exception:
+        return False
+
+
+def make_screen(cfg):
+    """Work out where the game is (see DEFAULT_CONFIG for priority order),
+    print what was decided, and return (Screen, hwnd_or_None)."""
+    hwnd = None
+    if cfg.get("region"):
+        region = cfg["region"]
+        source = 'config.json "region" override'
+    else:
+        found = find_game_window(cfg.get("window_title", "BloonsTD6"))
+        if found:
+            hwnd, title, region = found
+            source = f"auto-detected window {title!r}"
+        else:
+            region = None
+            source = ("full primary monitor (no game window found -- fine "
+                      "for fullscreen)")
+    screen = Screen(region)
+    print(f"Game area: {source} -> ({screen.left}, {screen.top}, "
+          f"{screen.w}x{screen.h})")
+    return screen, hwnd
+
+
+# ---------------------------------------------------------------------------
+# Round detection (OCR)
+# ---------------------------------------------------------------------------
+
+def setup_tesseract(cfg):
+    if pytesseract is None:
+        sys.exit("pytesseract is not installed. Run: pip install pytesseract")
+    if cfg.get("tesseract_cmd"):
+        pytesseract.pytesseract.tesseract_cmd = cfg["tesseract_cmd"]
+        return
+    if shutil.which("tesseract"):
+        return
+    for candidate in (r"C:\Program Files\Tesseract-OCR\tesseract.exe",
+                      r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe"):
+        if Path(candidate).exists():
+            pytesseract.pytesseract.tesseract_cmd = candidate
+            return
+    sys.exit("Tesseract binary not found. Install it (see README.md) or set "
+             "\"tesseract_cmd\" in config.json.")
+
+
+def preprocess_round_crop(img):
+    """Make HUD text easy for tesseract: big, black-on-white. Threshold
+    190: the text is pure white while grass-texture highlights sit around
+    170-185 (visible as speckle in the user's debug dumps at 170)."""
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    gray = cv2.resize(gray, None, fx=3, fy=3, interpolation=cv2.INTER_CUBIC)
+    _, thresh = cv2.threshold(gray, 190, 255, cv2.THRESH_BINARY)
+    return cv2.bitwise_not(thresh)
+
+
+def parse_round(text):
+    """'13/40' -> 13. Returns None when the text doesn't look like a round."""
+    text = text.strip()
+    if "/" in text:
+        text = text.split("/", 1)[0]
+    digits = "".join(ch for ch in text if ch.isdigit())
+    if digits and 1 <= int(digits) <= 200:
+        return int(digits)
+    return None
+
+
+def read_round(screen, cfg):
+    """Returns (parsed_round_or_None, raw_text, crop_img, processed_img)."""
+    crop = screen.grab(cfg["round_box"])
+    processed = preprocess_round_crop(crop)
+    text = pytesseract.image_to_string(
+        processed,
+        config="--psm 7 -c tessedit_char_whitelist=0123456789/").strip()
+    return parse_round(text), text, crop, processed
+
+
+def plausible(new, last):
+    """Rounds only move forward, and only a little at a time."""
+    if new is None:
+        return False
+    if last is None:
+        return 1 <= new <= 100
+    return last <= new <= last + 3
+
+
+def save_config_value(key, value):
+    """Persist one setting into config.json without touching the rest."""
+    cfg = (json.loads(CONFIG_PATH.read_text()) if CONFIG_PATH.exists()
+           else dict(DEFAULT_CONFIG))
+    cfg[key] = value
+    CONFIG_PATH.write_text(json.dumps(cfg, indent=2))
+
+
+# ---------------------------------------------------------------------------
+# Self-learned price book. No hardcoded tables: BTD6 rebalances costs
+# between versions and they differ per difficulty, so the bot records what
+# every purchase ACTUALLY cost (cash before minus cash after) and reuses
+# that knowledge on later runs -- to wait for exact amounts, and to
+# estimate what a plan will need in total.
+# ---------------------------------------------------------------------------
+
+PRICES_PATH = Path(__file__).parent / "prices.json"
+PRICES = json.loads(PRICES_PATH.read_text()) if PRICES_PATH.exists() else {}
+PRICE_DIFFICULTY = "medium"      # set from the plan's mode when playing
+
+# Upgrades you haven't unlocked with XP. The bot must NOT press these --
+# doing so spends your limited XP. Auto-detected (an affordable press that
+# moves neither cash nor tier is locked) and remembered across runs. You
+# can also pre-seed this file by hand, e.g. {"easy:dartling:0:1": true} or
+# broader "don't go past tier 2 on ninja" style entries you add yourself.
+LOCKED_PATH = Path(__file__).parent / "locked.json"
+LOCKED = json.loads(LOCKED_PATH.read_text()) if LOCKED_PATH.exists() else {}
+
+
+def is_locked(ttype, path_i, tier):
+    return bool(LOCKED.get(price_key(ttype, path_i, tier)))
+
+
+def mark_locked(ttype, path_i, tier):
+    key = price_key(ttype, path_i, tier)
+    if not LOCKED.get(key):
+        LOCKED[key] = True
+        LOCKED_PATH.write_text(json.dumps(LOCKED, indent=1, sort_keys=True))
+        print(f"      (locked: {key} not unlocked -- won't try it again)")
+
+
+def price_key(*parts):
+    return ":".join([PRICE_DIFFICULTY, *map(str, parts)])
+
+
+def record_price(key, cost):
+    """Persist a learned price -- with poison filters: every real BTD6
+    price is a multiple of 5, and deltas computed from corrupted cash
+    reads almost never are. Implausibly huge costs are rejected too."""
+    if cost is None or cost <= 0 or cost > 120000:
+        return
+    if cost % 5 != 0:              # every real BTD6 price ends in 0 or 5
+        return
+    cost = int(cost)
+    if PRICES.get(key) != cost:
+        PRICES[key] = cost
+        PRICES_PATH.write_text(json.dumps(PRICES, indent=1, sort_keys=True))
+
+
+def plan_cost_estimate(plan):
+    """Total plan cost from learned prices; returns (known_total,
+    unknown_purchase_count). Unknowns become known after one run."""
+    tiers, total, unknown = {}, 0, 0
+    for a in plan["actions"]:
+        if a.get("do") == "place":
+            tiers[tuple(a["at"])] = (a["tower"].lower(), [0, 0, 0])
+            p = PRICES.get(price_key(a["tower"].lower()))
+            total, unknown = total + (p or 0), unknown + (p is None)
+        elif a.get("do") == "upgrade":
+            at, entry = tuple(a["at"]), None
+            if tiers:
+                near = min(tiers, key=lambda q: (q[0] - at[0]) ** 2
+                           + (q[1] - at[1]) ** 2)
+                if ((near[0] - at[0]) ** 2
+                        + (near[1] - at[1]) ** 2) ** 0.5 <= 0.03:
+                    entry = tiers[near]
+            if entry is None:
+                unknown += sum(a["path"])
+                continue
+            ttype, cur = entry
+            for i, count in enumerate(a["path"]):
+                for _ in range(count):
+                    cur[i] += 1
+                    p = PRICES.get(price_key(ttype, i, cur[i]))
+                    total, unknown = total + (p or 0), unknown + (p is None)
+    return total, unknown
+
+
+def _round_box_from_gear(screen):
+    """Primary locator: find the blue settings-gear button in the top strip
+    (a very distinctive color blob) and derive the round counter's box from
+    it -- the number always sits at a fixed offset to the gear's left.
+    Pure geometry, so it doesn't care that OCR struggles with the game
+    font."""
+    off_x = 0.40
+    strip = screen.grab([off_x, 0.0, 1.0 - off_x, 0.14])
+    hsv = cv2.cvtColor(strip, cv2.COLOR_BGR2HSV)
+    mask = cv2.inRange(hsv, (90, 120, 140), (112, 255, 255))
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL,
+                                   cv2.CHAIN_APPROX_SIMPLE)
+    best = None
+    for c in contours:
+        area = cv2.contourArea(c)
+        x, y, w, h = cv2.boundingRect(c)
+        if area < 150 or w > 0.09 * screen.w or h > 0.11 * screen.h:
+            continue
+        if not (0.7 <= w / max(h, 1) <= 1.4):   # the button is square-ish
+            continue
+        if best is None or area > best[0]:
+            best = (area, x, y, w, h)
+    if best is None:
+        return None
+    _, x, y, w, h = best
+    gcx = x + w / 2 + off_x * screen.w          # strip -> game-area pixels
+    gcy = y + h / 2
+    size = (w + h) / 2
+    x0 = max(0.0, (gcx - 3.2 * size) / screen.w)
+    y0 = max(0.0, (gcy - 0.18 * size) / screen.h)
+    return [round(x0, 4), round(y0, 4),
+            round(2.5 * size / screen.w, 4),
+            round(0.70 * size / screen.h, 4)]
+
+
+def _round_box_from_ocr(screen):
+    """Fallback locator: OCR the whole top strip and look for a word shaped
+    like 'N/NN'. Returns a padded normalized [x, y, w, h] box, or None."""
+    strip = screen.grab([0.0, 0.0, 0.92, 0.12])   # skip the shop column
+    gray = cv2.cvtColor(strip, cv2.COLOR_BGR2GRAY)
+    scale = 2
+    big = cv2.resize(gray, None, fx=scale, fy=scale,
+                     interpolation=cv2.INTER_CUBIC)
+    _, thr = cv2.threshold(big, 170, 255, cv2.THRESH_BINARY)
+    thr = cv2.bitwise_not(thr)
+    data = pytesseract.image_to_data(
+        thr, config="--psm 11 -c tessedit_char_whitelist=0123456789/",
+        output_type=pytesseract.Output.DICT)
+    for i, word in enumerate(data["text"]):
+        if not re.fullmatch(r"\d{1,3}/\d{1,3}", word.strip()):
+            continue
+        if float(data["conf"][i]) < 30 or data["height"][i] < 10:
+            continue
+        x, y = data["left"][i] / scale, data["top"][i] / scale
+        bw, bh = data["width"][i] / scale, data["height"][i] / scale
+        pad_x, pad_y = 0.8 * bw, 0.6 * bh
+        nx = max(0.0, (x - pad_x) / screen.w)
+        ny = max(0.0, (y - pad_y) / screen.h)
+        nw = min(1.0 - nx, (bw + 2 * pad_x) / screen.w)
+        nh = min(1.0 - ny, (bh + 2 * pad_y) / screen.h)
+        return [round(nx, 4), round(ny, 4), round(nw, 4), round(nh, 4)]
+    debug_dir = Path(__file__).parent / "debug"
+    debug_dir.mkdir(exist_ok=True)
+    cv2.imwrite(str(debug_dir / "round_search_strip.png"), thr)
+    return None
+
+
+def read_round_stable(screen, cfg, tries=4):
+    """Return a round value only if two consecutive reads agree -- a
+    misaligned crop produces flickery garbage that never repeats reliably,
+    so this filters out the lucky-junk reads that fooled earlier versions."""
+    prev = None
+    for _ in range(tries):
+        value, *_ = read_round(screen, cfg)
+        if value is not None and value == prev:
+            return value
+        prev = value
+        time.sleep(0.25)
+    return None
+
+
+def preflight_round_box(screen, cfg, recalibrate=False):
+    """Guarantee a readable round counter before relying on it. Candidate
+    boxes come from the gear geometry first, OCR search second; a candidate
+    is only saved after an actual stable read verifies it. Requires a
+    loaded map (the counter must be on screen)."""
+    original = cfg["round_box"]
+    if not recalibrate and read_round_stable(screen, cfg) is not None:
+        return True
+    print("Locating the round counter on screen...")
+    candidates = []
+    box = _round_box_from_gear(screen)
+    if box:
+        candidates.append(("settings-gear geometry", box))
+    box = _round_box_from_ocr(screen)
+    if box:
+        candidates.append(("OCR pattern search", box))
+    for how, cand in candidates:
+        cfg["round_box"] = cand
+        if read_round_stable(screen, cfg) is not None:
+            if cand != original:
+                save_config_value("round_box", cand)
+                print(f"Locked on via {how}. Saved round_box={cand} to "
+                      f"config.json.")
+            return True
+    cfg["round_box"] = original          # nothing verified; restore
+    return read_round_stable(screen, cfg) is not None
+
+
+def _hud_icon(screen, strip_box, hsv_lo, hsv_hi, extra_range=None):
+    """Find a round HUD icon (coin/heart) in a strip. Returns
+    (cx, cy, size) in game-area pixels, or None -- dumping the search
+    strip and mask to debug/ on failure so misses can be diagnosed."""
+    strip = screen.grab(strip_box)
+    hsv = cv2.cvtColor(strip, cv2.COLOR_BGR2HSV)
+    mask = cv2.inRange(hsv, hsv_lo, hsv_hi)
+    if extra_range:
+        mask = cv2.bitwise_or(mask, cv2.inRange(hsv, *extra_range))
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL,
+                                   cv2.CHAIN_APPROX_SIMPLE)
+    best = None
+    for c in contours:
+        area = cv2.contourArea(c)
+        x, y, w, h = cv2.boundingRect(c)
+        if area < 200 or w > 0.06 * screen.w or h > 0.08 * screen.h:
+            continue
+        if not (0.7 <= w / max(h, 1) <= 1.4):
+            continue
+        if best is None or area > best[0]:
+            best = (area, x, y, w, h)
+    if best is None:
+        debug_dir = Path(__file__).parent / "debug"
+        debug_dir.mkdir(exist_ok=True)
+        tag = f"{int(hsv_lo[0])}_{int(hsv_hi[0])}"
+        cv2.imwrite(str(debug_dir / f"hud_search_{tag}_strip.png"), strip)
+        cv2.imwrite(str(debug_dir / f"hud_search_{tag}_mask.png"), mask)
+        return None
+    _, x, y, w, h = best
+    return (x + w / 2 + strip_box[0] * screen.w,
+            y + h / 2 + strip_box[1] * screen.h, (w + h) / 2)
+
+
+def _cash_box_from_coin(screen):
+    """Find the gold coin icon in the top-left HUD; the cash number sits
+    just to its right. Starting the box past the '$' sign keeps the symbol
+    from being misread as a digit."""
+    icon = _hud_icon(screen, [0.0, 0.0, 0.35, 0.12],
+                     (12, 110, 140), (40, 255, 255))
+    if icon is None:
+        return None
+    ccx, ccy, size = icon
+    # Start BEFORE the '$' on purpose: read_cash anchors on it, and a box
+    # that starts too far right clips the leading digit instead
+    # ('$374' -> '74', seen in the field as impossible cash deltas).
+    x0 = max(0.0, (ccx + 0.55 * size) / screen.w)
+    y0 = max(0.0, (ccy - 0.55 * size) / screen.h)
+    return [round(x0, 4), round(y0, 4),
+            round(4.6 * size / screen.w, 4),
+            round(1.1 * size / screen.h, 4)]
+
+
+def _cash_box_from_text(screen, cfg=None):
+    """Find the cash NUMBER itself via word bounding boxes. Guards against
+    the lives counter masquerading as cash: candidate tokens must sit
+    strictly RIGHT of the lives box (the coin separates them), and a token
+    containing '$' beats rightmost-ness -- on frames where '$845' fails to
+    tokenize, '200' (lives) must never win by default."""
+    strip = screen.grab([0.0, 0.0, 0.35, 0.12])
+    gray = cv2.cvtColor(strip, cv2.COLOR_BGR2GRAY)
+    scale = 2
+    big = cv2.resize(gray, None, fx=scale, fy=scale,
+                     interpolation=cv2.INTER_CUBIC)
+    _, thr = cv2.threshold(big, 170, 255, cv2.THRESH_BINARY)
+    thr = cv2.bitwise_not(thr)
+    data = pytesseract.image_to_data(
+        thr, config="--psm 11 -c tessedit_char_whitelist=0123456789$,",
+        output_type=pytesseract.Output.DICT)
+    min_x = 0.14 * screen.w                    # right of lives, always
+    lb = (cfg or {}).get("lives_box")
+    if lb:
+        min_x = max(min_x, (lb[0] + lb[2]) * screen.w)
+    tokens = []
+    for i, word in enumerate(data["text"]):
+        w = word.strip()
+        digits = re.sub(r"\D", "", w)
+        if len(digits) < 2:
+            continue
+        if float(data["conf"][i]) < 30 or data["height"][i] < 10:
+            continue
+        x = data["left"][i] / scale
+        if x <= min_x:
+            continue                           # that's lives territory
+        tokens.append(("$" in w, x, data["top"][i] / scale,
+                       data["width"][i] / scale, data["height"][i] / scale))
+    if not tokens:
+        return None
+    has_dollar = [t for t in tokens if t[0]]
+    pool = has_dollar or tokens
+    _, x, y, bw, bh = max(pool, key=lambda t: t[1])
+    x0 = max(0.0, (x - 0.4 * bh) / screen.w)
+    y0 = max(0.0, (y - 0.5 * bh) / screen.h)
+    return [round(x0, 4), round(y0, 4),
+            round((bw + 2.4 * bh) / screen.w, 4),   # room to grow rightward
+            round(2.0 * bh / screen.h, 4)]
+
+
+def _snap_cash_box_to_digits(screen, box):
+    """Char-level refinement: given a roughly-right cash box, use
+    tesseract's per-character boxes on a widened crop to trim it to the
+    DIGITS ONLY -- excluding the '$', the glyph that keeps OCR-ing as a
+    leading 5/3, and any coin sliver to its left."""
+    x, y, w, h = box
+    wide = [max(0.0, x - h), max(0.0, y - 0.3 * h), w + 2 * h, h * 1.6]
+    crop = screen.grab(wide)
+    proc = preprocess_round_crop(crop)
+    try:
+        raw = pytesseract.image_to_boxes(
+            proc, config="--psm 7 -c tessedit_char_whitelist=0123456789$")
+    except Exception:
+        return None
+    ph = proc.shape[0]
+    chars = []
+    for line in raw.splitlines():
+        p = line.split()
+        if len(p) >= 5:
+            try:
+                c, x1, y1, x2, y2 = p[0], *map(int, p[1:5])
+            except ValueError:
+                continue
+            chars.append((c, x1, ph - y2, x2, ph - y1))  # to top-origin
+    last_dollar = max((i for i, ch in enumerate(chars) if ch[0] == "$"),
+                      default=-1)
+    digits = [ch for ch in chars[last_dollar + 1:] if ch[0].isdigit()]
+    if len(digits) < 2:
+        return None
+    scale = 3.0                                # preprocess upscales 3x
+    dx1 = min(d[1] for d in digits) / scale
+    dx2 = max(d[3] for d in digits) / scale
+    dy1 = min(d[2] for d in digits) / scale
+    dy2 = max(d[4] for d in digits) / scale
+    bh = max(dy2 - dy1, 8)
+    nx0 = wide[0] + max(0.0, dx1 - 0.25 * bh) / screen.w
+    ny0 = wide[1] + max(0.0, dy1 - 0.35 * bh) / screen.h
+    return [round(nx0, 4), round(ny0, 4),
+            round((dx2 - dx1 + 2.2 * bh) / screen.w, 4),  # rightward room
+            round(1.7 * bh / screen.h, 4)]
+
+
+def _cash_boxes_from_heart(screen):
+    """Fallback anchor: the heart locator is rock-solid, and the coin sits
+    at a fixed offset to its right, so cash can be derived even when the
+    coin's own colors evade detection. Returns SEVERAL candidate boxes at
+    slightly different horizontal offsets -- the digits' exact start
+    varies with how the icon size was estimated -- for the caller to
+    verify by actually reading each one."""
+    icon = _hud_icon(screen, [0.0, 0.0, 0.20, 0.12],
+                     (0, 140, 120), (8, 255, 255),
+                     extra_range=((172, 140, 120), (180, 255, 255)))
+    if icon is None:
+        return []
+    hcx, hcy, size = icon
+    boxes = []
+    for shift in (4.8, 4.4, 5.2, 4.0):        # land on/before the '$';
+        x0 = max(0.0, (hcx + shift * size) / screen.w)   # parser anchors
+        y0 = max(0.0, (hcy - 0.55 * size) / screen.h)
+        boxes.append([round(x0, 4), round(y0, 4),
+                      round(4.8 * size / screen.w, 4),
+                      round(1.1 * size / screen.h, 4)])
+    return boxes
+
+
+def read_cash(screen, cfg):
+    """Current cash as an int, or None if unknown/unreadable. When a '$'
+    is recognized, only digits AFTER it count -- otherwise the glyph
+    OCRs as a leading 5/3 and inflates the value. Implausibly huge
+    readings return None rather than poisoning the economy."""
+    box = cfg.get("cash_box")
+    if not box or pytesseract is None:
+        return None
+    crop = screen.grab(box)
+    processed = preprocess_round_crop(crop)
+    text = pytesseract.image_to_string(
+        processed,
+        config="--psm 7 -c tessedit_char_whitelist=0123456789$,").strip()
+    if "$" in text:
+        text = text.rsplit("$", 1)[1]
+    digits = re.sub(r"\D", "", text)
+    if not digits:
+        return None
+    value = int(digits)
+    return value if value <= 150000 else None
+
+
+def read_cash_confirmed(screen, cfg):
+    """Two reads that must corroborate: equal -> that value; one a clean
+    SUFFIX of the other (prepended-junk signature) -> the shorter; else
+    None. Used where a single bad read does lasting damage (watermarks,
+    price recording)."""
+    a = read_cash(screen, cfg)
+    time.sleep(0.15)
+    b = read_cash(screen, cfg)
+    if a is None or b is None:
+        return a if a == b else None
+    if a == b:
+        return a
+    sa, sb = str(a), str(b)
+    if sa.endswith(sb):
+        return b
+    if sb.endswith(sa):
+        return a
+    return None
+
+
+def _overlaps_lives(box, cfg):
+    """Does this candidate cash box intrude on the lives counter's zone?"""
+    lb = cfg.get("lives_box")
+    if not box or not lb:
+        return False
+    return (box[0] < lb[0] + lb[2] and lb[0] < box[0] + box[2]
+            and box[1] < lb[1] + lb[3] and lb[1] < box[1] + box[3])
+
+
+def preflight_cash_box(screen, cfg, recalibrate=False):
+    """Locate/verify the cash counter: text search first, then coin
+    anchor, then heart-derived candidates -- each verified by actually
+    reading it. Any candidate (including a previously SAVED box) that
+    overlaps the lives counter is discarded on sight: lives reads
+    'succeed' fluently, so a mispositioned box never self-corrects
+    without this guard. All-fail dumps crops to debug/."""
+    if _overlaps_lives(cfg.get("cash_box"), cfg):
+        dbg("saved cash_box overlaps the LIVES counter -- discarding it")
+        cfg["cash_box"] = None
+        save_config_value("cash_box", None)
+    original = cfg.get("cash_box")
+    if not recalibrate and original and read_cash(screen, cfg) is not None:
+        # The box reads -- but a box that clips the leading digit ALSO
+        # reads ('$2,851' -> 851) and would stay wrong forever. Always try
+        # the digit snap; adopt it when it reads and differs.
+        snapped = _snap_cash_box_to_digits(screen, original)
+        if snapped and snapped != original:
+            cfg["cash_box"] = snapped
+            if read_cash(screen, cfg) is not None:
+                save_config_value("cash_box", snapped)
+                dbg(f"cash box re-fitted to the digit run: {snapped}")
+                return True
+            cfg["cash_box"] = original
+        return True
+    candidates = []
+    text_box = _cash_box_from_text(screen, cfg)
+    if text_box:
+        candidates.append(("cash text search", text_box))
+    coin = _cash_box_from_coin(screen)
+    if coin:
+        candidates.append(("coin icon", coin))
+    candidates += [("heart-relative geometry", b)
+                   for b in _cash_boxes_from_heart(screen)]
+    candidates = [(how, b) for how, b in candidates
+                  if not _overlaps_lives(b, cfg)]
+    for how, box in candidates:
+        cfg["cash_box"] = box
+        ok = False
+        for _ in range(3):
+            if read_cash(screen, cfg) is not None:
+                ok = True
+                break
+            time.sleep(0.15)
+        if ok:
+            snapped = _snap_cash_box_to_digits(screen, box)
+            if snapped:
+                cfg["cash_box"] = snapped
+                if read_cash(screen, cfg) is not None:
+                    box = snapped
+                    how += " + digit snap"
+                else:
+                    cfg["cash_box"] = box
+            if box != original:
+                save_config_value("cash_box", box)
+                print(f"Cash counter located via {how}. Saved "
+                      f"cash_box={box} to config.json.")
+            return True
+    cfg["cash_box"] = original
+    if candidates:
+        debug_dir = Path(__file__).parent / "debug"
+        debug_dir.mkdir(exist_ok=True)
+        for n, (how, box) in enumerate(candidates):
+            crop = screen.grab(box)
+            cv2.imwrite(str(debug_dir / f"cash_cand{n}.png"), crop)
+            cv2.imwrite(str(debug_dir / f"cash_cand{n}_proc.png"),
+                        preprocess_round_crop(crop))
+        dbg(f"cash: {len(candidates)} candidate boxes all failed to read "
+            f"-- crops dumped to debug/cash_cand*.png")
+    return read_cash(screen, cfg) is not None
+
+
+def wait_for_cash(screen, cfg, amount, timeout=120):
+    """Block until cash >= amount (used by 'wait_cash' plan actions)."""
+    t_end = time.time() + timeout
+    while time.time() < t_end:
+        cash = read_cash(screen, cfg)
+        if cash is not None and cash >= amount:
+            return True
+        time.sleep(1.0)
+    print(f"      !! waited {timeout}s for ${amount} without seeing it -- "
+          f"continuing anyway")
+    return False
+
+
+def _lives_box_from_heart(screen):
+    """Find the red heart icon in the top-left HUD; the lives number sits
+    just to its right. Red wraps around hue 0, so two HSV ranges."""
+    icon = _hud_icon(screen, [0.0, 0.0, 0.20, 0.12],
+                     (0, 140, 120), (8, 255, 255),
+                     extra_range=((172, 140, 120), (180, 255, 255)))
+    if icon is None:
+        return None
+    hcx, hcy, size = icon
+    x0 = max(0.0, (hcx + 0.7 * size) / screen.w)
+    y0 = max(0.0, (hcy - 0.55 * size) / screen.h)
+    return [round(x0, 4), round(y0, 4),
+            round(2.9 * size / screen.w, 4),   # short of the coin's edge
+            round(1.1 * size / screen.h, 4)]
+
+
+def read_lives(screen, cfg):
+    """Current lives as an int, or None if unknown/unreadable."""
+    box = cfg.get("lives_box")
+    if not box or pytesseract is None:
+        return None
+    crop = screen.grab(box)
+    processed = preprocess_round_crop(crop)
+    text = pytesseract.image_to_string(
+        processed,
+        config="--psm 7 -c tessedit_char_whitelist=0123456789").strip()
+    digits = re.sub(r"\D", "", text)
+    if not digits:
+        return None
+    value = int(digits)
+    return value if value <= 1000 else None    # '2001' = coin-sliver junk
+
+
+def preflight_lives_box(screen, cfg, recalibrate=False):
+    """Locate/verify the lives counter. Needed for defeat detection --
+    the round counter stays visible on the defeat screen."""
+    original = cfg.get("lives_box")
+    if not recalibrate and read_lives(screen, cfg) is not None:
+        return True
+    box = _lives_box_from_heart(screen)
+    if box:
+        cfg["lives_box"] = box
+        if read_lives(screen, cfg) is not None:
+            if box != original:
+                save_config_value("lives_box", box)
+                print(f"Lives counter located. Saved lives_box={box} to "
+                      f"config.json.")
+            return True
+        cfg["lives_box"] = original
+    return read_lives(screen, cfg) is not None
+
+
+# ---------------------------------------------------------------------------
+# Actions
+# ---------------------------------------------------------------------------
+
+def click_norm(screen, pt, button="left"):
+    x, y = screen.to_pixels(*pt)
+    pyautogui.moveTo(x, y, duration=0.15)
+    click(button)
+
+
+def counter_steady(screen, cfg):
+    """Two successful parses out of four reads -- a single OCR flicker
+    while a ghost is still held must never fake a 'placed!' verdict."""
+    hits = 0
+    for _ in range(4):
+        if read_round(screen, cfg)[0] is not None:
+            hits += 1
+            if hits >= 2:
+                return True
+        time.sleep(0.12)
+    return False
+
+
+def counter_visible(screen, cfg, tries=3):
+    """The round counter is HIDDEN while a tower ghost is held (a big X
+    replaces it) -- which turns it into a free placement sensor:
+      hotkey pressed, counter still visible  -> no ghost = can't afford yet
+      clicked, counter visible again         -> ghost gone = tower placed
+      clicked, counter still hidden          -> ghost stuck = invalid spot"""
+    for _ in range(tries):
+        if read_round(screen, cfg)[0] is not None:
+            return True
+        time.sleep(0.12)
+    return False
+
+
+def ui_clear(screen, cfg):
+    """True only when the HUD is readable AND no upgrade panel is open on
+    EITHER side. A left-side panel leaves the round counter visible, so
+    the counter alone is not enough -- that blind spot let left panels
+    linger, covering the cash/lives HUD and left-half towers."""
+    return (counter_visible(screen, cfg, tries=2)
+            and detect_panel_side(screen) is None)
+
+
+def clear_ui(screen, cfg):
+    """Restore a clean state: no ghost, no panel (either side), no pause.
+    Escalation: unpause -> right-click (cancels ghosts) -> the detected
+    panel's own X button -> clicks on known-empty ground."""
+    unpause_if_needed(screen, cfg)
+    if ui_clear(screen, cfg):
+        return True
+    click("right")
+    time.sleep(0.3)
+    if ui_clear(screen, cfg):
+        return True
+    side = detect_panel_side(screen)
+    if side:
+        dbg(f"closing {side} panel via its X button")
+        click_norm(screen, PANEL_GEOM["close_x"][side])
+        time.sleep(0.35)
+        if ui_clear(screen, cfg):
+            return True
+    else:
+        # Counter dark but no panel: a stuck GHOST is the likely blocker.
+        # Esc cancels placement; if nothing was actually held it opens the
+        # pause menu instead -- which the next line immediately heals.
+        dbg("no panel detected -- pressing Esc to cancel a stuck ghost")
+        press_key("esc")
+        time.sleep(0.4)
+        unpause_if_needed(screen, cfg)
+        if ui_clear(screen, cfg):
+            return True
+    for pt in [cfg["deselect_point"]] + SAFE_CLICKS:
+        click_norm(screen, pt)
+        time.sleep(0.35)
+        if ui_clear(screen, cfg):
+            return True
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Upgrade-panel vision: read prices, XP locks, and closed paths by LOOKING,
+# never by pressing. Geometry measured from the user's screenshots
+# (normalized to the game client, so it scales with resolution).
+# ---------------------------------------------------------------------------
+
+PANEL_GEOM = {
+    # x, y, w, h of the big tower portrait, per panel side. NOTE: the
+    # portrait BACKGROUND is category-colored (Primary=blue, Magic=purple,
+    # ...) so detection must be color-agnostic -- see detect_panel_side.
+    "portrait": {"left": [0.016, 0.171, 0.201, 0.242],
+                 "right": [0.638, 0.171, 0.203, 0.242]},
+    # the brown title band ("NINJA MONKEY") at the panel's top, per side
+    "title_band": {"left": [0.031, 0.078, 0.165, 0.045],
+                   "right": [0.655, 0.078, 0.165, 0.045]},
+    # panel WOOD is sampled at three heights (title band, the gap under
+    # the portrait, the sell bar) -- see detect_panel_side for why
+    "brown_strips": [(0.078, 0.045), (0.416, 0.020), (0.845, 0.045)],
+    # x, w of the green price-button column, per panel side
+    "button_x": {"left": [0.130, 0.092], "right": [0.752, 0.092]},
+    # y, h of each of the three upgrade rows' button areas
+    "rows_y": [[0.440, 0.112], [0.577, 0.113], [0.715, 0.114]],
+    # within a button: where the price text strip sits (y-frac, h-frac)
+    "text_strip": [0.56, 0.34],
+    # the panel's X close button, per side (a deterministic way to close)
+    "close_x": {"left": [0.2156, 0.0883], "right": [0.8417, 0.0883]},
+    # where the white 'PAUSE' header text sits when the pause menu is open,
+    # the tan menu body below it (second factor -- flowers can't fake it),
+    # and the CONTINUE button that closes it (harmless grass if not paused)
+    "pause_band": [0.44, 0.042, 0.12, 0.045],
+    "pause_body": [0.30, 0.115, 0.40, 0.060],
+    "continue_btn": [0.695, 0.776],
+}
+
+
+def _brown_fraction(img):
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    mask = cv2.inRange(hsv, (10, 60, 80), (28, 220, 230))
+    return float((mask > 0).mean())
+
+
+def looks_paused(screen):
+    """Is the pause menu open? Two independent cues must BOTH fire: the
+    white 'PAUSE' header text AND the tan menu body below it. White
+    flowers/confetti can fake the first; only the menu supplies both."""
+    band = screen.grab(PANEL_GEOM["pause_band"])
+    if _white_fraction(band) < 0.06:
+        return False
+    body = screen.grab(PANEL_GEOM["pause_body"])
+    return _brown_fraction(body) > 0.45
+
+
+def unpause_if_needed(screen, cfg):
+    if looks_paused(screen):
+        dbg("pause menu detected -- clicking CONTINUE")
+        click_norm(screen, PANEL_GEOM["continue_btn"])
+        time.sleep(0.6)
+        return True
+    return False
+
+
+def _lightblue_fraction(img):
+    """The defeat dialog's BODY blue -- lighter and less saturated than
+    the gear/portrait blues, so it gets its own range."""
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    mask = cv2.inRange(hsv, (90, 40, 120), (118, 220, 255))
+    return float((mask > 0).mean())
+
+
+def looks_defeated(screen):
+    """Is the DEFEAT screen up? v2: the first version sampled the middle
+    of the dialog -- which is mostly its DARK navy inner panels -- with a
+    bright-blue test, so it never fired. Now: two light-blue body strips
+    (above the ROUND box, and the gap between the inner boxes, measured
+    from a real defeat frame) plus the orange DEFEAT title."""
+    strip_a = screen.grab([0.32, 0.310, 0.36, 0.050])
+    strip_b = screen.grab([0.32, 0.506, 0.36, 0.020])
+    if _lightblue_fraction(strip_a) < 0.45 \
+            or _lightblue_fraction(strip_b) < 0.45:
+        return False
+    title = screen.grab([0.38, 0.285, 0.24, 0.065])
+    hsv = cv2.cvtColor(title, cv2.COLOR_BGR2HSV)
+    orange = cv2.inRange(hsv, (3, 120, 120), (24, 255, 255))
+    return float((orange > 0).mean()) > 0.08
+
+
+def _white_fraction(img):
+    """Fraction of near-white pixels -- the XP button's big up-arrow."""
+    return float((img > 185).all(axis=2).mean())
+
+
+def _blue_fraction(img):
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    mask = cv2.inRange(hsv, (90, 60, 150), (112, 255, 255))
+    return float((mask > 0).mean())
+
+
+def _green_fraction(img):
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    mask = cv2.inRange(hsv, (45, 100, 100), (80, 255, 255))
+    return float((mask > 0).mean())
+
+
+def _classify_price_text(text):
+    """'$510' or '510' -> ('cash', 510); anything with X/P -> ('xp', None).
+    The XP-safety no longer hinges on OCR: the white up-arrow pixel test
+    runs BEFORE any text is read, so digits reaching this point are a
+    price even when tesseract drops the stylized '$'."""
+    t = text.upper()
+    if "X" in t or "P" in t:
+        return "xp", None
+    digits = re.sub(r"\D", "", t)
+    if digits:
+        return "cash", int(digits)
+    return "none", None
+
+
+def _vivid_nongreen_fraction(img):
+    """Fraction of saturated, bright, NOT-green pixels. Every tower
+    portrait background is a solid vivid color (blue, purple, ...) while
+    the map underneath is grass green and desaturated gray path -- so this
+    is high exactly when a portrait is present, whatever its category."""
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    h, s, v = hsv[..., 0], hsv[..., 1], hsv[..., 2]
+    vivid = (s > 90) & (v > 110)
+    green = (h > 35) & (h < 85)
+    return float((vivid & ~green).mean())
+
+
+def detect_panel_side(screen):
+    """Which side is an upgrade panel open on, if any? Portrait COLOR is
+    useless: backgrounds are category-themed and Military's is GREEN --
+    on a grass map, a sniper's panel was literally camouflaged from the
+    old detector. Instead, triangulate the panel's WOOD: brown must show
+    at 2 of 3 fixed heights (title band, under-portrait gap, sell bar).
+    Grass/path/bloons can't fake brown; the HUD's gold coin covers far
+    too little of one strip to matter."""
+    x_of = {"left": PANEL_GEOM["title_band"]["left"][:1]
+            + [PANEL_GEOM["title_band"]["left"][2]],
+            "right": PANEL_GEOM["title_band"]["right"][:1]
+            + [PANEL_GEOM["title_band"]["right"][2]]}
+    for side in ("left", "right"):
+        sx, sw = x_of[side]
+        hits = 0
+        for sy, sh in PANEL_GEOM["brown_strips"]:
+            if _brown_fraction(screen.grab([sx, sy, sw, sh])) >= 0.35:
+                hits += 1
+        if hits >= 2:
+            return side
+    return None
+
+
+def read_upgrade_row(screen, side, row_i):
+    """Classify one upgrade row:
+      ('cash', price)  -- green button, white price: buyable now
+      ('short', price) -- GREYED button, RED price: a real upgrade we
+                          can't afford yet. The red digits still OCR, so
+                          the price is learned without buying anything.
+      ('xp', None)     -- white unlock arrow: XP-locked, never press
+      ('closed', None) -- no button, no price text at all
+      ('unread', None) -- something's there but unreadable
+    Price OCR is majority-voted across thresholds ('$' sometimes reads as
+    a leading '5')."""
+    bx, bw = PANEL_GEOM["button_x"][side]
+    ry, rh = PANEL_GEOM["rows_y"][row_i]
+    button = screen.grab([bx, ry, bw, rh])
+    green = _green_fraction(button)
+    ty, th = PANEL_GEOM["text_strip"]
+    crop = screen.grab([bx, ry + ty * rh, bw, th * rh])
+
+    if green >= 0.10:
+        upper = button[:max(1, int(button.shape[0] * 0.55))]
+        if _white_fraction(upper) > 0.22:
+            return "xp", None            # the big white unlock arrow
+        prices = []
+        for lo in (175, 190, 205):
+            white = (crop > lo).all(axis=2).astype(np.uint8) * 255
+            big = cv2.resize(white, None, fx=3, fy=3,
+                             interpolation=cv2.INTER_CUBIC)
+            text = pytesseract.image_to_string(
+                cv2.bitwise_not(big),
+                config="--psm 7 -c tessedit_char_whitelist=0123456789$,XP"
+            ).strip()
+            state, price = _classify_price_text(text)
+            if state == "xp":
+                return "xp", None
+            if state == "cash" and price:
+                prices.append(price)
+        if prices:
+            best = max(set(prices), key=prices.count)
+            if prices.count(best) == 1 and len(set(prices)) > 1:
+                best = min(prices)       # '$'->'5' only ever ADDS digits
+            return "cash", best
+
+    # No (readable) green button: check for the RED price of an
+    # unaffordable upgrade before concluding the path is closed. The
+    # channel gap must be LARGE (+90): panel-wood brown is reddish enough
+    # to sneak past a looser filter.
+    b, g, r = (crop[..., 0].astype(int), crop[..., 1].astype(int),
+               crop[..., 2].astype(int))
+    red_mask = (r > 150) & (r > g + 90) & (r > b + 90)
+    if red_mask.mean() > 0.02:
+        reads = []
+        for fx in (3, 4):                     # two scales vote: the '$'
+            big = cv2.resize(red_mask.astype(np.uint8) * 255, None,
+                             fx=fx, fy=fx, interpolation=cv2.INTER_CUBIC)
+            text = pytesseract.image_to_string(
+                cv2.bitwise_not(big),
+                config="--psm 7 -c tessedit_char_whitelist=0123456789$,"
+            ).strip()
+            digits = re.sub(r"\D", "", text)
+            if digits:
+                reads.append(int(digits))
+        price = None
+        if reads:
+            price = reads[0] if len(set(reads)) == 1 else min(reads)
+            if price % 5:                     # all BTD6 prices end in 0/5
+                price = None
+        return "short", price
+
+    if green < 0.10:
+        return "closed", None
+    debug_dir = Path(__file__).parent / "debug"
+    debug_dir.mkdir(exist_ok=True)
+    cv2.imwrite(str(debug_dir / f"panel_row{row_i}_unread.png"), crop)
+    return "unread", None
+
+
+def read_upgrade_panel(screen, cfg, tower=None):
+    """With a tower selected, read all three rows in one pass. Also feeds
+    everything it sees into the books: visible prices are recorded WITHOUT
+    buying, visible XP locks are recorded WITHOUT pressing. Returns
+    (side, rows) or (None, None) if the panel wasn't found."""
+    side = detect_panel_side(screen)
+    if side is None:
+        return None, None
+    rows = [read_upgrade_row(screen, side, i) for i in range(3)]
+    if tower:
+        ttype = tower["tower"].lower()
+        for i, (state, price) in enumerate(rows):
+            tier = tower["path"][i] + 1
+            if state == "cash" and price:
+                record_price(price_key(ttype, i, tier), price)
+            elif state == "xp":
+                mark_locked(ttype, i, tier)
+    return side, rows
+
+
+# Fallback offsets used only when NO mask is loaded. Two rings: small
+# nudges, then wider jumps that can actually clear a path arm.
+NUDGES = [(0, 0), (0.012, 0), (-0.012, 0), (0, 0.02), (0, -0.02),
+          (0.012, 0.02), (-0.012, 0.02), (0.012, -0.02), (-0.012, -0.02),
+          (0.03, 0), (-0.03, 0), (0, 0.045), (0, -0.045),
+          (0.03, 0.045), (-0.03, 0.045), (0.03, -0.045), (-0.03, -0.045)]
+
+
+def placement_candidates(spot, tower=None, limit=12):
+    """Where to try placing, in order. First the planned spot itself; then
+    the nearest known-good mask points. Large-footprint towers try the 6
+    nearest ROOMY points, then the 6 nearest strict points -- the game is
+    the final judge, and a rejected click only costs a couple seconds."""
+    candidates = [list(spot)]
+    seen = {(round(spot[0], 4), round(spot[1], 4))}
+    if tower in LARGE_TOWERS:
+        pools = [(MASK_ROOMY, 6), (MASK_POINTS, 6)]
+    elif MASK_POINTS:
+        pools = [(MASK_POINTS, limit)]
+    else:
+        pools = []
+    for pool, take in pools:
+        for q in sorted(pool, key=lambda p: (p[0] - spot[0]) ** 2
+                        + (p[1] - spot[1]) ** 2)[:take]:
+            key = (round(q[0], 4), round(q[1], 4))
+            if key not in seen:
+                seen.add(key)
+                candidates.append([q[0], q[1]])
+    if len(candidates) == 1:                   # no mask -> blind nudges
+        candidates += [[spot[0] + dx, spot[1] + dy] for dx, dy in NUDGES[1:]]
+    return candidates
+
+
+def act_place(screen, cfg, action):
+    """Try to place a tower. Returns (status, landed):
+      ("placed", [x, y])  -- tower is down at that coordinate
+      ("broke", None)     -- no ghost appeared: can't afford it YET. One
+                             press, one check, immediate return -- the
+                             caller waits for income; this never counts
+                             as a placement failure.
+      ("no_spot", None)   -- ghost held but every candidate click was
+                             rejected: genuinely unplaceable around here."""
+    key = TOWER_HOTKEYS[action["tower"].lower()]
+    spot = action["at"]
+    candidates = placement_candidates(spot, action["tower"].lower())
+    deadline = time.time() + action.get("timeout", 60)
+
+    cash_before = read_cash(screen, cfg)
+    press_key(key)                            # try to pick up the ghost
+    time.sleep(0.3)
+    if counter_visible(screen, cfg, tries=2):
+        return "broke", None                  # no ghost -> just money
+
+    attempt = 0
+    max_tries = min(len(candidates), 12)
+    while attempt < max_tries and time.time() < deadline:
+        target = candidates[attempt]
+        target = [round(target[0], 4), round(target[1], 4)]
+        click_norm(screen, target)
+        time.sleep(0.35)
+        if counter_steady(screen, cfg):       # ghost truly gone -> placed
+            note = ""
+            cash_after = read_cash(screen, cfg)
+            if cash_before is not None and cash_after is not None \
+                    and cash_after < cash_before:
+                record_price(price_key(action["tower"].lower()),
+                             cash_before - cash_after)
+                note = f"  (${cash_before} -> ${cash_after})"
+            if attempt:
+                note += f"  [moved to {target}]"
+            print(f"      placed {action['tower']}{note}")
+            return "placed", target
+        # Rejected: cancel the ghost and VERIFY it's gone -- some game
+        # states (e.g. nudge mode) leave a stuck ghost that right-click
+        # doesn't clear, and re-pressing the hotkey then does nothing.
+        click("right")
+        time.sleep(0.25)
+        if not counter_visible(screen, cfg, tries=2):
+            dbg("ghost stuck after right-click -- pressing Esc")
+            press_key("esc")
+            time.sleep(0.4)
+            unpause_if_needed(screen, cfg)
+        attempt += 1
+        if attempt < max_tries:
+            press_key(key)
+            time.sleep(0.25)
+            if counter_visible(screen, cfg, tries=1):
+                return "broke", None          # affordability flapped
+    click("right")                            # tidy up any held ghost
+    return "no_spot", None
+
+
+def act_upgrade(screen, cfg, action, tower=None, timeout=8):
+    """Buy the requested upgrade tiers, deciding by SIGHT first. After the
+    panel opens, the bot reads each row: '$price' = buyable, 'XP' = locked
+    (recorded, never pressed -- your XP is yours), no green button = path
+    closed/maxed. A key is only pressed on a row visually confirmed as a
+    cash upgrade we can afford. Returns a status string:
+      "bought" / "locked" / "closed" / "broke" / "no_select" / "unread"."""
+    ttype = tower["tower"].lower() if tower else None
+
+    # Skip tiers already known to be XP-locked, before opening anything.
+    if tower:
+        for i, count in enumerate(action["path"]):
+            if count and is_locked(ttype, i, tower["path"][i] + 1):
+                return "locked"
+
+    # A leftover panel from a previous action physically COVERS towers
+    # underneath it -- clicks would hit UI, not the map. Clean state first.
+    if not ui_clear(screen, cfg):
+        clear_ui(screen, cfg)
+
+    # Selection success = a panel APPEARED (either side). The old check --
+    # "did the round counter hide?" -- only worked for right-side panels;
+    # left panels leave the counter visible and were invisible to it.
+    side = None
+    for _ in range(3):
+        click_norm(screen, action["at"])
+        time.sleep(cfg["action_delay"])
+        side = detect_panel_side(screen)
+        if side:
+            break
+    if not side:
+        dbg(f"select failed at {action['at']} (no panel appeared)")
+        if tower is not None:
+            tower["_noselect"] = tower.get("_noselect", 0) + 1
+            if tower["_noselect"] == 1:
+                debug_dir = Path(__file__).parent / "debug"
+                debug_dir.mkdir(exist_ok=True)
+                shot = debug_dir / (f"no_select_{ttype}_"
+                                    f"{int(time.time()) % 100000}.png")
+                cv2.imwrite(str(shot), screen.grab())
+                dbg(f"full-frame screenshot saved: {shot.name}")
+        clear_ui(screen, cfg)      # close anything half-open before leaving
+        return "no_select"
+
+    # One full three-row harvest per tower (prices + locks recorded); after
+    # that, only the row being bought is read -- OCR is the expensive part.
+    if tower is not None and not tower.get("_scanned"):
+        rows = [read_upgrade_row(screen, side, i) for i in range(3)]
+        ttype_l = tower["tower"].lower()
+        for i, (state, price) in enumerate(rows):
+            t = tower["path"][i] + 1
+            k = price_key(ttype_l, i, t)
+            if state == "cash" and price:
+                record_price(k, price)          # green: cleanest source
+            elif state == "short" and price and k not in PRICES:
+                record_price(k, price)          # red: fill blanks only
+            elif state == "xp":
+                mark_locked(ttype_l, i, t)
+        tower["_side"] = side
+        tower["_scanned"] = True
+        dbg(f"panel[{side}] {ttype}: " + " / ".join(
+            f"{s}{'' if p is None else ' $' + str(p)}"
+            for s, p in rows))
+    else:
+        rows = [None, None, None]     # lazy: read only the row being bought
+
+    status = "bought"
+    for i, count in enumerate(action["path"]):
+        for _ in range(count):
+            tier = tower["path"][i] + 1 if tower else None
+            pkey = (price_key(ttype, i, tier) if tower else None)
+            if tower and is_locked(ttype, i, tier):
+                status = "locked"
+                break
+            if rows is not None and rows[i] is None and side:
+                rows[i] = read_upgrade_row(screen, side, i)
+                if tower:                       # book the lazy read too
+                    state, seen_price = rows[i]
+                    if state == "cash" and seen_price:
+                        record_price(pkey, seen_price)
+                    elif state == "short" and seen_price \
+                            and pkey not in PRICES:
+                        record_price(pkey, seen_price)
+                    elif state == "xp":
+                        mark_locked(ttype, i, tier)
+            info = rows[i] if rows else None
+            if info:
+                state, seen_price = info
+                if state == "xp":
+                    status = "locked"          # already recorded by reader
+                    break
+                if state == "short":
+                    # Greyed button + red price: a real upgrade we can't
+                    # afford yet. Price is booked; the caller saves up.
+                    status = "broke"
+                    break
+                if state == "closed":
+                    if tower:
+                        closed = tower.setdefault("closed_paths", [])
+                        if i not in closed:
+                            closed.append(i)
+                    status = "closed"
+                    break
+                if state == "unread":
+                    status = "unread"          # can't be sure: don't press
+                    break
+            known = PRICES.get(pkey) if pkey else None
+            cash = read_cash(screen, cfg)
+            if known is not None and cash is not None and cash < known:
+                status = "broke"               # caller waits, menu closed
+                break
+            press_key(UPGRADE_KEYS[i])
+            time.sleep(0.5)
+            after = read_cash(screen, cfg)
+            if cash is None or after is None:
+                if tower:
+                    tower["path"][i] += 1      # can't verify; trust
+            elif after <= cash - 10:           # verified purchase
+                if pkey:
+                    record_price(pkey, cash - after)
+                if tower:
+                    tower["path"][i] += 1
+            else:
+                if info and info[0] == "cash":
+                    # The row VISUALLY showed a cash price, so a press that
+                    # moves nothing means we couldn't afford it (likely a
+                    # bad price read, e.g. '$' OCR'd as '5') -- it is NOT
+                    # an XP lock, and marking it as one would be poison.
+                    dbg(f"press didn't take on a cash row (path {i + 1}) "
+                        f"-- treating as broke")
+                    status = "broke"
+                    break
+                # No visual info and an affordable press moved nothing:
+                # the safety net -- treat as locked and stop pressing.
+                if tower:
+                    mark_locked(ttype, i, tier)
+                status = "locked"
+                break
+            # Multi-tier buys: refresh this row so the NEXT tier's state
+            # (new price / new XP wall) is read before another press.
+            if rows is not None and count > 1 and side:
+                rows[i] = read_upgrade_row(screen, side, i)
+        if status != "bought":
+            break
+    if not clear_ui(screen, cfg):
+        print("      !! panel would not close -- HUD blocked")
+    return status
+
+
+def act_press(screen, cfg, action):
+    """Generic key press -- e.g. abilities on '1', '2', '3'."""
+    press_key(action["key"])
+
+
+ACTION_FUNCS = {"place": act_place, "upgrade": act_upgrade, "press": act_press}
+
+
+def describe(a):
+    if a["do"] == "place":
+        return f"place {a['tower']} at {a['at']}"
+    if a["do"] == "upgrade":
+        return f"upgrade tower at {a['at']} by {a['path']}"
+    if a["do"] == "press":
+        return f"press '{a['key']}'"
+    return str(a)
+
+
+def validate_plan(plan):
+    for a in plan["actions"]:
+        if a.get("do") not in ACTION_FUNCS:
+            sys.exit(f"Unknown action type in plan: {a}")
+        if a["do"] == "place" and a["tower"].lower() not in TOWER_HOTKEYS:
+            sys.exit(f"Unknown tower '{a['tower']}' -- add its hotkey to "
+                     f"TOWER_HOTKEYS in btd6_bot.py")
+        if "round" not in a:
+            sys.exit(f"Action is missing a \"round\": {a}")
+
+
+# ---------------------------------------------------------------------------
+# Subcommands
+# ---------------------------------------------------------------------------
+
+def cmd_locate(args):
+    cfg = load_config()
+    screen, _ = make_screen(cfg)
+    print("Hover the mouse over the game. Copy the norm=[x, y] values into "
+          "your plan file. Ctrl+C to stop.\n")
+    try:
+        while True:
+            x, y = pyautogui.position()
+            nx, ny = screen.to_norm(x, y)
+            print(f"\r  pixel=({x:>5},{y:>5})   norm=[{nx:0.3f}, {ny:0.3f}]   ",
+                  end="", flush=True)
+            time.sleep(0.15)
+    except KeyboardInterrupt:
+        print("\nDone.")
+
+
+def cmd_watch(args):
+    cfg = load_config()
+    setup_tesseract(cfg)
+    screen, _ = make_screen(cfg)
+    debug_dir = Path(__file__).parent / "debug"
+    debug_dir.mkdir(exist_ok=True)
+    if not preflight_round_box(screen, cfg, recalibrate=True):
+        print("Auto-locate failed. Is a map loaded with the round counter "
+              "visible? debug/round_search_strip.png shows what was "
+              "searched. You can still set \"round_box\" by hand.\n")
+    if not preflight_cash_box(screen, cfg, recalibrate=True):
+        print("Couldn't locate the cash counter (non-fatal: placement "
+              "still self-verifies, but cash gating is off).\n")
+    if not preflight_lives_box(screen, cfg, recalibrate=True):
+        print("Couldn't locate the lives counter (needed for defeat "
+              "detection in farm/play).\n")
+    print("Reading the round counter once per second. With a game loaded, "
+          "'parsed' should match the round on screen.")
+    print(f"Debug images -> {debug_dir}/round_crop.png and "
+          f"round_processed.png (adjust \"round_box\" in config.json until "
+          f"the crop shows just the round text). Ctrl+C to stop.\n")
+    try:
+        while True:
+            value, text, crop, processed = read_round(screen, cfg)
+            cv2.imwrite(str(debug_dir / "round_crop.png"), crop)
+            cv2.imwrite(str(debug_dir / "round_processed.png"), processed)
+            print(f"  raw={text!r:<12} parsed={value}   "
+                  f"cash={read_cash(screen, cfg)}   "
+                  f"lives={read_lives(screen, cfg)}")
+            time.sleep(1.0)
+    except KeyboardInterrupt:
+        print("\nDone.")
+
+
+def ring_red_shift(cur, clean, cx, cy, r_in, r_out):
+    """How much redder did a ring around (cx, cy) get compared to the clean
+    map? The ring sits inside the ghost's range circle but OUTSIDE the
+    monkey's body -- monkey fur is brown (red-heavy!), which is exactly what
+    fooled the first version of this detector. Comparing against the clean
+    frame cancels out map art (red flowers, brown crates, ...) too.
+
+    Valid spot: gray translucent circle -> all channels shift equally -> ~0.
+    Invalid spot: red circle -> red channel shifts far more -> 20-60."""
+    h, w = cur.shape[:2]
+    y0, y1 = max(cy - r_out, 0), min(cy + r_out + 1, h)
+    x0, x1 = max(cx - r_out, 0), min(cx + r_out + 1, w)
+    yy, xx = np.ogrid[y0:y1, x0:x1]
+    d2 = (yy - cy) ** 2 + (xx - cx) ** 2
+    ring = (d2 >= r_in ** 2) & (d2 <= r_out ** 2)
+    if not ring.any():
+        return 0.0
+    diff = cur[y0:y1, x0:x1].astype(int) - clean[y0:y1, x0:x1].astype(int)
+    diff = diff[ring]                       # N x 3, BGR
+    # Per-pixel red shift, then the MEDIAN: a genuine invalid-tint covers
+    # the whole ring so the median is high, while transient red things --
+    # falling confetti, firework flashes (hi, seasonal skins), a sliver of
+    # brown monkey fur -- only cover a fraction of pixels and can't move it.
+    shift_px = diff[:, 2] - (diff[:, 0] + diff[:, 1]) / 2.0
+    return float(np.median(shift_px))
+
+
+def cmd_scan(args):
+    """Machine-generated placement knowledge: no human hovering required.
+    Hold a tower ghost, sweep the cursor over a grid, and ask the game
+    (via the red invalid-tint on the range circle) whether each point is
+    placeable."""
+    cfg = load_config()
+    screen, hwnd = make_screen(cfg)
+    tower = args.tower.lower()
+    if tower not in TOWER_HOTKEYS:
+        sys.exit(f"Unknown tower '{args.tower}' -- see TOWER_HOTKEYS.")
+    threshold = float(cfg.get("scan_red_shift", 12.0))
+
+    masks_dir = Path(__file__).parent / "masks"
+    debug_dir = Path(__file__).parent / "debug"
+    masks_dir.mkdir(exist_ok=True)
+    debug_dir.mkdir(exist_ok=True)
+
+    # Grid over the play area only: skip the top HUD bar and the tower
+    # shop column on the right.
+    xs = np.arange(0.03, 0.84, args.step)
+    ys = np.arange(0.10, 0.95, args.step)
+    total = len(xs) * len(ys)
+
+    # Ring radii in pixels: inside the range circle, outside the monkey.
+    r_in = max(6, int(0.020 * screen.h))
+    r_out = max(r_in + 4, int(0.050 * screen.h))
+
+    print(f"Scanning {total} grid points with a {tower} ghost "
+          f"(step {args.step}). Takes a couple of minutes.")
+    print("Have the map LOADED but round 1 NOT started. Starting in 3 "
+          "seconds...")
+    focus_game_window(hwnd)
+    time.sleep(3)
+
+    clean = screen.grab()        # ghost-free reference frame + preview base
+
+    # Pick up the ghost, then VERIFY the game actually got the key press.
+    # (If it didn't, every point would silently read as "placeable" --
+    # that's the all-green half-map failure mode.)
+    check_pt = (0.45, 0.50)
+    pyautogui.moveTo(*screen.to_pixels(*check_pt))
+    time.sleep(0.2)
+    press_key(TOWER_HOTKEYS[tower])
+    time.sleep(0.5)
+    cx, cy = int(check_pt[0] * screen.w), int(check_pt[1] * screen.h)
+    probe = screen.grab()
+    changed = np.abs(
+        probe[cy - r_out:cy + r_out, cx - r_out:cx + r_out].astype(int) -
+        clean[cy - r_out:cy + r_out, cx - r_out:cx + r_out].astype(int)
+    ).mean()
+    if changed < 2.0:
+        sys.exit(
+            "\nNo tower ghost appeared after pressing "
+            f"'{TOWER_HOTKEYS[tower]}'.\n"
+            "The game did not receive the key press. Checklist:\n"
+            "  1. pip install pydirectinput  (pyautogui keys don't reach "
+            "Unity games)\n"
+            "  2. The BTD6 window must be focused (it should be -- the bot "
+            "focuses it)\n"
+            "  3. In-game hotkeys must be the BTD6 defaults (Settings -> "
+            "Hotkeys).\n     NOTE: BTD4/BTD5 hotkey lists on the wiki do "
+            "NOT apply to BTD6.")
+    print(f"Ghost confirmed (frame change {changed:.1f}). Sweeping...")
+
+    valid, invalid = [], []
+    done = 0
+    try:
+        for ny in ys:
+            for nx in xs:
+                pyautogui.moveTo(*screen.to_pixels(nx, ny))
+                time.sleep(0.08)              # let the tint render
+                cur = screen.grab()
+                px, py = int(nx * screen.w), int(ny * screen.h)
+                shift = ring_red_shift(cur, clean, px, py, r_in, r_out)
+                if 6.0 <= shift <= 30.0:
+                    # Borderline: could be a firework flash or confetti
+                    # cluster. A transient fades between frames; a real
+                    # invalid-tint doesn't. Resample and keep the lower.
+                    time.sleep(0.22)
+                    cur = screen.grab()
+                    shift = min(shift, ring_red_shift(cur, clean,
+                                                      px, py, r_in, r_out))
+                point = [round(float(nx), 3), round(float(ny), 3)]
+                (invalid if shift > threshold else valid).append(point)
+                done += 1
+            print(f"\r  {done}/{total} points checked", end="", flush=True)
+    except KeyboardInterrupt:
+        print("\nScan aborted.")
+    finally:
+        click("right")                        # drop the ghost
+    print()
+
+    # "Strict" points have all four grid neighbors valid too -- these sit
+    # comfortably inside placeable regions, away from track edges where
+    # detection is fuzzy and tower footprints overhang. Stage 2 samples
+    # from these; edge points are kept separately for reference.
+    step = args.step
+    valid_set = {(p[0], p[1]) for p in valid}
+    strict = [p for p in valid
+              if all((round(p[0] + dx, 3), round(p[1] + dy, 3)) in valid_set
+                     for dx, dy in ((step, 0), (-step, 0),
+                                    (0, step), (0, -step)))]
+
+    mask_path = masks_dir / f"{args.name}_{tower}.json"
+    mask_path.write_text(json.dumps(
+        {"map": args.name, "tower": tower, "step": args.step,
+         "game_area": [screen.w, screen.h],
+         "valid_strict": strict, "valid": valid}, indent=1))
+
+    preview = clean.copy()
+    for nx, ny in invalid:
+        cv2.circle(preview, (int(nx * screen.w), int(ny * screen.h)),
+                   2, (0, 0, 255), -1)
+    edge = valid_set - {(p[0], p[1]) for p in strict}
+    for nx, ny in edge:                       # valid but near an edge
+        cv2.circle(preview, (int(nx * screen.w), int(ny * screen.h)),
+                   3, (0, 165, 255), -1)
+    for nx, ny in strict:                     # safely placeable
+        cv2.circle(preview, (int(nx * screen.w), int(ny * screen.h)),
+                   4, (0, 255, 0), -1)
+    preview_path = debug_dir / f"scan_{args.name}_{tower}_preview.png"
+    cv2.imwrite(str(preview_path), preview)
+
+    print(f"{len(strict)} safely placeable (green) + {len(edge)} edge "
+          f"(orange) / {done} checked.")
+    print(f"Mask    -> {mask_path}")
+    print(f"Preview -> {preview_path}")
+    print("Green = safe interior spots (use these for plans). Orange = "
+          "valid but hugging an edge. If it disagrees with the map, tune "
+          "\"scan_red_shift\" in config.json and rescan.")
+
+
+MASK_POINTS = []     # strict points from the loaded mask; retries use these
+MASK_ROOMY = []      # strict points eroded once more: room for BIG towers
+SAFE_CLICKS = []     # mask points far from every tower -- safe to deselect on
+
+# Towers with footprints larger than the dart used for scanning. They only
+# snap to / retry on ROOMY points (extra clearance on all sides).
+LARGE_TOWERS = {"super", "village", "farm", "ace"}
+
+# Tower pool for random layouts in `farm` (land towers only, since the
+# mask is scanned with a dart ghost).
+FARM_TOWERS = ["dart", "tack", "bomb", "sniper", "ninja", "wizard",
+               "druid", "alchemist", "glue", "ice"]
+
+
+def load_mask(mask_path):
+    """Load a scan mask and derive both placement pools: strict points for
+    normal towers, and once-more-eroded 'roomy' points for big-footprint
+    towers whose base needs extra clearance."""
+    global MASK_POINTS, MASK_ROOMY
+    data = json.loads(mask_path.read_text())
+    points = data.get("valid_strict") or data.get("valid") or []
+    step = data.get("step", 0.025)
+    have = {(p[0], p[1]) for p in points}
+    MASK_ROOMY = [p for p in points
+                  if all((round(p[0] + dx, 3), round(p[1] + dy, 3)) in have
+                         for dx, dy in ((step, 0), (-step, 0),
+                                        (0, step), (0, -step)))] or points
+    MASK_POINTS = points
+    return points
+
+
+def _slug(text):
+    return re.sub(r"[^a-z0-9]+", "_", (text or "").lower()).strip("_")
+
+
+def find_mask_path(plan, plan_path):
+    """Resolve the plan's mask file. Order: the plan's explicit "mask"
+    field; then auto-discovery -- any masks/*.json whose name contains the
+    plan's map name; then a lone masks/*.json if there's exactly one."""
+    bases = (Path.cwd(), plan_path.parent, Path(__file__).parent)
+    name = plan.get("mask")
+    if name:
+        for base in bases:
+            if (base / name).exists():
+                return base / name
+        print(f"Mask '{name}' not found where expected -- trying "
+              f"auto-discovery instead.")
+    found = []
+    for base in bases:
+        d = base / "masks"
+        if d.is_dir():
+            for p in sorted(d.glob("*.json")):
+                if p.resolve() not in [f.resolve() for f in found]:
+                    found.append(p)
+    slug = _slug(plan.get("map"))
+    if slug:
+        matched = [p for p in found if slug in p.stem]
+        if matched:
+            return matched[0]
+    if len(found) == 1:
+        return found[0]
+    return None
+
+
+def snap_plan_to_mask(plan, plan_path):
+    """Resolve every 'place' coordinate to the nearest safe (strict) point
+    from the map's scan mask, and keep the mask points around so placement
+    retries can use them too. Plan coordinates are HINTS."""
+    global MASK_POINTS
+    mask_path = find_mask_path(plan, plan_path)
+    if mask_path is None:
+        if any(a.get("do") == "place" for a in plan["actions"]):
+            print("!" * 64)
+            print("!! No scan mask found. Placements will use RAW plan")
+            print("!! coordinates and retries will be blind nudges -- this")
+            print("!! is how towers end up wrestling with the path.")
+            print("!! Fix: run `scan <map_name>` once for this map.")
+            print("!" * 64)
+        return
+    data_points = load_mask(mask_path)
+    if not data_points:
+        print(f"Mask {mask_path.name} has no placeable points -- rescan.")
+        return
+    points = data_points
+    moves = []
+    for a in plan["actions"]:
+        if a.get("do") != "place":
+            continue
+        large = a["tower"].lower() in LARGE_TOWERS
+        pool = MASK_ROOMY if large else points
+        # Big towers get a longer leash: cramped map centers may put the
+        # nearest roomy spot far away, and relocating a super beats
+        # stranding it on an unplaceable hint.
+        cap = 0.20 if large else 0.08
+        ax, ay = a["at"]
+        nx, ny = min(pool, key=lambda q: (q[0] - ax) ** 2 + (q[1] - ay) ** 2)
+        dist = ((nx - ax) ** 2 + (ny - ay) ** 2) ** 0.5
+        if dist > cap:
+            print(f"   !! no safe point within reach of {a['at']} "
+                  f"(nearest is {dist:.2f} away) -- leaving it as-is")
+            continue
+        if dist > 0.001:
+            print(f"   snapped {a['tower']} {a['at']} -> [{nx}, {ny}]")
+            moves.append((tuple(a["at"]), [nx, ny]))
+            a["at"] = [nx, ny]
+    # Second pass: upgrades written against the ORIGINAL coordinates must
+    # follow their tower to its snapped position, or they'd click grass.
+    for a in plan["actions"]:
+        if a.get("do") != "upgrade" or not moves:
+            continue
+        ax, ay = a["at"]
+        (ox, oy), new = min(
+            moves, key=lambda m: (m[0][0] - ax) ** 2 + (m[0][1] - ay) ** 2)
+        if ((ox - ax) ** 2 + (oy - ay) ** 2) ** 0.5 <= 0.03:
+            a["at"] = list(new)
+    # Safe deselect spots: mask points far from every planned tower, so a
+    # panel-closing click can never land on a monkey and open a new panel.
+    place_pts = [a["at"] for a in plan["actions"] if a.get("do") == "place"]
+    if place_pts:
+        def _min_d(q):
+            return min((q[0] - p[0]) ** 2 + (q[1] - p[1]) ** 2
+                       for p in place_pts)
+        SAFE_CLICKS[:] = [list(q) for q in
+                          sorted(points, key=_min_d, reverse=True)[:3]]
+    print(f"Placements snapped to safe points from {mask_path.name}.")
+
+
+# ---------------------------------------------------------------------------
+# STAGE 2: the data farm. Random layouts -> unattended episodes ->
+# (layout, final_round, outcome) rows in runs_log.jsonl.
+# ---------------------------------------------------------------------------
+
+def random_genome(rng, n_towers):
+    """An ordered buy list: towers on random mask points, then shuffled
+    single-tier upgrades (a random main path to <=4, a crosspath to <=2).
+    Executed greedily as cash allows -- timing emerges from the economy.
+    Tiers already known to be XP-locked are never generated."""
+    genome = []
+    spots = rng.sample(MASK_POINTS, min(n_towers, len(MASK_POINTS)))
+    types = [rng.choice(FARM_TOWERS) for _ in spots]
+    for spot, ttype in zip(spots, types):
+        genome.append({"do": "place", "tower": ttype,
+                       "at": [spot[0], spot[1]]})
+    ups = []
+    for ref, ttype in enumerate(types):
+        main = rng.randrange(3)
+        cross = rng.choice([p for p in range(3) if p != main])
+        want = ([main] * rng.randint(0, 4)) + ([cross] * rng.randint(0, 2))
+        tiers = {main: 0, cross: 0}
+        for path_i in want:
+            tiers[path_i] += 1
+            if is_locked(ttype, path_i, tiers[path_i]):
+                tiers[path_i] -= 1             # locked: stop this path here
+                continue
+            ups.append((ref, path_i))
+    rng.shuffle(ups)
+    for ref, path_i in ups:
+        vec = [0, 0, 0]
+        vec[path_i] = 1
+        genome.append({"do": "upgrade", "ref": ref, "path": vec})
+    return genome
+
+
+def run_episode(screen, cfg, genome, final_round):
+    """Play one random layout to survival or defeat. Returns
+    (outcome, final_round_reached, towers, lives_by_round)."""
+    # (Re)calibrate sensors on the clean, un-started map -- the best frame
+    # we'll ever get. Cash preflight runs UNCONDITIONALLY: a box that
+    # clips the leading digit still 'reads', and only the digit snap
+    # inside the preflight can catch and re-fit it.
+    if not preflight_cash_box(screen, cfg):
+        dbg("cash unreadable -- recalibrating from scratch")
+        preflight_cash_box(screen, cfg, recalibrate=True)
+    if read_lives(screen, cfg) is None:
+        dbg("lives unreadable -- recalibrating from the heart icon")
+        preflight_lives_box(screen, cfg, recalibrate=True)
+    dbg(f"sensors: cash={read_cash(screen, cfg)} "
+        f"lives={read_lives(screen, cfg)}")
+
+    press_key("space")
+    time.sleep(0.3)
+    press_key("space")                        # fast-forward
+    queue = list(genome)
+    landed_by_ref, towers = {}, {}
+    lives_by_round = {}
+    broke_at = [None]     # cash watermark: level of the last money-failure
+    # Safe deselect spots for THIS episode: mask points farthest from every
+    # tower this genome will place, so a panel-closing click can't select
+    # a monkey. (The genome differs per episode, so recompute each time.)
+    spots = [g["at"] for g in genome if g["do"] == "place"]
+    pool = MASK_ROOMY or MASK_POINTS
+    if pool and spots:
+        SAFE_CLICKS[:] = sorted(
+            pool, key=lambda q: -min((q[0] - p[0]) ** 2 + (q[1] - p[1]) ** 2
+                                     for p in spots))[:3]
+    place_i = 0
+    attempts = 0
+    last_round = prev_read = None
+    lives = prev_lives = None
+    zero_streak = 0
+    dumped_defeat_check = False
+    misreads = 0
+    outcome = "hud_lost"
+    while True:
+        unpause_if_needed(screen, cfg)        # cheap; a paused game shows
+        value, *_ = read_round(screen, cfg)   # a frozen-but-visible counter
+        prev_lives = lives
+        lives = read_lives(screen, cfg)
+        accepted = None
+        if value is not None:
+            if value == last_round:
+                accepted = value
+            elif plausible(value, last_round) and value == prev_read:
+                accepted = value
+            prev_read = value
+        if accepted is None:
+            misreads += 1
+        else:
+            misreads = 0
+            if accepted != last_round:
+                last_round = accepted
+                if lives is not None:
+                    lives_by_round[str(last_round)] = lives
+                print(f"   [round {last_round:>3}]  lives={lives}  "
+                      f"({len(queue)} buys pending)")
+
+        if lives == 0:
+            zero_streak += 1
+            if zero_streak == 1 and not looks_defeated(screen) \
+                    and not dumped_defeat_check:
+                # Detectors disagree: photograph the moment so a missed
+                # defeat diagnoses itself from the debug folder.
+                dumped_defeat_check = True
+                ddir = Path(__file__).parent / "debug"
+                ddir.mkdir(exist_ok=True)
+                cv2.imwrite(str(ddir / f"defeat_check_{int(time.time()) % 100000}.png"),
+                            screen.grab())
+        elif lives is not None:
+            zero_streak = 0
+        if (lives == 0 and prev_lives == 0) or zero_streak >= 3:
+            outcome = "defeat"                # defeat screen (HUD stays!)
+            break
+        if looks_defeated(screen):
+            time.sleep(0.4)
+            if looks_defeated(screen):        # confirmed on two samples
+                dbg("DEFEAT screen recognized visually")
+                outcome = "defeat"
+                break
+
+        # Try the next buy (one attempt per loop, so rounds keep reading).
+        if queue and last_round is not None:
+            # Find the first queue item that isn't sleeping on a cooldown,
+            # so a stuck/expensive upgrade never blocks the whole build.
+            idx = next((j for j, it in enumerate(queue)
+                        if it.get("_wake", 0) <= time.time()), None)
+            item = queue[idx] if idx is not None else None
+            if item is None:
+                pass                           # all pending buys cooling down
+            elif item["do"] == "place":
+                ttype = item["tower"].lower()
+                base = PRICES.get(price_key(ttype))
+                cash = read_cash(screen, cfg)
+                if base and cash is not None and cash < base:
+                    dbg(f"{ttype}: saving up (${cash}/${base})")
+                    item["_wake"] = time.time() + 3    # saving up: silent
+                elif broke_at[0] is not None and cash is not None \
+                        and cash <= broke_at[0] + 100:
+                    dbg(f"{ttype}: watermark hold (${cash} <= "
+                        f"${broke_at[0]}+100)")
+                    item["_wake"] = time.time() + 4    # watermark gate
+                else:
+                    st, landed = act_place(screen, cfg,
+                                           {**item, "timeout": 10})
+                    if landed is not None:
+                        landed_by_ref[place_i] = landed
+                        towers[tuple(landed)] = {"tower": item["tower"],
+                                                 "at": landed,
+                                                 "path": [0, 0, 0]}
+                        place_i += 1
+                        queue.pop(idx)
+                        broke_at[0] = None
+                    elif st == "broke":
+                        broke_at[0] = read_cash_confirmed(screen, cfg)
+                        item["_wake"] = time.time() + 5
+                    else:                              # no_spot: real fail
+                        item["_fails"] = item.get("_fails", 0) + 1
+                        if item["_fails"] >= 3:
+                            print(f"   skipping {item['tower']} at "
+                                  f"{item['at']} -- no placeable spot "
+                                  f"nearby (rescan if this looks wrong)")
+                            landed_by_ref[place_i] = None
+                            place_i += 1
+                            queue.pop(idx)
+                        else:
+                            item["_wake"] = time.time() + 4
+            else:                              # upgrade
+                landed = landed_by_ref.get(item["ref"])
+                if landed is None:             # its tower was skipped
+                    queue.pop(idx)
+                else:
+                    entry = towers.get(tuple(landed))
+                    pi = item["path"].index(1) if 1 in item["path"] else 0
+                    ttype = entry["tower"].lower() if entry else ""
+                    tier = (entry["path"][pi] + 1) if entry else 1
+                    # Decide WITHOUT opening the menu where possible.
+                    if entry and entry.get("_noselect", 0) >= 3:
+                        dbg(f"{ttype}: unselectable tower -- dropping "
+                            f"this upgrade")
+                        queue.pop(idx)
+                    elif entry and is_locked(ttype, pi, tier):
+                        dbg(f"{ttype} path{pi + 1} t{tier}: XP-locked, skip")
+                        queue.pop(idx)         # XP-locked: never touch it
+                    elif entry and pi in entry.get("closed_paths", []):
+                        dbg(f"{ttype} path{pi + 1}: closed, skip")
+                        queue.pop(idx)         # path closed on this tower
+                    elif (known := PRICES.get(price_key(ttype, pi, tier))) \
+                            and (cash := read_cash(screen, cfg)) is not None \
+                            and cash < known:
+                        # Known price, can't afford: no menu, just sleep
+                        # this item and let income build.
+                        dbg(f"{ttype} path{pi + 1} t{tier}: saving "
+                            f"(${cash}/${known})")
+                        item["_saving"] = item.get("_saving", time.time())
+                        if time.time() - item["_saving"] > 120:
+                            print(f"   skipping ${known} upgrade -- income "
+                                  f"too slow")
+                            queue.pop(idx)
+                        else:
+                            item["_wake"] = time.time() + 3
+                    elif broke_at[0] is not None \
+                            and (cash := read_cash(screen, cfg)) is not None \
+                            and cash <= broke_at[0] + 100:
+                        dbg(f"{ttype} path{pi + 1}: watermark hold "
+                            f"(${cash} <= ${broke_at[0]}+100)")
+                        item["_wake"] = time.time() + 5
+                    else:
+                        st = act_upgrade(screen, cfg,
+                                         {**item, "at": landed}, entry)
+                        dbg(f"{ttype} path{pi + 1} t{tier}: {st}")
+                        if st == "bought":
+                            queue.pop(idx)
+                            broke_at[0] = None
+                            attempts = 0
+                        elif st in ("locked", "closed"):
+                            queue.pop(idx)     # recorded; done with it
+                        elif st == "broke":
+                            broke_at[0] = read_cash_confirmed(screen, cfg)
+                            item["_fails"] = item.get("_fails", 0) + 1
+                            item["_wake"] = time.time() + min(
+                                10 * 2 ** (item["_fails"] - 1), 60)
+                            if item["_fails"] >= 6:
+                                queue.pop(idx)
+                        else:                  # no_select / unread
+                            item["_fails"] = item.get("_fails", 0) + 1
+                            item["_wake"] = time.time() + 10
+                            if item["_fails"] >= 4:
+                                print(f"   giving up on an upgrade ({st})")
+                                queue.pop(idx)
+
+        if misreads == 12:                    # stuck panel? try to clear
+            dbg("counter dark for a while -- clearing UI")
+            clear_ui(screen, cfg)
+        if last_round is not None and last_round >= final_round:
+            outcome = "survived"
+            break
+        if misreads >= 25:                    # HUD truly gone: unknown state
+            break
+        time.sleep(0.6)
+    clean = [{k: v for k, v in t.items() if not k.startswith("_")}
+             for t in towers.values()]
+    return outcome, last_round, clean, lives_by_round
+
+
+def restart_game(screen, cfg, outcome):
+    """Get back to a fresh round 1. The path is chosen from the CURRENT
+    screen state, not the outcome label: a live game (counter readable)
+    must go through the pause menu; a defeat screen through its own
+    RESTART button. One retry re-evaluates state, so a wrong first guess
+    (e.g. hud_lost on a game that was actually still running) recovers."""
+    for attempt in range(2):
+        clear_ui(screen, cfg)
+        defeated = looks_defeated(screen)
+        live = (not defeated) and read_round(screen, cfg)[0] is not None
+        dbg(f"restart attempt {attempt + 1}: "
+            f"{'DEFEAT screen (defeat route)' if defeated else ('game looks LIVE (pause route)' if live else 'ended (defeat route)')}")
+        if live:
+            press_key("esc")
+            time.sleep(0.8)
+            click_norm(screen, cfg["pause_restart"])
+        else:
+            click_norm(screen, cfg["defeat_restart"])
+        time.sleep(0.8)
+        click_norm(screen, cfg["restart_confirm"])
+        time.sleep(2.0)
+        for _ in range(12):
+            if read_round(screen, cfg)[0] == 1:
+                return True
+            time.sleep(1.0)
+    return False
+
+
+def cmd_farm(args):
+    cfg = load_config()
+    setup_tesseract(cfg)
+    screen, hwnd = make_screen(cfg)
+
+    missing = [k for k in ("defeat_restart", "pause_restart",
+                           "restart_confirm") if not cfg.get(k)]
+    if missing:
+        sys.exit(
+            "farm needs one-time restart calibration. Missing in "
+            f"config.json: {', '.join(missing)}.\n"
+            "Use `locate` and hover: the defeat screen's RESTART button "
+            "(lose once on purpose),\nthe pause menu's RESTART (press "
+            "Esc), and the confirm dialog's OK button.")
+
+    mask_path = find_mask_path({"map": args.name}, Path.cwd() / "_")
+    if mask_path is None:
+        sys.exit(f"No mask found for '{args.name}' -- run `scan "
+                 f"{args.name}` first.")
+    load_mask(mask_path)
+    # (safe deselect spots are computed per episode, from each genome)
+
+    global PRICE_DIFFICULTY
+    PRICE_DIFFICULTY = args.difficulty
+    rng = random.Random(args.seed)
+    runs_path = Path(__file__).parent / "runs_log.jsonl"
+
+    print(f"Farming {args.episodes} episodes on '{args.name}' "
+          f"({args.towers} towers, to round {args.final_round}, "
+          f"difficulty {args.difficulty}).")
+    print("Load the map fresh (round 1, no towers). Starting in 5 "
+          "seconds...")
+    focus_game_window(hwnd)
+    time.sleep(5)
+    if not preflight_round_box(screen, cfg):
+        sys.exit("Round counter unreadable -- fix with `watch` first.")
+    if not preflight_cash_box(screen, cfg):
+        print("Cash not readable yet -- will recalibrate at each episode "
+              "start (make sure the map is loaded).")
+    if not preflight_lives_box(screen, cfg):
+        print("Lives not readable yet -- will recalibrate at each episode "
+              "start. Defeat detection needs it, so if episode 1 still "
+              "can't read lives, stop and debug with `watch`.")
+
+    for ep in range(1, args.episodes + 1):
+        genome = random_genome(rng, args.towers)
+        print(f"\n=== Episode {ep}/{args.episodes}: "
+              f"{sum(1 for g in genome if g['do'] == 'place')} towers, "
+              f"{sum(1 for g in genome if g['do'] == 'upgrade')} upgrades")
+        try:
+            outcome, reached, towers, lives_by_round = run_episode(
+                screen, cfg, genome, args.final_round)
+        except KeyboardInterrupt:
+            raise
+        except Exception:
+            err = traceback.format_exc()
+            print(err)
+            with open(Path(__file__).parent / "crash_log.txt", "a") as f:
+                f.write(f"\n=== {datetime.now().isoformat()} episode {ep}\n")
+                f.write(err)
+            print("Episode crashed -- logged to crash_log.txt, attempting "
+                  "to recover and continue.")
+            outcome, reached, towers, lives_by_round = ("crashed", None,
+                                                        [], {})
+            clear_ui(screen, cfg)
+        print(f"=== Episode {ep}: {outcome} at round {reached}")
+        with open(runs_path, "a") as f:
+            f.write(json.dumps({
+                "time": datetime.now().isoformat(timespec="seconds"),
+                "mode": "farm", "map": args.name,
+                "difficulty": args.difficulty,
+                "final_round": reached, "outcome": outcome,
+                "lives_by_round": lives_by_round,
+                "towers": towers}) + "\n")
+        if ep < args.episodes:
+            if not restart_game(screen, cfg, outcome):
+                sys.exit("Couldn't restart into a fresh game -- check the "
+                         "restart calibration points in config.json.")
+    print(f"\nDone. {args.episodes} labeled episodes appended to "
+          f"{runs_path.name}.")
+
+
+def cmd_play(args):
+    cfg = load_config()
+    setup_tesseract(cfg)
+    screen, hwnd = make_screen(cfg)
+
+    plan = json.loads(Path(args.plan).read_text())
+    validate_plan(plan)
+    snap_plan_to_mask(plan, Path(args.plan).resolve())
+    global PRICE_DIFFICULTY
+    mode_slug = _slug(str(plan.get("difficulty", "")) + " "
+                      + str(plan.get("mode", "")))
+    PRICE_DIFFICULTY = next((d for d in ("easy", "hard", "impoppable")
+                             if d in mode_slug), "medium")
+    est, unknown = plan_cost_estimate(plan)
+    line = f"Plan cost ({PRICE_DIFFICULTY}, learned prices): ${est}"
+    if unknown:
+        line += (f" + {unknown} purchase(s) not yet learned -- they'll be "
+                 f"recorded this run")
+    print(line)
+    queue = sorted(plan["actions"], key=lambda a: a["round"])
+    final_round = plan.get("final_round", 40)
+
+    # Round log -- this is the seed of your Stage 2 dataset.
+    log_path = Path(__file__).parent / "rounds_log.csv"
+    new_log = not log_path.exists()
+    log_file = open(log_path, "a", newline="")
+    log = csv.writer(log_file)
+    if new_log:
+        log.writerow(["timestamp", "elapsed_s", "round", "lives"])
+
+    print(f"Plan: {args.plan}  ({len(queue)} actions, final round "
+          f"{final_round})")
+    print("EMERGENCY STOP: slam the mouse into the top-left corner.")
+    if focus_game_window(hwnd):
+        print("Focused the game window automatically -- have the map loaded. "
+              "Starting in 3 seconds.\n")
+        time.sleep(3)
+    else:
+        print("Couldn't auto-focus the game -- click on the BTD6 window! "
+              "Starting in 5 seconds.\n")
+        time.sleep(5)
+
+    if not preflight_round_box(screen, cfg):
+        sys.exit("Could not read or locate the round counter, so this run "
+                 "would be flying blind. Load the map and debug with "
+                 "`watch` first.")
+    if not preflight_cash_box(screen, cfg):
+        print("Cash counter not located -- placement still self-verifies "
+              "via the hidden-counter trick, but wait_cash gating is off "
+              "this run.")
+    if not preflight_lives_box(screen, cfg):
+        print("Lives counter not located -- defeat detection is off this "
+              "run (the bot may idle on a defeat screen).")
+
+    t0 = time.time()
+    press_key("space")                   # start round 1
+    if plan.get("fast_forward", True):
+        time.sleep(0.3)
+        press_key("space")               # second press toggles fast-forward
+
+    last_round = None
+    prev_read = None
+    misreads = 0
+    lives = prev_lives = None
+    final_seen = None
+    placements = {}      # planned coordinate -> where the tower really is
+    towers = {}          # actual position -> {tower, at, path[t,m,b]}
+    outcome = "stopped"
+    try:
+        while True:
+            unpause_if_needed(screen, cfg)
+            value, *_ = read_round(screen, cfg)
+            prev_lives = lives
+            lives = read_lives(screen, cfg)
+
+            # Accept a new round only after seeing the same value twice in
+            # a row -- one-frame OCR glitches then can't trigger actions.
+            accepted = None
+            if value is not None:
+                if value == last_round:
+                    accepted = value
+                elif plausible(value, last_round) and value == prev_read:
+                    accepted = value
+                prev_read = value
+
+            if accepted is None:
+                misreads += 1
+            else:
+                misreads = 0
+                if accepted != last_round:
+                    last_round = accepted
+                    print(f"[round {last_round:>3}]  lives={lives}")
+                    log.writerow([datetime.now().isoformat(timespec='seconds'),
+                                  round(time.time() - t0, 1), last_round,
+                                  lives if lives is not None else ""])
+                    log_file.flush()
+
+            if lives == 0 and prev_lives == 0:
+                # Two consecutive zero reads: that's the defeat screen.
+                # (The round counter stays visible on it, so it can't be
+                # the signal.)
+                outcome = "defeat"
+                print(f"\nDefeat at round {last_round}.")
+                break
+            if looks_defeated(screen):
+                time.sleep(0.4)
+                if looks_defeated(screen):
+                    outcome = "defeat"
+                    print(f"\nDefeat at round {last_round} (recognized "
+                          f"visually).")
+                    break
+
+            while queue and last_round is not None \
+                    and queue[0]["round"] <= last_round:
+                action = queue.pop(0)
+                print(f"   -> {describe(action)}")
+                if "wait_cash" in action:
+                    wait_for_cash(screen, cfg, action["wait_cash"])
+                if action["do"] == "place":
+                    st, landed = act_place(screen, cfg, action)
+                    t_end = time.time() + 90
+                    while st == "broke" and time.time() < t_end:
+                        time.sleep(2.0)        # plan order holds: save up
+                        st, landed = act_place(screen, cfg, action)
+                    if landed is not None:
+                        placements[tuple(action["at"])] = landed
+                        towers[tuple(landed)] = {"tower": action["tower"],
+                                                 "at": landed,
+                                                 "path": [0, 0, 0]}
+                    elif st == "no_spot":
+                        print(f"      !! no placeable spot near "
+                              f"{action['at']} -- move this hint")
+                elif action["do"] == "upgrade" and placements:
+                    at = tuple(action["at"])
+                    near = min(placements, key=lambda p: (p[0] - at[0]) ** 2
+                               + (p[1] - at[1]) ** 2)
+                    if ((near[0] - at[0]) ** 2
+                            + (near[1] - at[1]) ** 2) ** 0.5 <= 0.03:
+                        action = {**action, "at": list(placements[near])}
+                    entry = towers.get(tuple(action["at"]))
+                    st = act_upgrade(screen, cfg, action, entry)
+                    if st == "broke" and entry and 1 in action["path"]:
+                        pi = action["path"].index(1)
+                        need = PRICES.get(price_key(
+                            entry["tower"].lower(), pi, entry["path"][pi] + 1))
+                        if need:
+                            wait_for_cash(screen, cfg, need, timeout=90)
+                            act_upgrade(screen, cfg, action, entry)
+                    elif st in ("no_select", "locked", "closed", "unread"):
+                        print(f"      upgrade {st} -- moving on")
+                else:
+                    ACTION_FUNCS[action["do"]](screen, cfg, action)
+
+            if misreads in (25, 55):
+                # Something (a stuck panel, a lingering ghost) is hiding
+                # the HUD. Try to clear it instead of counting down to
+                # termination.
+                print("   (round counter blocked -- clearing any open UI)")
+                clear_ui(screen, cfg)
+
+            if last_round is not None and last_round >= final_round \
+                    and not queue:
+                final_seen = final_seen or time.time()
+                if misreads >= 8 or time.time() - final_seen > 120:
+                    # HUD gone after the last round, or the round has sat
+                    # at the final number for two minutes: victory.
+                    outcome = "victory"
+                    print("\nFinal round done -- looks like a win. GG!")
+                    break
+            else:
+                final_seen = None
+            if misreads >= 90:
+                outcome = "counter_lost"
+                print("\nCouldn't read the round counter for a long time "
+                      "even after clearing UI -- stopping.")
+                break
+            time.sleep(0.7)
+    except KeyboardInterrupt:
+        outcome = "interrupted"
+        print("\nStopped by user.")
+    finally:
+        log_file.close()
+        if towers:
+            print("\nFinal layout:")
+            for t in towers.values():
+                print(f"   {t['tower']:<10} {t['path']}  at {t['at']}")
+        runs_path = Path(__file__).parent / "runs_log.jsonl"
+        clean_towers = [{k: v for k, v in t.items()
+                         if not k.startswith("_")} for t in towers.values()]
+        with open(runs_path, "a") as f:
+            f.write(json.dumps({
+                "time": datetime.now().isoformat(timespec="seconds"),
+                "plan": str(args.plan),
+                "difficulty": PRICE_DIFFICULTY,
+                "final_round": last_round,
+                "final_lives": lives,
+                "outcome": outcome,
+                "towers": clean_towers}) + "\n")
+        print(f"Round log -> {log_path.name}; run summary -> "
+              f"{runs_path.name}")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="BTD6 Stage-1 bot (see README.md)")
+    sub = parser.add_subparsers(dest="command", required=True)
+    sub.add_parser("locate", help="print live mouse coordinates")
+    sub.add_parser("watch", help="debug the round-counter OCR")
+    p_play = sub.add_parser("play", help="execute a gameplan")
+    p_play.add_argument("plan", help="path to a plan .json file")
+    p_play.add_argument("-q", "--quiet", action="store_true",
+                        help="suppress per-decision debug output")
+    p_scan = sub.add_parser(
+        "scan", help="auto-detect every placeable spot on the current map")
+    p_scan.add_argument("name", help="map name for output files, "
+                                     "e.g. monkey_meadow")
+    p_scan.add_argument("--tower", default="dart",
+                        help="ghost to sweep with: dart=land, sub=water "
+                             "(default: dart)")
+    p_scan.add_argument("--step", type=float, default=0.025,
+                        help="grid spacing as a fraction of the game area "
+                             "(default: 0.025)")
+    p_farm = sub.add_parser(
+        "farm", help="STAGE 2: play random layouts unattended and log the "
+                     "training dataset")
+    p_farm.add_argument("name", help="map name matching your mask, "
+                                     "e.g. monkey_meadow")
+    p_farm.add_argument("--episodes", type=int, default=10)
+    p_farm.add_argument("--towers", type=int, default=4,
+                        help="towers per random layout (default: 4)")
+    p_farm.add_argument("--final-round", type=int, default=40,
+                        dest="final_round",
+                        help="round that counts as survival (default: 40)")
+    p_farm.add_argument("--difficulty", default="easy",
+                        choices=["easy", "medium", "hard", "impoppable"])
+    p_farm.add_argument("--seed", type=int, default=None,
+                        help="RNG seed for reproducible layouts")
+    p_farm.add_argument("-q", "--quiet", action="store_true",
+                        help="suppress per-decision debug output")
+    args = parser.parse_args()
+    global DEBUG
+    DEBUG = not getattr(args, "quiet", False)
+    {"locate": cmd_locate, "watch": cmd_watch,
+     "play": cmd_play, "scan": cmd_scan, "farm": cmd_farm}[args.command](args)
+
+
+if __name__ == "__main__":
+    main()

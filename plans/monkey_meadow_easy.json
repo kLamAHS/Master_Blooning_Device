@@ -1,0 +1,33 @@
+{
+  "map": "Monkey Meadow",
+  "mode": "Easy / Standard (rounds 1-40)",
+  "mask": "masks/monkey_meadow_dart.json",
+  "final_round": 40,
+  "fast_forward": true,
+  "notes": [
+    "Coordinates are HINTS: with a mask present (run `scan` first), every",
+    "placement snaps to the nearest safe green point automatically, and",
+    "upgrades follow their tower. Adjust hints to move towers around.",
+    "Strategy: two dart monkeys early for chip damage, a ninja pushed to",
+    "4-0-2 for the midgame, and a super monkey around round 30 to shred",
+    "the round-40 MOAB. Tune rounds/upgrades until it clears 40 -- watching",
+    "where it dies and fixing the plan IS the Stage 1 milestone."
+  ],
+  "actions": [
+    {"round": 1,  "do": "place",   "tower": "dart",  "at": [0.330, 0.400], "name": "dart1"},
+    {"round": 2,  "do": "place",   "tower": "dart",  "at": [0.450, 0.550], "name": "dart2"},
+    {"round": 4,  "do": "place",   "tower": "ninja", "at": [0.380, 0.470], "name": "ninja"},
+    {"round": 6,  "do": "upgrade", "at": [0.380, 0.470], "path": [1, 0, 0]},
+    {"round": 8,  "do": "upgrade", "at": [0.380, 0.470], "path": [1, 0, 0]},
+    {"round": 10, "do": "upgrade", "at": [0.380, 0.470], "path": [0, 0, 1]},
+    {"round": 13, "do": "place",   "tower": "bomb",  "at": [0.470, 0.430], "name": "bomb (pops LEAD -- sharp darts and shurikens bounce off armor)"},
+    {"round": 15, "do": "upgrade", "at": [0.470, 0.430], "path": [0, 1, 0]},
+    {"round": 16, "do": "upgrade", "at": [0.380, 0.470], "path": [0, 0, 1]},
+    {"round": 18, "do": "upgrade", "at": [0.380, 0.470], "path": [1, 0, 0]},
+    {"round": 20, "do": "upgrade", "at": [0.470, 0.430], "path": [0, 1, 0]},
+    {"round": 24, "do": "upgrade", "at": [0.380, 0.470], "path": [1, 0, 0]},
+    {"round": 28, "do": "place",   "tower": "super", "at": [0.520, 0.440], "name": "super"},
+    {"round": 31, "do": "upgrade", "at": [0.520, 0.440], "path": [1, 0, 0]},
+    {"round": 33, "do": "upgrade", "at": [0.520, 0.440], "path": [1, 0, 0], "name": "plasma also melts lead + shreds the round-40 MOAB"}
+  ]
+}

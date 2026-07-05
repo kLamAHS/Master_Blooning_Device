@@ -1,0 +1,5 @@
+pyautogui
+mss
+opencv-python
+numpy
+pytesseract
