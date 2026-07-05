@@ -291,6 +291,36 @@ restricts to the original ten). Every logged episode now records a
 `"strategy"` field (meta / evolve / crossover, roles, mutations), so the
 dataset itself shows *how* each layout was conceived.
 
+### Placement is geometry-aware
+
+The scan mask contains more than "where can I build" — the track itself
+is the big blob of interior cells that *refuse* placement. The brain
+builds a **track model** from it: a 0→1 progress coordinate along the
+path, and per-spot **coverage** (how much track a tower's range actually
+touches — bends and long straights beat corner decorations, which is
+why some spots hit more bloons for longer). Each tower then gets placed
+by what it wants:
+
+- **DPS carries** claim the highest-coverage real estate first.
+- **Alchemist / Village** sit inside buff radius of teammates, the
+  carry above all — a brew that reaches nobody buffs nobody.
+- **Glue / Ice** cover the stretch *just upstream* of the carry's kill
+  zone: glue applied too early wears off before the DPS sees the
+  bloons, and glue applied downstream of it does nothing.
+- **Spike factories** favor late track, where leaks go to die.
+- **Snipers / mortars** (global range) stay *off* prime spots that
+  range-limited towers need.
+
+One thing pixels can't tell: which end of the track is the entry. So
+`farm` senses it — on its first episode the map is empty, and the first
+thing that moves near the track *is* the bloons entering. The result is
+saved into the mask file (`"flow_entry"`), so it's sensed once per map.
+Until it's known, placement runs direction-agnostic (debuffers co-locate
+with the carry instead of aiming upstream). The learned per-region
+posteriors still multiply every score, and the `--explore` fraction of
+placements stays fully random, so position learning and emergence both
+survive the geometry.
+
 To see what the bot currently believes — where its experience confirms
 or contradicts the research, which elite layouts evolution is breeding
 from, and which round bucket kills it (annotated with the nearest known

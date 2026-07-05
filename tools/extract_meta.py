@@ -88,6 +88,42 @@ BUILDS = {
                   {"main": 2, "cross": 0, "weight": 0.5, "label": "Ray of Doom line (2-0-4)"}],
 }
 
+# Placement profiles: how each tower wants to sit relative to the track
+# and its teammates. "range" is the attack/buff radius as a fraction of
+# screen WIDTH (BTD6 range units / 560 -- coarse, ranking is what
+# matters). Styles:
+#   coverage    maximize track cells in range (DPS: hit more bloons for
+#               longer -- bends and long straights beat corners)
+#   upstream    cover the stretch JUST BEFORE the carry's kill zone
+#               (debuffers: glue applied too early wears off before the
+#               DPS sees the bloons; applied downstream it does nothing)
+#   buddy       sit within buff radius of teammates, the carry above all
+#   downstream  cover late track to catch leaks (spikes near the exit)
+#   offside     global range: stay OFF the prime real estate others need
+PLACEMENT = {
+    "dart":      {"range": 0.057, "style": "coverage"},
+    "boomerang": {"range": 0.077, "style": "coverage"},
+    "bomb":      {"range": 0.071, "style": "coverage"},
+    "tack":      {"range": 0.041, "style": "coverage"},
+    "ice":       {"range": 0.036, "style": "upstream"},
+    "glue":      {"range": 0.082, "style": "upstream"},
+    "sniper":    {"range": None,  "style": "offside"},
+    "sub":       {"range": 0.075, "style": "coverage"},
+    "buccaneer": {"range": 0.082, "style": "coverage"},
+    "heli":      {"range": 0.080, "style": "coverage"},
+    "mortar":    {"range": None,  "style": "offside"},
+    "dartling":  {"range": None,  "style": "coverage"},
+    "wizard":    {"range": 0.071, "style": "coverage"},
+    "super":     {"range": 0.089, "style": "coverage"},
+    "ninja":     {"range": 0.071, "style": "coverage"},
+    "alchemist": {"range": 0.080, "style": "buddy"},
+    "druid":     {"range": 0.062, "style": "coverage"},
+    "village":   {"range": 0.071, "style": "buddy"},
+    "engineer":  {"range": 0.071, "style": "coverage"},
+    "spike":     {"range": 0.036, "style": "downstream"},
+    "beast":     {"range": 0.060, "style": "coverage"},
+}
+
 # Role tags per tower for layout templating: every meta layout wants a
 # carry, an amplifier, and some control (Dashboard: "carry + stall +
 # debuff + cleanup"). "opener" = cheap towers that hold the early rounds.
@@ -184,11 +220,15 @@ def extract(xlsx_path):
             "avoid_for": str(avoid),
             "notes": str(notes),
             "builds": BUILDS.get(key, []),
+            "placement": PLACEMENT.get(key,
+                                       {"range": 0.06, "style": "coverage"}),
         }
     for key, info in INFERRED_TOWERS.items():
         if key not in towers:
             towers[key] = {**info, "status": "inferred",
                            "builds": BUILDS.get(key, []),
+                           "placement": PLACEMENT.get(
+                               key, {"range": 0.06, "style": "coverage"}),
                            "inferred": True}
 
     heroes = {}

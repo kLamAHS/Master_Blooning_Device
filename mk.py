@@ -2267,6 +2267,34 @@ def snap_plan_to_mask(plan, plan_path):
     print(f"Placements snapped to safe points from {mask_path.name}.")
 
 
+def sense_flow_entry(screen, clean, track, timeout=7.0):
+    """Which end of the track do bloons come from? Pixels of a still map
+    can't say -- but the round just started on an EMPTY map, so the first
+    thing that MOVES near the track is the bloons entering. Frame-diff
+    against the pre-start clean frame, masked to a corridor around the
+    track cells so HUD animation, confetti, and map decorations can't
+    vote. Returns the normalized [x, y] of the first motion, or None."""
+    h, w = clean.shape[:2]
+    corridor = np.zeros((h, w), np.uint8)
+    rad = max(6, int(track.step * 0.9 * w))
+    for cx, cy in track.cells:
+        cv2.circle(corridor, (int(cx * w), int(cy * h)), rad, 255, -1)
+    corridor[:int(0.14 * h)] = 0          # HUD strip animates every round
+    t_end = time.time() + timeout
+    while time.time() < t_end:
+        cur = screen.grab()
+        diff = cv2.absdiff(cur[..., :3], clean[..., :3])
+        moving = ((diff.max(axis=2) > 45) & (corridor > 0)).astype(np.uint8)
+        n, _lab, stats, cent = cv2.connectedComponentsWithStats(moving, 8)
+        blobs = [(stats[i, 4], cent[i]) for i in range(1, n)
+                 if stats[i, 4] >= 30]
+        if blobs:
+            _area, (cx, cy) = max(blobs, key=lambda b: b[0])
+            return [round(cx / w, 4), round(cy / h, 4)]
+        time.sleep(0.12)
+    return None
+
+
 # ---------------------------------------------------------------------------
 # STAGE 2: the data farm. Random layouts -> unattended episodes ->
 # (layout, final_round, outcome) rows in runs_log.jsonl.
@@ -2318,9 +2346,14 @@ def random_genome(rng, n_towers):
     return genome
 
 
-def run_episode(screen, cfg, genome, final_round, abort_lives=50):
+def run_episode(screen, cfg, genome, final_round, abort_lives=50,
+                flow_sensor=None):
     """Play one random layout to survival or defeat. Returns
-    (outcome, final_round_reached, towers, lives_by_round)."""
+    (outcome, final_round_reached, towers, lives_by_round).
+    flow_sensor, when given, is called once with the pre-start clean
+    frame right after the round starts -- its window to watch where the
+    first bloons appear (nothing has been bought yet, so leaking a few
+    seconds of round 1 costs nothing)."""
     # (Re)calibrate sensors on the clean, un-started map -- the best frame
     # we'll ever get. Cash preflight runs UNCONDITIONALLY: a box that
     # clips the leading digit still 'reads', and only the digit snap
@@ -2334,9 +2367,12 @@ def run_episode(screen, cfg, genome, final_round, abort_lives=50):
     dbg(f"sensors: cash={read_cash(screen, cfg)} "
         f"lives={read_lives(screen, cfg)}")
 
+    clean = screen.grab() if flow_sensor else None
     press_key("space")
     time.sleep(0.3)
     press_key("space")                        # fast-forward
+    if flow_sensor:
+        flow_sensor(clean)
     queue = list(genome)
     landed_by_ref, towers = {}, {}
     lives_by_round = {}
@@ -2824,7 +2860,7 @@ def cmd_farm(args):
     # runs_log.jsonl -> Thompson-sampled layouts that start meta-informed
     # and drift toward whatever actually survives on THIS map. Missing
     # knowledge file or --no-meta degrades cleanly to uniform random.
-    brain, tower_pool = None, FARM_TOWERS
+    brain, tower_pool, track = None, FARM_TOWERS, None
     if not args.no_meta:
         try:
             import meta as meta_mod
@@ -2840,6 +2876,19 @@ def cmd_farm(args):
                   f"explore={brain.explore:.2f}, "
                   f"evolution={'on' if not args.no_evolve else 'off'}, "
                   f"pool={len(tower_pool)} towers.")
+            mask_data = json.loads(mask_path.read_text())
+            track = meta_mod.TrackModel(mask_data)
+            if track.ok:
+                if mask_data.get("flow_entry"):
+                    track.orient(mask_data["flow_entry"])
+                print(f"Track model: {len(track.cells)} path cells; flow "
+                      + ("known (entry saved in mask)" if track.oriented
+                         else "unknown -- will watch where bloons enter "
+                              "on episode 1"))
+            else:
+                track = None
+                print("Track model unavailable (no track blob in mask) "
+                      "-- placement falls back to distance pools.")
         except Exception as e:
             print(f"Meta brain unavailable ({e}) -- falling back to "
                   f"uniform random layouts.")
@@ -2852,9 +2901,28 @@ def cmd_farm(args):
             genome = brain.next_genome(
                 rng, args.towers, pools, is_locked=is_locked,
                 large_towers=LARGE_TOWERS, tower_pool=tower_pool,
-                price_of=lambda t: PRICES.get(price_key(t)))
+                price_of=lambda t: PRICES.get(price_key(t)),
+                track=track)
         else:
             genome = random_genome(rng, args.towers)
+        sensor = None
+        if track is not None and not track.oriented:
+            def sensor(clean):
+                pt = sense_flow_entry(screen, clean, track)
+                if pt:
+                    track.orient(pt)
+                    try:
+                        d = json.loads(mask_path.read_text())
+                        d["flow_entry"] = pt
+                        mask_path.write_text(json.dumps(d))
+                    except Exception:
+                        _log_crash("flow_entry save")
+                    print(f"   flow sensed: bloons enter near "
+                          f"[{pt[0]:.2f}, {pt[1]:.2f}] -- saved to "
+                          f"{mask_path.name}")
+                else:
+                    print("   flow not sensed this episode -- placement "
+                          "stays direction-agnostic, will retry")
         print(f"\n=== Episode {ep}/{args.episodes}: "
               f"{sum(1 for g in genome if g['do'] == 'place')} towers, "
               f"{sum(1 for g in genome if g['do'] == 'upgrade')} upgrades")
@@ -2863,7 +2931,7 @@ def cmd_farm(args):
         try:
             outcome, reached, towers, lives_by_round = run_episode(
                 screen, cfg, genome, args.final_round,
-                abort_lives=args.abort_lives)
+                abort_lives=args.abort_lives, flow_sensor=sensor)
         except KeyboardInterrupt:
             raise
         except Exception:
@@ -2911,11 +2979,23 @@ def cmd_farm(args):
 def cmd_learn(args):
     """Offline: show the meta brain's current beliefs for a map -- which
     towers its own episodes confirm or contradict the spreadsheet on,
-    the elite layouts evolution draws from, and where defenses die."""
+    the elite layouts evolution draws from, where defenses die, and the
+    map's prime real estate if a scan mask exists."""
     import meta as meta_mod
     brain = meta_mod.MetaBrain(args.name, args.difficulty,
                                target_round=args.final_round)
-    print(brain.report())
+    track = mask_pts = None
+    mask_path = find_mask_path({"map": args.name}, Path.cwd() / "_")
+    if mask_path:
+        try:
+            data = json.loads(mask_path.read_text())
+            track = meta_mod.TrackModel(data)
+            if track.ok and data.get("flow_entry"):
+                track.orient(data["flow_entry"])
+            mask_pts = data.get("valid_strict") or data.get("valid")
+        except Exception:
+            track = None
+    print(brain.report(track=track, mask_points=mask_pts))
 
 
 def cmd_play(args):

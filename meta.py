@@ -65,6 +65,128 @@ def _bucket(pt):
     return (round(pt[0] * 20) / 20, round(pt[1] * 20) / 20)
 
 
+# Coordinates are fractions of width/height, but the screen is 16:9 --
+# 0.1 of height is a much shorter walk than 0.1 of width. All physical
+# distances (tower ranges, buff radii) are in width-fractions, with y
+# corrected by this factor.
+ASPECT = 9.0 / 16.0
+
+
+def _dist(a, b):
+    return math.hypot(a[0] - b[0], (a[1] - b[1]) * ASPECT)
+
+
+class TrackModel:
+    """Geometry of the bloon path, derived from a scan mask. The mask's
+    lattice already encodes the track: it is the largest connected blob
+    of interior cells that REFUSE placement (trees hug the border and are
+    excluded). On top of that blob this computes a 0..1 `progress`
+    coordinate along the path (graph distance from one end) and per-spot
+    coverage -- which stretch of track a tower on a spot can actually
+    hit. Which end is the ENTRY cannot be known from pixels alone;
+    `farm` senses it once per map by watching where the first bloons
+    appear, then `orient()` pins progress 0 to the entry."""
+
+    def __init__(self, mask):
+        step = mask.get("step", 0.025)
+        self.step = step
+        strict = mask.get("valid_strict") or mask.get("valid") or []
+        every = {(round(p[0], 3), round(p[1], 3))
+                 for p in (mask.get("valid") or strict)}
+        self.cells, self.progress = [], {}
+        self.oriented = False
+        self.ok = False
+        if not every:
+            return
+
+        def nb(c):
+            return [(round(c[0] + dx, 3), round(c[1] + dy, 3))
+                    for dx, dy in ((step, 0), (-step, 0),
+                                   (0, step), (0, -step))]
+
+        xs = sorted({c[0] for c in every})
+        ys = sorted({c[1] for c in every})
+        lattice = set()
+        x = xs[0]
+        while x <= xs[-1] + step / 2:
+            y = ys[0]
+            while y <= ys[-1] + step / 2:
+                lattice.add((round(x, 3), round(y, 3)))
+                y += step
+            x += step
+        invalid = lattice - every
+        ring = {c for c in lattice
+                if c[0] < xs[0] + 1.5 * step or c[0] > xs[-1] - 1.5 * step
+                or c[1] < ys[0] + 1.5 * step or c[1] > ys[-1] - 1.5 * step}
+        interior = invalid - ring
+        seen, blob = set(), set()
+        for c in interior:
+            if c in seen:
+                continue
+            comp, stack = set(), [c]
+            while stack:
+                q = stack.pop()
+                if q in comp:
+                    continue
+                comp.add(q)
+                stack += [n for n in nb(q) if n in interior and n not in comp]
+            seen |= comp
+            if len(comp) > len(blob):
+                blob = comp
+        if len(blob) < 8:            # no believable track in this mask
+            return
+
+        def bfs(start):
+            dist = {start: 0}
+            frontier = [start]
+            while frontier:
+                nxt = []
+                for c in frontier:
+                    for n in nb(c):
+                        if n in blob and n not in dist:
+                            dist[n] = dist[c] + 1
+                            nxt.append(n)
+                frontier = nxt
+            return dist
+
+        # Double BFS: the two graph-farthest cells are the track's ends.
+        d0 = bfs(next(iter(blob)))
+        end_a = max(d0, key=d0.get)
+        d1 = bfs(end_a)
+        span = max(d1.values()) or 1
+        self.cells = sorted(d1)
+        self.progress = {c: d1[c] / span for c in d1}
+        self.ok = True
+
+    def orient(self, entry_pt):
+        """Pin progress 0 to the sensed bloon entry point."""
+        if not self.ok:
+            return
+        near = min(self.cells, key=lambda c: _dist(c, entry_pt))
+        if self.progress[near] > 0.5:
+            self.progress = {c: 1.0 - p for c, p in self.progress.items()}
+        self.oriented = True
+
+    def covered(self, pt, r):
+        return [c for c in self.cells if _dist(c, pt) <= r]
+
+    def exposure(self, pt, r):
+        """Fraction of the track a tower at pt can hit: the 'damage more
+        bloons for longer' number. Bends and long straights score high,
+        corner decorations score ~0."""
+        if not self.ok:
+            return 0.0
+        return len(self.covered(pt, r)) / len(self.cells)
+
+    def span(self, pt, r):
+        """(first, mean, last) progress of the covered stretch, or None."""
+        cov = self.covered(pt, r)
+        if not cov:
+            return None
+        ps = sorted(self.progress[c] for c in cov)
+        return ps[0], sum(ps) / len(ps), ps[-1]
+
+
 class MetaBrain:
     def __init__(self, map_name, difficulty, target_round=40,
                  explore=0.30, evolve=True, knowledge=None, runs_path=None):
@@ -210,6 +332,111 @@ class MetaBrain:
                 best, best_w = c, w
         return list(best)
 
+    def _pos_theta(self, rng, pt):
+        ba, bb = self.pos_post.get(_bucket(pt), [1.0, 1.0])
+        return _beta(rng, ba, bb)
+
+    def _spot_for(self, rng, ttype, pools, taken, placed, track,
+                  large=False):
+        """Style-aware placement. `placed` is [(ttype, spot), ...] already
+        assigned in this layout. Scores candidates by what the tower
+        actually wants -- track coverage for DPS, just-upstream coverage
+        for debuffers, buff adjacency for alch/village, late track for
+        spikes, remoteness for global towers -- multiplied by the learned
+        per-region posterior, so experience still bends the geometry."""
+        if track is None or not track.ok or rng.random() < self.explore:
+            return self._pick_spot(rng, pools, taken, large=large)
+        prof = self.towers.get(ttype, {}).get("placement") or {}
+        style = prof.get("style", "coverage")
+        r = prof.get("range") or 0.06
+        if large:
+            base = pools.get("roomy") or pools.get("all") or []
+        else:
+            base = ((pools.get("near") or []) + (pools.get("mid") or [])) \
+                or pools.get("all") or []
+        if not base:
+            return None
+        cands = [rng.choice(base) for _ in range(min(50, len(base)))]
+        if style == "buddy" and placed:
+            # A random sample can easily miss the small disc around the
+            # teammates a buffer exists to stand in -- guarantee the
+            # scorer actually gets to see in-range candidates.
+            anchors = [s for _, s in placed if s]
+            nearby = [p for p in base
+                      if any(_dist(p, a) <= r * 0.85 for a in anchors)]
+            if nearby:
+                cands = [rng.choice(nearby)
+                         for _ in range(min(30, len(nearby)))] + cands[:20]
+        free = [c for c in cands
+                if all(_dist(c, t) > 0.015 for t in taken)]
+        cands = free or cands
+
+        # The carry anchors the geometry for debuffers and buffers.
+        carries = set(self.roles.get("carry", []))
+        carry_spot = next((s for t, s in placed if t in carries and s),
+                          None)
+        carry_span = None
+        if carry_spot is not None:
+            carry_r = (self.towers.get(
+                next(t for t, s in placed if t in carries and s), {})
+                .get("placement") or {}).get("range") or 0.06
+            carry_span = track.span(carry_spot, carry_r)
+
+        best, best_s = None, 0.0
+        for c in cands:
+            exp = track.exposure(c, r)
+            if style == "upstream":
+                if carry_span and track.oriented:
+                    sp = track.span(c, r)
+                    if sp is None:
+                        s = 0.0
+                    else:
+                        gap = carry_span[1] - sp[1]   # + = upstream of it
+                        fit = (1.0 if 0.0 <= gap <= 0.18 else
+                               0.4 if -0.06 <= gap < 0.0 else 0.05)
+                        s = exp * fit
+                elif carry_spot is not None:
+                    # Direction unknown: co-locate with the carry so the
+                    # debuff at least overlaps its kill zone.
+                    s = exp * max(0.1, 1.0 - 4.0 * _dist(c, carry_spot))
+                else:
+                    s = exp
+            elif style == "buddy":
+                mates = sum((2.0 if t in carries else 1.0)
+                            for t, spot in placed
+                            if spot and _dist(c, spot) <= r * 0.9)
+                s = mates + 0.15 * exp
+            elif style == "downstream":
+                sp = track.span(c, r)
+                late = sp[1] if (sp and track.oriented) else 0.5
+                s = exp * (0.3 + late)
+            elif style == "offside":
+                s = 1.0 / (1.0 + 40.0 * track.exposure(c, 0.06))
+            else:                                    # coverage
+                s = exp
+            s *= 0.5 + self._pos_theta(rng, c)
+            if s > best_s:
+                best, best_s = c, s
+        if best is None:
+            return self._pick_spot(rng, pools, taken, large=large)
+        return list(best)
+
+    def _placement_order(self, picks):
+        """Spot-assignment order: the carry anchors first, coverage DPS
+        next, then debuffers/cleanup that position relative to it, and
+        buffers last (they need to see where everyone sits)."""
+        rank = {"coverage": 1, "upstream": 2, "downstream": 3,
+                "offside": 4, "buddy": 5}
+        carries = set(self.roles.get("carry", []))
+
+        def key(i):
+            ttype, role = picks[i]
+            style = (self.towers.get(ttype, {}).get("placement")
+                     or {}).get("style", "coverage")
+            return (0 if (role == "carry" or ttype in carries)
+                    else rank.get(style, 1), i)
+        return sorted(range(len(picks)), key=key)
+
     def _pick_build(self, rng, ttype):
         """(main, cross) for a tower: meta build templates re-weighted by
         the learned per-path posterior; explore = any legal combo."""
@@ -294,19 +521,21 @@ class MetaBrain:
 
     def next_genome(self, rng, n_towers, pools, is_locked=None,
                     large_towers=frozenset(), tower_pool=None,
-                    price_of=None):
+                    price_of=None, track=None):
         """Produce a buy list in run_episode's format. Rolls between a
-        fresh meta-templated layout and an evolution of an elite one."""
+        fresh meta-templated layout and an evolution of an elite one.
+        `track` (a TrackModel) turns on geometry-aware placement."""
         is_locked = is_locked or (lambda *a: False)
         elites = self.elites() if self.evolve else []
         p_evolve = min(0.5, len(elites) / 10.0) if len(elites) >= 3 else 0.0
         if rng.random() < p_evolve:
             genome = self._evolved_genome(rng, n_towers, pools, is_locked,
-                                          large_towers, tower_pool, elites)
+                                          large_towers, tower_pool, elites,
+                                          track)
             if genome:
                 return genome
         return self._fresh_genome(rng, n_towers, pools, is_locked,
-                                  large_towers, tower_pool, price_of)
+                                  large_towers, tower_pool, price_of, track)
 
     def _role_slots(self, n):
         base = ["opener", "carry", "amplifier", "control"]
@@ -321,7 +550,7 @@ class MetaBrain:
         return base + ["free"] * (n - 4)
 
     def _fresh_genome(self, rng, n_towers, pools, is_locked,
-                      large_towers, tower_pool, price_of):
+                      large_towers, tower_pool, price_of, track=None):
         pool = list(tower_pool or
                     [t for t in self.towers if t in ROUGH_COST])
         picks = []       # [(ttype, role), ...]
@@ -333,27 +562,37 @@ class MetaBrain:
                 picks.append((ttype, role))
         needs = self._coverage_fixes(rng, picks)
         genome, meta = self._assemble(rng, picks, needs, pools, is_locked,
-                                      large_towers, price_of)
+                                      large_towers, price_of, track)
         self.last_strategy = {
             "kind": "meta", "explore": self.explore,
+            "placement": ("track" + ("+flow" if track.oriented else "")
+                          if track and track.ok else "pools"),
             "roles": [f"{r}:{t}" for t, r in picks], **meta}
         return genome
 
     def _assemble(self, rng, picks, needs, pools, is_locked,
-                  large_towers, price_of=None):
+                  large_towers, price_of=None, track=None):
         """picks + coverage requirements -> ordered place/upgrade actions.
-        Places go cheapest-first (early rounds need towers NOW); upgrades
-        are sorted by threat deadline with noise for variety."""
-        placed = []      # (ref, ttype, spot, main, cross, label)
-        taken = []
-        for ref, (ttype, _role) in enumerate(picks):
-            spot = self._pick_spot(rng, pools, taken,
-                                   large=ttype in large_towers)
+        Spots are assigned in placement order (carry anchors, buffers
+        last); places go cheapest-first (early rounds need towers NOW);
+        upgrades are sorted by threat deadline with noise for variety."""
+        spots = {}
+        taken, placed_ctx = [], []
+        for i in self._placement_order(picks):
+            ttype = picks[i][0]
+            spot = self._spot_for(rng, ttype, pools, taken, placed_ctx,
+                                  track, large=ttype in large_towers)
             if spot is None:
                 continue
+            spots[i] = spot
             taken.append(spot)
+            placed_ctx.append((ttype, spot))
+        placed = []      # (ref, ttype, spot, main, cross, label)
+        for ref, (ttype, _role) in enumerate(picks):
+            if ref not in spots:
+                continue
             main, cross, label = self._pick_build(rng, ttype)
-            placed.append((ref, ttype, spot, main, cross, label))
+            placed.append((ref, ttype, spots[ref], main, cross, label))
 
         def cost_of(ttype):
             if price_of:
@@ -410,7 +649,7 @@ class MetaBrain:
     # --------------------------------------------------------- evolution
 
     def _evolved_genome(self, rng, n_towers, pools, is_locked,
-                        large_towers, tower_pool, elites):
+                        large_towers, tower_pool, elites, track=None):
         """Mutate (and sometimes cross over) the best layouts found so
         far. This is where genuinely emergent tactics come from: the
         parents are the bot's own discoveries, and mutations are free to
@@ -434,10 +673,13 @@ class MetaBrain:
         mutations = []
         for t in towers:
             roll = rng.random()
-            if roll < 0.20:                       # relocate
-                spot = self._pick_spot(rng, pools,
-                                       [x["at"] for x in towers if x is not t],
-                                       large=t["tower"] in large_towers)
+            if roll < 0.20:                       # relocate (style-aware)
+                others = [(x["tower"], x["at"]) for x in towers
+                          if x is not t]
+                spot = self._spot_for(rng, t["tower"], pools,
+                                      [s for _, s in others], others,
+                                      track,
+                                      large=t["tower"] in large_towers)
                 if spot:
                     t["at"] = spot
                     mutations.append(f"move:{t['tower']}")
@@ -460,8 +702,11 @@ class MetaBrain:
                 mutations.append(f"deeper:{t['tower']}")
         if len(towers) < n_towers and rng.random() < 0.5:
             ttype = self._pick_tower(rng, pool, [x["tower"] for x in towers])
-            spot = self._pick_spot(rng, pools, [x["at"] for x in towers],
-                                   large=ttype in large_towers)
+            others = [(x["tower"], x["at"]) for x in towers]
+            spot = self._spot_for(rng, ttype, pools,
+                                  [s for _, s in others], others, track,
+                                  large=ttype in large_towers) \
+                if ttype else None
             if ttype and spot:
                 main, cross, _ = self._pick_build(rng, ttype)
                 path = [0, 0, 0]
@@ -503,6 +748,11 @@ class MetaBrain:
             vec[p_i] = 1
             genome.append({"do": "upgrade", "ref": ref, "path": vec})
         self.last_strategy = {"kind": label, "explore": self.explore,
+                              "placement": ("track"
+                                            + ("+flow" if track.oriented
+                                               else "")
+                                            if track and track.ok
+                                            else "pools"),
                               "mutations": mutations}
         return genome
 
@@ -519,13 +769,29 @@ class MetaBrain:
                 else " [clone, no mutations]"
         elif s.get("roles"):
             extra = f" [{', '.join(s['roles'])}]"
-        return (f"   strategy={s.get('kind', '?')}{extra}\n"
+        spots = f" spots={s['placement']}" if s.get("placement") else ""
+        return (f"   strategy={s.get('kind', '?')}{spots}{extra}\n"
                 f"   layout: {kinds} (+{ups} upgrades)")
 
-    def report(self):
+    def report(self, track=None, mask_points=None):
         lines = [f"MetaBrain report -- map '{self.map_name}', "
                  f"difficulty {self.difficulty}, target r{self.target}",
                  f"episodes learned from: {len(self.history)}", ""]
+        if track and track.ok and mask_points:
+            ranked = sorted(mask_points,
+                            key=lambda p: -track.exposure(p, 0.06))[:5]
+            flow = ("bloons enter near progress 0"
+                    if track.oriented else
+                    "flow direction not sensed yet (farm learns it on "
+                    "its first episode)")
+            lines.append(f"map model: {len(track.cells)} track cells; "
+                         f"{flow}")
+            lines.append("prime real estate (most track in range): "
+                         + "  ".join(
+                             f"[{p[0]:.2f},{p[1]:.2f}]"
+                             f"={track.exposure(p, 0.06):.0%}"
+                             for p in ranked))
+            lines.append("")
         lines.append(f"{'tower':<11}{'meta':>5}{'seen':>6}{'learned':>9}"
                      f"  verdict")
         prior_only, moved = [], []
@@ -694,6 +960,73 @@ def _selftest():
                 ok = True
         misses += 0 if ok else 1
     assert misses == 0, f"camo uncovered in {misses}/50 exploit genomes"
+
+    # ----- track-aware placement, against the real mask when present
+    mask_path = Path(__file__).parent / "masks" / "monkey_meadow_dart.json"
+    if mask_path.exists():
+        mask = _load_json(mask_path)
+        track = TrackModel(mask)
+        assert track.ok and len(track.cells) >= 20, "no track blob found"
+        ps = sorted(track.progress.values())
+        assert ps[0] == 0.0 and ps[-1] == 1.0
+        pts = mask.get("valid_strict") or mask["valid"]
+        exps = sorted(track.exposure(p, 0.06) for p in pts)
+        assert exps[-1] > 0 and exps[-1] >= 3 * max(exps[0], 0.005), \
+            "exposure should separate prime spots from corners"
+        entry = min(track.cells, key=lambda c: track.progress[c])
+        track.orient([entry[0], entry[1]])
+        assert track.oriented and track.progress[entry] == 0.0
+        tpools = {"near": pts, "mid": [], "all": pts, "roomy": pts}
+        b3 = MetaBrain("selftest_map", "easy", target_round=40,
+                       explore=0.0, knowledge=k, runs_path="/nonexistent")
+        med_exp = exps[len(exps) // 2]
+        stats = {"carry": 0, "carry_prime": 0,
+                 "buddy": 0, "buddy_near": 0,
+                 "glue": 0, "glue_upstream": 0}
+        carries = set(k["roles"]["carry"])
+        for i in range(60):
+            g = b3.next_genome(rng, 4, tpools, tower_pool=pool,
+                               track=track)
+            here = {x["ref"]: (x["tower"], x["at"]) for x in g
+                    if x["do"] == "place"}
+            spots = {t: at for t, at in here.values()}
+            carry = next((t for t, _ in here.values() if t in carries),
+                         None)
+            if carry:
+                stats["carry"] += 1
+                if track.exposure(spots[carry], 0.06) >= med_exp:
+                    stats["carry_prime"] += 1
+            for t, at in here.values():
+                style = (k["towers"][t].get("placement")
+                         or {}).get("style")
+                if style == "buddy" and len(here) > 1:
+                    stats["buddy"] += 1
+                    rr = k["towers"][t]["placement"]["range"]
+                    if any(_dist(at, a2) <= rr * 0.9
+                           for t2, a2 in here.values() if a2 is not at):
+                        stats["buddy_near"] += 1
+                if t == "glue" and carry and carry != "glue":
+                    gs = track.span(at, 0.082)
+                    cs = track.span(
+                        spots[carry],
+                        (k["towers"][carry]["placement"] or {}).get(
+                            "range") or 0.06)
+                    if gs and cs:
+                        stats["glue"] += 1
+                        if gs[1] <= cs[1] + 0.06:
+                            stats["glue_upstream"] += 1
+        assert stats["carry_prime"] >= 0.8 * stats["carry"], \
+            f"carries not on prime real estate: {stats}"
+        assert stats["buddy_near"] >= 0.8 * max(stats["buddy"], 1), \
+            f"buffers placed away from teammates: {stats}"
+        if stats["glue"] >= 5:
+            assert stats["glue_upstream"] >= 0.8 * stats["glue"], \
+                f"glue not upstream of the carry: {stats}"
+        print(f"track placement OK on {mask_path.name}: "
+              f"{len(track.cells)} track cells, "
+              f"carry prime {stats['carry_prime']}/{stats['carry']}, "
+              f"buddy near {stats['buddy_near']}/{stats['buddy']}, "
+              f"glue upstream {stats['glue_upstream']}/{stats['glue']}")
 
     print("selftest OK: genome format, two-path rule, exploration floor,")
     print("posterior learning, evolution engagement, spot learning, and")

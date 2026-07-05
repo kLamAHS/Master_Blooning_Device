@@ -34,7 +34,11 @@
      "weight": 0.2,
      "label": "Juggernaut line (5-0-2)"
     }
-   ]
+   ],
+   "placement": {
+    "range": 0.057,
+    "style": "coverage"
+   }
   },
   "boomerang": {
    "score": 82.0,
@@ -61,7 +65,11 @@
      "weight": 0.4,
      "label": "Perma Charge line (2-5-0)"
     }
-   ]
+   ],
+   "placement": {
+    "range": 0.077,
+    "style": "coverage"
+   }
   },
   "bomb": {
    "score": 78.0,
@@ -88,7 +96,11 @@
      "weight": 0.4,
      "label": "Recursive Cluster (2-0-4)"
     }
-   ]
+   ],
+   "placement": {
+    "range": 0.071,
+    "style": "coverage"
+   }
   },
   "tack": {
    "score": 90.0,
@@ -116,7 +128,11 @@
      "weight": 0.3,
      "label": "Ring of Fire / Inferno (5-0-2)"
     }
-   ]
+   ],
+   "placement": {
+    "range": 0.041,
+    "style": "coverage"
+   }
   },
   "ice": {
    "score": 89.0,
@@ -139,7 +155,11 @@
      "weight": 0.45,
      "label": "Icicle Impale (0-2-5)"
     }
-   ]
+   ],
+   "placement": {
+    "range": 0.036,
+    "style": "upstream"
+   }
   },
   "glue": {
    "score": 94.0,
@@ -168,7 +188,11 @@
      "weight": 0.2,
      "label": "Bloon Solver (5-0-2)"
     }
-   ]
+   ],
+   "placement": {
+    "range": 0.082,
+    "style": "upstream"
+   }
   },
   "sniper": {
    "score": 84.0,
@@ -194,7 +218,11 @@
      "weight": 0.3,
      "label": "Full Auto line (2-0-4)"
     }
-   ]
+   ],
+   "placement": {
+    "range": null,
+    "style": "offside"
+   }
   },
   "sub": {
    "score": 80.0,
@@ -219,7 +247,11 @@
      "weight": 0.5,
      "label": "Energizer (5-2-0)"
     }
-   ]
+   ],
+   "placement": {
+    "range": 0.075,
+    "style": "coverage"
+   }
   },
   "buccaneer": {
    "score": 77.0,
@@ -245,7 +277,11 @@
      "weight": 0.4,
      "label": "Pirate Lord line (4-0-2)"
     }
-   ]
+   ],
+   "placement": {
+    "range": 0.082,
+    "style": "coverage"
+   }
   },
   "heli": {
    "score": 81.0,
@@ -272,7 +308,11 @@
      "weight": 0.4,
      "label": "Downdraft (2-3-0)"
     }
-   ]
+   ],
+   "placement": {
+    "range": 0.08,
+    "style": "coverage"
+   }
   },
   "mortar": {
    "score": 73.0,
@@ -299,7 +339,11 @@
      "weight": 0.5,
      "label": "Shattering Shells (0-2-4)"
     }
-   ]
+   ],
+   "placement": {
+    "range": null,
+    "style": "offside"
+   }
   },
   "dartling": {
    "score": 82.0,
@@ -327,7 +371,11 @@
      "weight": 0.5,
      "label": "Ray of Doom line (2-0-4)"
     }
-   ]
+   ],
+   "placement": {
+    "range": null,
+    "style": "coverage"
+   }
   },
   "wizard": {
    "score": 88.0,
@@ -354,7 +402,11 @@
      "weight": 0.35,
      "label": "Summon Phoenix (2-5-0)"
     }
-   ]
+   ],
+   "placement": {
+    "range": 0.071,
+    "style": "coverage"
+   }
   },
   "super": {
    "score": 89.0,
@@ -383,7 +435,11 @@
      "weight": 0.4,
      "label": "Sun Avatar (3-2-0)"
     }
-   ]
+   ],
+   "placement": {
+    "range": 0.089,
+    "style": "coverage"
+   }
   },
   "ninja": {
    "score": 86.0,
@@ -409,7 +465,11 @@
      "weight": 0.45,
      "label": "Bloonjitsu / Grandmaster (4-0-2)"
     }
-   ]
+   ],
+   "placement": {
+    "range": 0.071,
+    "style": "coverage"
+   }
   },
   "alchemist": {
    "score": 95.0,
@@ -432,7 +492,11 @@
      "weight": 0.4,
      "label": "Berserker Brew (4-0-1)"
     }
-   ]
+   ],
+   "placement": {
+    "range": 0.08,
+    "style": "buddy"
+   }
   },
   "druid": {
    "score": 86.0,
@@ -459,7 +523,11 @@
      "weight": 0.3,
      "label": "Ball Lightning (4-0-2)"
     }
-   ]
+   ],
+   "placement": {
+    "range": 0.062,
+    "style": "coverage"
+   }
   },
   "village": {
    "score": 96.0,
@@ -482,7 +550,11 @@
      "weight": 0.2,
      "label": "Primary Expertise (4-2-0)"
     }
-   ]
+   ],
+   "placement": {
+    "range": 0.071,
+    "style": "buddy"
+   }
   },
   "engineer": {
    "score": 84.0,
@@ -507,7 +579,11 @@
      "weight": 0.3,
      "label": "Sentry Expert line (4-2-0)"
     }
-   ]
+   ],
+   "placement": {
+    "range": 0.071,
+    "style": "coverage"
+   }
   },
   "beast": {
    "score": 74.0,
@@ -520,7 +596,11 @@
    ],
    "avoid_for": "Simple generic advice",
    "notes": "Power depends heavily on placement/merge planning.",
-   "builds": []
+   "builds": [],
+   "placement": {
+    "range": 0.06,
+    "style": "coverage"
+   }
   },
   "spike": {
    "score": 83,
@@ -546,6 +626,10 @@
      "label": "Perma-Spike (0-2-5)"
     }
    ],
+   "placement": {
+    "range": 0.036,
+    "style": "downstream"
+   },
    "inferred": true
   }
  },
