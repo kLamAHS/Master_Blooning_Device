@@ -333,15 +333,24 @@ happen), a **priority**, and a **cost estimate**:
 
 - **Paced by income, upgrade-first.** Buys are scheduled along a rough
   income curve so the plan never wants more money than the game can
-  have produced — and in the order a good player buys: hero and opener
-  anchor, the carry base follows, then the **carry's first tiers come
-  before any more bases**. Support towers join after the carry has
-  teeth; a $2,500 super is *planned* for ~round 15 instead of being
-  dribbled away on trinkets. Threat answers keep hard dates (camo
-  before 24, lead before 28) that cap both the upgrade *and* its
-  tower's placement, whatever the curve says. When cash runs ahead of
-  the model, the next scheduled buy unlocks early — estimates pace,
+  have produced — and in the order a good player buys: the hero
+  anchors (with a hero placed there is **no separate opener** — that
+  would just split cash away from the carry), the carry base follows,
+  then the **carry's first tiers come before any more bases**. A
+  $2,500 super is *planned* for ~round 15 instead of being dribbled
+  away on trinkets. Threat answers keep hard dates (camo before 24,
+  lead before 28) that cap both the upgrade *and* its tower's
+  placement, whatever the curve says. When cash runs ahead of the
+  model, the next scheduled buy unlocks early — estimates pace,
   reality decides.
+- **Support is conditional, not on a timer.** Amplifier/control/extra
+  bases are *gated on the carry being stable* (main path at tier 3):
+  glue and buffs arrive when the core can use them, not because a
+  clock ticked. Gates yield to threat dates (camo coverage never waits
+  for a struggling carry), to a leak emergency, and to running 6+
+  rounds late — support arrives when needed either way. Every tower
+  gets an identity label (`boomerang#0(carry)`), so logs and the
+  dataset say exactly which tower each upgrade landed on.
 - **Reservation.** The most important due purchase reserves its price.
   Lower-priority buys (crosspaths, luxuries) only spend the *surplus*
   above the reservation — being efficient now is what makes the big

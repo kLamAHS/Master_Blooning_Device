@@ -63,7 +63,8 @@ def earned_by(r):
     return 650 + 25 * r + 11 * r * r
 
 
-def choose_buy(queue, cur_round, cash, cost_of, now, emergency=False):
+def choose_buy(queue, cur_round, cash, cost_of, now, emergency=False,
+               gate_ok=None):
     """The economy policy: which pending buy may spend money right now?
 
     - Buys unlock at their scheduled "round" (a good player doesn't dump
@@ -86,6 +87,8 @@ def choose_buy(queue, cur_round, cash, cost_of, now, emergency=False):
     for j, it in enumerate(queue):
         prio = it.get("prio", 1)
         awake = it.get("_wake", 0) <= now
+        if not emergency and gate_ok is not None and not gate_ok(it):
+            continue        # conditional buy whose condition isn't met
         if emergency:
             if not awake:
                 continue
@@ -616,17 +619,19 @@ class MetaBrain:
                                   large_towers, tower_pool, price_of,
                                   track, hero)
 
-    def _role_slots(self, n):
-        base = ["opener", "carry", "amplifier", "control"]
+    def _role_slots(self, n, hero=False):
+        """Roles for n tower slots. With a hero anchoring, the hero IS
+        the opener -- a separate cheap opener would just split cash away
+        from the carry's first tiers (the second-boomerang trap)."""
         if n <= 0:
             return []
+        if hero:
+            slots = ["carry", "amplifier", "control", "free"]
+            return slots[:n] + ["free"] * max(0, n - 4)
+        slots = ["opener", "carry", "amplifier", "control"]
         if n == 1:
             return ["carry"]
-        if n == 2:
-            return ["opener", "carry"]
-        if n == 3:
-            return ["opener", "carry", "amplifier"]
-        return base + ["free"] * (n - 4)
+        return slots[:n] + ["free"] * max(0, n - 4)
 
     def _fresh_genome(self, rng, n_towers, pools, is_locked,
                       large_towers, tower_pool, price_of, track=None,
@@ -636,7 +641,7 @@ class MetaBrain:
         picks = []       # [(ttype, role), ...]
         if hero:
             picks.append(("hero", "hero"))   # free scaling: always early
-        for role in self._role_slots(n_towers):
+        for role in self._role_slots(n_towers, hero=hero):
             cands = pool if role == "free" else \
                 [t for t in self.roles.get(role, []) if t in pool] or pool
             ttype = self._pick_tower(rng, cands, [t for t, _ in picks])
@@ -763,16 +768,28 @@ class MetaBrain:
                 if tt in sol and sol[tt] is None:
                     base_by[i] = min(base_by.get(i, 99), first - 2)
                     break
+        # Tower identity: every place gets an unambiguous name so logs
+        # read "boomerang#1(carry) bottom t2", never "upgrade ref2".
+        carry_order = next((o for o, (r, *_x) in enumerate(placed)
+                            if picks[r][1] == "carry"), None)
         entries = []
         for order, (ref, ttype, spot, main, cross, label) in enumerate(placed):
             role = picks[ref][1]
             p_prio, p_dl = place_plan.get(role, (1, 12.0))
             entry = {"do": "place", "tower": ttype,
                      "at": [spot[0], spot[1]], "ref": order,
+                     "name": f"{ttype}#{order}({role})",
                      "prio": p_prio, "deadline": p_dl,
                      "est": base_cost(ttype)}
             if ref in base_by:
                 entry["by"] = base_by[ref]
+            if role in ("amplifier", "control", "free") \
+                    and carry_order is not None:
+                # Conditional support: these bases wait until the carry
+                # is stable (main path t3). A threat date ("by") or a
+                # leak emergency still overrides -- support arrives when
+                # NEEDED, not on a timer.
+                entry["gate"] = {"ref": carry_order, "tier": 3}
             entries.append(entry)
             if ttype == "hero":
                 continue          # heroes level up on their own: no buys
@@ -918,6 +935,7 @@ class MetaBrain:
         for order, t in enumerate(towers):
             entries.append({"do": "place", "tower": t["tower"],
                             "at": list(t["at"]), "ref": order,
+                            "name": f"{t['tower']}#{order}(evolved)",
                             "prio": 0, "deadline": 1.0,
                             "est": ROUGH_COST.get(t["tower"], 600)})
             if t["tower"] == "hero":
@@ -959,7 +977,7 @@ class MetaBrain:
     def describe_genome(self, genome):
         places = [g for g in genome if g["do"] == "place"]
         ups = sum(1 for g in genome if g["do"] == "upgrade")
-        kinds = ", ".join(g["tower"] for g in places)
+        kinds = ", ".join(g.get("name") or g["tower"] for g in places)
         s = self.last_strategy
         extra = ""
         if "mutations" in s:
@@ -1256,6 +1274,16 @@ def _selftest():
           q_item(do="place", tower="b", round=1, prio=0, est=200)]
     assert choose_buy(q2, 1, 250, est, now) == 1, \
         "equal-priority siblings buy while the head saves"
+    q3 = [q_item(do="place", tower="glue", round=1, prio=1, est=275,
+                 gate={"ref": 0, "tier": 3}),
+          q_item(do="upgrade", ref=0, path=[0, 0, 1], round=1, prio=2,
+                 est=300)]
+    gated = lambda it: "gate" not in it
+    assert choose_buy(q3, 1, 900, est, now, gate_ok=gated) == 1, \
+        "a closed gate must skip the item entirely"
+    assert choose_buy(q3, 1, 900, est, now, emergency=True,
+                      gate_ok=gated) == 0, \
+        "emergencies bypass gates"
 
     # ----- buy scheduling: paced by income, threats before deadlines
     if mask_path.exists():
@@ -1314,6 +1342,20 @@ def _selftest():
                     and not any(x["do"] == "upgrade"
                                 and x["ref"] in hero_refs for x in g):
                 hero_ok += 1
+            roles = b4.last_strategy.get("roles", [])
+            if roles:                          # fresh (not evolved) only
+                assert not any(r.startswith("opener:") for r in roles), \
+                    "hero layouts must not also buy a separate opener"
+                names = [x["name"] for x in g if x["do"] == "place"]
+                assert len(names) == len(set(names)) and all(names), \
+                    f"tower names must be unique labels: {names}"
+                gates = [x for x in g if x["do"] == "place"
+                         and x.get("gate")]
+                assert gates, "support bases should be carry-gated"
+                for x in gates:
+                    assert g[[y["ref"] for y in g
+                              if y["do"] == "place"].index(
+                        x["gate"]["ref"])]["tower"] != "hero"
             second_up = [j for j, x in enumerate(g)
                          if x["do"] == "upgrade"][1:2]
             if second_up:

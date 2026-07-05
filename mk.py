@@ -1629,7 +1629,8 @@ def act_place(screen, cfg, action):
                 note = f"  (${cash_before} -> ${cash_after})"
             if attempt:
                 note += f"  [moved to {target}]"
-            print(f"      placed {action['tower']}{note}")
+            print(f"      placed "
+                  f"{action.get('name') or action['tower']}{note}")
             return "placed", target
         # Rejected: cancel the ghost and VERIFY it's gone -- some game
         # states (e.g. nudge mode) leave a stuck ghost that right-click
@@ -2374,7 +2375,8 @@ def run_episode(screen, cfg, genome, final_round, abort_lives=50,
     try:
         from meta import choose_buy
     except ImportError:                       # no brain: old greedy rule
-        def choose_buy(q, _round, _cash, _cost, now, emergency=False):
+        def choose_buy(q, _round, _cash, _cost, now, emergency=False,
+                       gate_ok=None):
             return next((j for j, it in enumerate(q)
                          if it.get("_wake", 0) <= now), None)
 
@@ -2537,10 +2539,33 @@ def run_episode(screen, cfg, genome, final_round, abort_lives=50,
                             ent["path"][pi] + 1))
                 return known or it.get("est")
 
+            def _gate_ok(it):
+                """Conditional buys: support bases gated on the carry
+                being stable (main path at the gate tier). Overrides
+                that keep the gate from becoming a deadlock: a threat
+                date ('by') close at hand, the carry placement having
+                been skipped, or the item running 6+ rounds past its
+                own schedule -- support arrives when NEEDED, and a
+                struggling carry can't strand it forever."""
+                g = it.get("gate")
+                if not g:
+                    return True
+                if it.get("by") and last_round >= it["by"] - 1:
+                    return True
+                if last_round >= it.get("round", 0) + 6:
+                    return True
+                if g["ref"] in landed_by_ref \
+                        and landed_by_ref[g["ref"]] is None:
+                    return True          # carry skipped: gate is void
+                lnd = landed_by_ref.get(g["ref"])
+                ent = towers.get(tuple(lnd)) if lnd else None
+                return bool(ent) and max(ent["path"]) >= g["tier"]
+
             idx = choose_buy(queue, last_round,
                              read_cash(screen, cfg), _cost_of,
                              time.time(),
-                             emergency=time.time() < emergency_until[0])
+                             emergency=time.time() < emergency_until[0],
+                             gate_ok=_gate_ok)
             item = queue[idx] if idx is not None else None
             if item is None:
                 pass                           # all pending buys cooling down
@@ -2572,7 +2597,10 @@ def run_episode(screen, cfg, genome, final_round, abort_lives=50,
                         landed_by_ref[item.get("ref", place_i)] = landed
                         towers[tuple(landed)] = {"tower": item["tower"],
                                                  "at": landed,
-                                                 "path": [0, 0, 0]}
+                                                 "path": [0, 0, 0],
+                                                 **({"name": item["name"]}
+                                                    if item.get("name")
+                                                    else {})}
                         place_i += 1
                         queue.pop(idx)
                         broke_at[0] = None
@@ -2628,24 +2656,26 @@ def run_episode(screen, cfg, genome, final_round, abort_lives=50,
                     entry = towers.get(tuple(landed))
                     pi = item["path"].index(1) if 1 in item["path"] else 0
                     ttype = entry["tower"].lower() if entry else ""
+                    tname = (entry.get("name") if entry else None) \
+                        or ttype
                     tier = (entry["path"][pi] + 1) if entry else 1
                     # Decide WITHOUT opening the menu where possible.
                     if entry and entry.get("_noselect", 0) >= 3:
-                        dbg(f"{ttype}: unselectable tower -- dropping "
+                        dbg(f"{tname}: unselectable tower -- dropping "
                             f"this upgrade")
                         queue.pop(idx)
                     elif entry and is_locked(ttype, pi, tier):
-                        dbg(f"{ttype} path{pi + 1} t{tier}: XP-locked, skip")
+                        dbg(f"{tname} path{pi + 1} t{tier}: XP-locked, skip")
                         queue.pop(idx)         # XP-locked: never touch it
                     elif entry and pi in entry.get("closed_paths", []):
-                        dbg(f"{ttype} path{pi + 1}: closed, skip")
+                        dbg(f"{tname} path{pi + 1}: closed, skip")
                         queue.pop(idx)         # path closed on this tower
                     elif (known := PRICES.get(price_key(ttype, pi, tier))) \
                             and (cash := read_cash(screen, cfg)) is not None \
                             and cash < known:
                         # Known price, can't afford: no menu, just sleep
                         # this item and let income build.
-                        msg = (f"{ttype} path{pi + 1} t{tier}: saving "
+                        msg = (f"{tname} path{pi + 1} t{tier}: saving "
                                f"(${cash}/${known})")
                         if item.get("_dbg") != msg:
                             item["_dbg"] = msg
@@ -2663,11 +2693,11 @@ def run_episode(screen, cfg, genome, final_round, abort_lives=50,
                             # re-reads it; a green sighting overwrites and
                             # heals. Repeats every 60s while still stuck.
                             item["_recheck_at"] = time.time() + 60
-                            dbg(f"{ttype} path{pi + 1}: re-checking "
+                            dbg(f"{tname} path{pi + 1}: re-checking "
                                 f"unverified ${known}")
                             st = act_upgrade(screen, cfg,
                                              {**item, "at": landed}, entry)
-                            dbg(f"{ttype} path{pi + 1} t{tier}: {st}")
+                            dbg(f"{tname} path{pi + 1} t{tier}: {st}")
                             if st == "bought":
                                 queue.pop(idx)
                                 broke_at[0] = None
@@ -2684,7 +2714,7 @@ def run_episode(screen, cfg, genome, final_round, abort_lives=50,
                     elif broke_at[0] is not None \
                             and (cash := read_cash(screen, cfg)) is not None \
                             and watermark_holds(cash):
-                        msg = (f"{ttype} path{pi + 1}: watermark hold "
+                        msg = (f"{tname} path{pi + 1}: watermark hold "
                                f"(${cash} <= ${broke_at[0]}+100)")
                         if item.get("_dbg") != msg:
                             item["_dbg"] = msg
@@ -2693,7 +2723,7 @@ def run_episode(screen, cfg, genome, final_round, abort_lives=50,
                     else:
                         st = act_upgrade(screen, cfg,
                                          {**item, "at": landed}, entry)
-                        dbg(f"{ttype} path{pi + 1} t{tier}: {st}")
+                        dbg(f"{tname} path{pi + 1} t{tier}: {st}")
                         if st == "bought":
                             queue.pop(idx)
                             broke_at[0] = None
