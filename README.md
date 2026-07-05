@@ -11,6 +11,89 @@ script becomes your data collector for Stage 2 (it already logs every round to
 > an account flagged or banned. Use this **offline, single player only**,
 > ideally on a throwaway account. Never in races, co-op, or events.
 
+## Usage guide — every command, in order
+
+Each step's details live in the section noted. Setup steps (1–5) happen
+once; after that your daily loop is just steps 6–8.
+
+1. **Install** (once per machine, §1):
+
+   ```
+   pip install -r requirements.txt      # plus the Tesseract OCR engine
+   ```
+
+2. **Set the game up** (once, §2): Settings → Gameplay → **Auto Start ON**
+   and **Disable Nudge Mode ON**; play windowed or fullscreen and don't
+   move the window afterwards.
+
+3. **Verify the round OCR** (once per machine, §3 step 3). Load into the
+   map — Easy → Standard — but don't start round 1, then:
+
+   ```
+   python mk.py watch                   # want: parsed=1 on every read
+   ```
+
+4. **Scan the map** (once per map, "Emergent mode" section). Same clean,
+   un-started map:
+
+   ```
+   python mk.py scan monkey_meadow                # land spots
+   python mk.py scan monkey_meadow --tower sub    # optional water pass
+   ```
+
+5. **Calibrate the three restart buttons** (once, Stage 2 section) so
+   `farm` can chain episodes unattended. Use:
+
+   ```
+   python mk.py locate                  # prints live mouse coordinates
+   ```
+
+   Lose a game on purpose and hover the defeat screen's RESTART, press
+   Esc mid-game and hover the pause menu's RESTART, then hover the
+   confirm dialog's OK — and put the three values in `config.json` as
+   `defeat_restart`, `pause_restart`, `restart_confirm`.
+
+6. **(Optional) prove the pipeline** with the hand-written control plan
+   (§3):
+
+   ```
+   python mk.py play plans/monkey_meadow_easy.json
+   ```
+
+7. **Farm learning episodes** — the main loop (Stage 2 + Stage 3
+   sections). Load the map fresh at round 1 and walk away:
+
+   ```
+   python mk.py farm monkey_meadow --episodes 15 --towers 4
+   ```
+
+   Meta-guided layouts are the default. Useful flags: `--explore 0.5`
+   (more randomness), `--no-meta` (pure random, the old Stage 2),
+   `--no-evolve` (no genetic layer), `--pool classic` (original 10
+   towers only), `--final-round 40`, `--abort-lives 50`, `--seed N`.
+
+8. **Review what it learned** (Stage 3 section, no game needed):
+
+   ```
+   python mk.py learn monkey_meadow
+   ```
+
+9. **When the research spreadsheet gets a new version**, regenerate the
+   knowledge base (needs `pip install openpyxl`):
+
+   ```
+   python tools/extract_meta.py
+   ```
+
+10. **After touching the code**, run the offline sanity checks:
+
+    ```
+    python meta.py selftest
+    ```
+
+**Emergency stop, anytime:** slam the mouse into the top-left corner of
+the screen, or Ctrl+C in the terminal.
+
 ## 1. Install
 
 You need Python 3.10+.
@@ -47,7 +130,7 @@ Accessibility + Screen Recording permissions so it can click and screenshot.
    in a stuck confirm-state that ignores the cursor, which wrecks the
    bot's retry-at-the-next-spot behavior (worst for big towers like the
    super monkey).
-3. Keep default hotkeys (or edit `TOWER_HOTKEYS` in `btd6_bot.py` to match
+3. Keep default hotkeys (or edit `TOWER_HOTKEYS` in `mk.py` to match
    yours).
 4. Don't move or resize the window after calibrating — every coordinate
    depends on it.
@@ -58,7 +141,7 @@ Accessibility + Screen Recording permissions so it can click and screenshot.
 snaps every placement to the nearest safe green point automatically, and
 upgrades follow their tower — so the template's rough coordinates work
 as-is. To move a tower, nudge its hint toward where you want it (eyeball
-fractions from the preview image, or use `python btd6_bot.py locate` to
+fractions from the preview image, or use `python mk.py locate` to
 hover for exact values). `locate` is also handy for one-off points like
 `"deselect_point"` in config.json.
 
@@ -75,7 +158,7 @@ during the scan.
 Standard) but don't start the round, then run:
 
 ```
-python btd6_bot.py watch
+python mk.py watch
 ```
 
 `watch` now **recalibrates every time it starts**: it finds the blue
@@ -91,7 +174,7 @@ needed anymore.
 **Step 4 — let it play.**
 
 ```
-python btd6_bot.py play plans/monkey_meadow_easy.json
+python mk.py play plans/monkey_meadow_easy.json
 ```
 
 On Windows the bot brings the game window to the front by itself and starts
@@ -116,8 +199,8 @@ fools naive color checks — and the before/after comparison cancels out red
 map decorations too. Every legal placement gets written out.
 
 ```
-python btd6_bot.py scan monkey_meadow                # land spots (dart ghost)
-python btd6_bot.py scan monkey_meadow --tower sub    # add a water pass
+python mk.py scan monkey_meadow                # land spots (dart ghost)
+python mk.py scan monkey_meadow --tower sub    # add a water pass
 ```
 
 Run it with the map loaded and round 1 not yet started (empty map, no bloons
@@ -156,7 +239,7 @@ dialog's OK. Put them in `config.json` as `defeat_restart`,
 `pause_restart`, `restart_confirm`. Then:
 
 ```
-python btd6_bot.py farm monkey_meadow --episodes 15 --towers 4
+python mk.py farm monkey_meadow --episodes 15 --towers 4
 ```
 
 Load the map fresh and walk away. Random layouts mostly *die* — that's
