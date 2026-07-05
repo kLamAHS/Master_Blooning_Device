@@ -2300,14 +2300,14 @@ def sense_flow_entry(screen, clean, track, timeout=7.0):
 # (layout, final_round, outcome) rows in runs_log.jsonl.
 # ---------------------------------------------------------------------------
 
-def random_genome(rng, n_towers):
+def random_genome(rng, n_towers, hero=False):
     """An ordered buy list: towers on random mask points, then shuffled
     single-tier upgrades (a random main path to <=4, a crosspath to <=2).
     Executed greedily as cash allows -- timing emerges from the economy.
     Tiers already known to be XP-locked are never generated."""
     genome = []
     spots = []
-    for _ in range(min(n_towers, len(MASK_POINTS))):
+    for _ in range(min(n_towers + (1 if hero else 0), len(MASK_POINTS))):
         roll = rng.random()
         if roll < 0.70 and MASK_NEAR:
             pool = MASK_NEAR
@@ -2321,11 +2321,15 @@ def random_genome(rng, n_towers):
                 spots.append(cand)
                 break
     types = [rng.choice(FARM_TOWERS) for _ in spots]
+    if hero and types:
+        types[0] = "hero"          # levels on its own; no upgrade rolls
     for ref, (spot, ttype) in enumerate(zip(spots, types)):
         genome.append({"do": "place", "tower": ttype,
                        "at": [spot[0], spot[1]], "ref": ref})
     ups = []
     for ref, ttype in enumerate(types):
+        if ttype == "hero":
+            continue
         main = rng.randrange(3)
         cross = rng.choice([p for p in range(3) if p != main])
         # At least tier 1 on the main path: near-empty genomes finish
@@ -2573,8 +2577,32 @@ def run_episode(screen, cfg, genome, final_round, abort_lives=50,
                         queue.pop(idx)
                         broke_at[0] = None
                     elif st == "broke":
-                        set_watermark(base)
-                        item["_wake"] = time.time() + 5
+                        est_c = base or item.get("est")
+                        lvl = read_cash_confirmed(screen, cfg)
+                        if est_c and lvl is not None and lvl >= est_c:
+                            # "Can't afford" while holding MORE than the
+                            # price: the hotkey isn't producing a ghost
+                            # at all (classic case: hero key with no
+                            # hero equipped). Money won't fix this --
+                            # stop letting it anchor the buy plan.
+                            item["_ghost_fails"] = \
+                                item.get("_ghost_fails", 0) + 1
+                            if item["_ghost_fails"] >= 4:
+                                print(f"   giving up on {item['tower']}: "
+                                      f"affordable (${lvl}) but no ghost "
+                                      f"ever appears"
+                                      + (" -- is a hero equipped?"
+                                         if item["tower"] == "hero"
+                                         else ""))
+                                landed_by_ref[item.get("ref", place_i)] \
+                                    = None
+                                place_i += 1
+                                queue.pop(idx)
+                            else:
+                                item["_wake"] = time.time() + 5
+                        else:
+                            set_watermark(base)
+                            item["_wake"] = time.time() + 5
                     else:                              # no_spot: real fail
                         item["_fails"] = item.get("_fails", 0) + 1
                         if item["_fails"] >= 3:
@@ -2950,9 +2978,10 @@ def cmd_farm(args):
                 large_towers=LARGE_TOWERS, tower_pool=tower_pool,
                 price_of=lambda t, p=None, tr=None: PRICES.get(
                     price_key(t) if p is None else price_key(t, p, tr)),
-                track=track)
+                track=track, hero=not args.no_hero)
         else:
-            genome = random_genome(rng, args.towers)
+            genome = random_genome(rng, args.towers,
+                                   hero=not args.no_hero)
         sensor = None
         if track is not None and not track.oriented:
             def sensor(clean):
@@ -3299,6 +3328,9 @@ def main():
     p_farm.add_argument("--no-evolve", action="store_true", dest="no_evolve",
                         help="disable the genetic layer that mutates and "
                              "crosses over the best layouts found so far")
+    p_farm.add_argument("--no-hero", action="store_true", dest="no_hero",
+                        help="don't place the equipped hero (hotkey u) "
+                             "as the early anchor of each episode")
     p_farm.add_argument("--pool", choices=["classic", "full"],
                         default="full",
                         help="tower pool for meta layouts: classic = the "

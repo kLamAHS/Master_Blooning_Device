@@ -67,9 +67,11 @@ once; after that your daily loop is just steps 6–8.
    python mk.py farm monkey_meadow --episodes 15 --towers 4
    ```
 
-   Meta-guided layouts are the default. Useful flags: `--explore 0.5`
-   (more randomness), `--no-meta` (pure random, the old Stage 2),
-   `--no-evolve` (no genetic layer), `--pool classic` (original 10
+   Meta-guided layouts are the default, and the equipped hero is placed
+   as the early anchor — equip one (Sauda recommended) in the hero menu
+   first. Useful flags: `--explore 0.5` (more randomness), `--no-meta`
+   (pure random, the old Stage 2), `--no-evolve` (no genetic layer),
+   `--no-hero` (skip hero placement), `--pool classic` (original 10
    towers only), `--final-round 40`, `--abort-lives 50`, `--seed N`.
 
 8. **Review what it learned** (Stage 3 section, no game needed):
@@ -329,12 +331,17 @@ opposite: *money efficiency and save-up windows matter more than
 theoretical DPS.* So every buy now carries a **round** (when it should
 happen), a **priority**, and a **cost estimate**:
 
-- **Paced by income.** Buys are scheduled along a rough income curve so
-  the plan never wants more money than the game can have produced — an
-  opener goes down at round 1, a $2,500 super is *planned* for ~round
-  15 instead of being dribbled away on trinkets, and threat answers
-  keep hard dates (camo before 24, lead before 28) whatever the curve
-  says.
+- **Paced by income, upgrade-first.** Buys are scheduled along a rough
+  income curve so the plan never wants more money than the game can
+  have produced — and in the order a good player buys: hero and opener
+  anchor, the carry base follows, then the **carry's first tiers come
+  before any more bases**. Support towers join after the carry has
+  teeth; a $2,500 super is *planned* for ~round 15 instead of being
+  dribbled away on trinkets. Threat answers keep hard dates (camo
+  before 24, lead before 28) that cap both the upgrade *and* its
+  tower's placement, whatever the curve says. When cash runs ahead of
+  the model, the next scheduled buy unlocks early — estimates pace,
+  reality decides.
 - **Reservation.** The most important due purchase reserves its price.
   Lower-priority buys (crosspaths, luxuries) only spend the *surplus*
   above the reservation — being efficient now is what makes the big
@@ -345,6 +352,19 @@ happen), a **priority**, and a **cost estimate**:
 
 The executor still verifies everything against real cash — estimates
 pace the plan, reality decides the purchase.
+
+### The hero plays too
+
+Each episode opens by placing your equipped hero (hotkey `u`) as the
+early anchor — free scaling value the meta guide rates highly, with
+**Sauda** the recommended low-micro pick (equip her in the hero menu
+before farming; the bot can't choose heroes, only place them). Heroes
+level on their own, so no upgrade buys are ever attempted on one, and
+placement uses a short-range coverage profile that suits Sauda's melee
+reach. If no hero is equipped, the `u` press produces no ghost — the
+bot notices ("affordable but no ghost ever appears"), drops the hero
+from the plan after a few tries, and plays on. `--no-hero` skips hero
+placement entirely.
 
 To see what the bot currently believes — where its experience confirms
 or contradicts the research, which elite layouts evolution is breeding
