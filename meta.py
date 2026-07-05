@@ -44,6 +44,63 @@ ROUGH_COST = {
     "village": 1200, "super": 2500,
 }
 
+# Rough cost of an upgrade TIER, for scheduling and cash reserves when
+# the price book hasn't learned the real number yet. Coarse on purpose:
+# being $500 off shifts a buy by a round or two, nothing more.
+TIER_EST = {1: 300, 2: 700, 3: 1800, 4: 4500, 5: 14000}
+
+
+def earned_by(r):
+    """Very rough cumulative cash available by round r (start cash plus
+    pop income and end-of-round bonuses, no farms). Only used to PACE
+    the buy plan -- the executor still waits for real cash."""
+    return 650 + 25 * r + 11 * r * r
+
+
+def choose_buy(queue, cur_round, cash, cost_of, now, emergency=False):
+    """The economy policy: which pending buy may spend money right now?
+
+    - Buys unlock at their scheduled "round" (a good player doesn't dump
+      four towers at round 1 and then upgrade whatever).
+    - The most important DUE purchase is the head; while it saves up, it
+      RESERVES its price. Equal-or-higher-priority items may still buy
+      (two openers in parallel), lower-priority ones only if their cost
+      fits in the SURPLUS above the reservation -- efficiency now so the
+      big thing is affordable later.
+    - A leak emergency drops all gates: buy any affordable defense NOW.
+
+    Items missing round/prio (the old uniform-random genomes) default to
+    round 0 / prio 1, which reproduces the old first-awake behavior.
+    Returns an index into queue, or None to hold every wallet."""
+    head_prio = head_cost = None
+    for j, it in enumerate(queue):
+        if it.get("round", 0) > cur_round and not emergency:
+            continue
+        prio = it.get("prio", 1)
+        awake = it.get("_wake", 0) <= now
+        if emergency:
+            if not awake:
+                continue
+            c = cost_of(it)
+            if cash is None or c is None or c <= cash:
+                return j
+            continue
+        if head_prio is None:
+            head_prio, head_cost = prio, cost_of(it)
+            if awake:
+                return j
+            continue
+        if not awake:
+            continue
+        if prio <= head_prio:
+            return j
+        c = cost_of(it)
+        if head_cost is not None and c is not None and cash is not None \
+                and cash - c >= head_cost:
+            return j
+    return None
+
+
 # Land towers the meta layer may add beyond mk.py's classic FARM_TOWERS
 # pool. All are placeable from a dart-scanned land mask and need no
 # per-shot micro. (Heli/dartling chase the cursor, water towers need a
@@ -570,6 +627,43 @@ class MetaBrain:
             "roles": [f"{r}:{t}" for t, r in picks], **meta}
         return genome
 
+    def _schedule(self, entries):
+        """Assign every buy the round it should HAPPEN. Entries are
+        walked most-important-first along a rough income curve, so the
+        plan never wants more money than the game can have produced --
+        that is what stops the old buy-everything-at-once behavior.
+        Threat answers are pinned to land before their threat round even
+        if the curve says later (the executor's reserve makes the cash
+        appear in time). An upgrade never schedules before its tower."""
+        order = sorted(range(len(entries)),
+                       key=lambda i: (entries[i]["prio"],
+                                      entries[i]["deadline"]))
+        cum = 0.0
+        place_round = {}
+        for i in order:
+            e = entries[i]
+            cum += e.get("est") or 500
+            r = 1
+            while r < 100 and earned_by(r) * 0.85 < cum:
+                r += 1
+            if e.get("by"):                 # threat answers keep their
+                r = min(r, max(1, e["by"]))  # date whatever income says
+            # Never schedule past the episode: the income model paces,
+            # but real cash decides -- anything the curve puts after the
+            # target unlocks just before the end and buys only if the
+            # money is actually there.
+            e["round"] = min(r, max(1, self.target - 2))
+            if e["do"] == "place":
+                place_round[e["ref"]] = e["round"]
+        for e in entries:
+            if e["do"] == "upgrade":
+                e["round"] = max(e["round"], place_round.get(e["ref"], 1))
+        entries.sort(key=lambda e: (e["round"], e["prio"],
+                                    e["do"] != "place", e["deadline"]))
+        for e in entries:
+            del e["deadline"]
+        return entries
+
     def _assemble(self, rng, picks, needs, pools, is_locked,
                   large_towers, price_of=None, track=None):
         """picks + coverage requirements -> ordered place/upgrade actions.
@@ -594,18 +688,30 @@ class MetaBrain:
             main, cross, label = self._pick_build(rng, ttype)
             placed.append((ref, ttype, spots[ref], main, cross, label))
 
-        def cost_of(ttype):
+        def base_cost(ttype):
             if price_of:
                 known = price_of(ttype)
                 if known:
                     return known
             return ROUGH_COST.get(ttype, 600)
 
-        placed.sort(key=lambda p: (cost_of(p[1]), p[0]))
-        genome, buys = [], []
+        def tier_cost(ttype, p_i, tier):
+            if price_of:
+                try:
+                    known = price_of(ttype, p_i, tier)
+                except TypeError:      # old single-arg lookup
+                    known = None
+                if known:
+                    return known
+            return TIER_EST.get(tier, 800)
+
+        placed.sort(key=lambda p: (base_cost(p[1]), p[0]))
+        entries = []
         for order, (ref, ttype, spot, main, cross, label) in enumerate(placed):
-            genome.append({"do": "place", "tower": ttype,
-                           "at": [spot[0], spot[1]], "ref": order})
+            entries.append({"do": "place", "tower": ttype,
+                            "at": [spot[0], spot[1]], "ref": order,
+                            "prio": 0, "deadline": 1.0,
+                            "est": base_cost(ttype)})
             need = needs.get(ref, {})
             main_target = 5 if rng.random() < 0.10 else rng.randint(3, 4)
             cross_target = rng.randint(1, 2)
@@ -629,20 +735,23 @@ class MetaBrain:
                 keep = sorted(want, key=lambda p: (0 if p in need else 1,
                                                    -want[p]))[:2]
                 want = {p: want[p] for p in keep}
-            tiers = {p: 0 for p in want}
             for p_i in sorted(want):
                 for tier in range(1, want[p_i] + 1):
                     if is_locked(ttype, p_i, tier):
                         break
-                    tiers[p_i] = tier
-                    buys.append((self._deadline(ttype, main, p_i, tier,
-                                                need) + rng.uniform(-4, 4),
-                                 order, p_i))
-        buys.sort(key=lambda b: b[0])
-        for _dl, ref, p_i in buys:
-            vec = [0, 0, 0]
-            vec[p_i] = 1
-            genome.append({"do": "upgrade", "ref": ref, "path": vec})
+                    vec = [0, 0, 0]
+                    vec[p_i] = 1
+                    is_need = tier <= need.get(p_i, 0)
+                    dl = self._deadline(ttype, main, p_i, tier, need)
+                    entry = {
+                        "do": "upgrade", "ref": order, "path": vec,
+                        "prio": 0 if is_need else (1 if p_i == main else 2),
+                        "deadline": dl + rng.uniform(-4, 4),
+                        "est": tier_cost(ttype, p_i, tier)}
+                    if is_need:
+                        entry["by"] = dl   # HARD cap: before the threat
+                    entries.append(entry)
+        genome = self._schedule(entries)
         meta = {"builds": [f"{t} {l}" for _r, t, _s, _m, _c, l in placed]}
         return genome, meta
 
@@ -720,12 +829,13 @@ class MetaBrain:
             towers.remove(weakest)
             mutations.append(f"drop:{weakest['tower']}")
 
-        genome = []
-        buys = []
+        entries = []
         towers.sort(key=lambda t: ROUGH_COST.get(t["tower"], 600))
         for order, t in enumerate(towers):
-            genome.append({"do": "place", "tower": t["tower"],
-                           "at": list(t["at"]), "ref": order})
+            entries.append({"do": "place", "tower": t["tower"],
+                            "at": list(t["at"]), "ref": order,
+                            "prio": 0, "deadline": 1.0,
+                            "est": ROUGH_COST.get(t["tower"], 600)})
             path = t.get("path") or [0, 0, 0]
             if max(path) == 0:
                 main, cross, _ = self._pick_build(rng, t["tower"])
@@ -739,14 +849,16 @@ class MetaBrain:
                         break
                     if is_locked(t["tower"], p_i, tier):
                         break
-                    buys.append((self._deadline(t["tower"], main, p_i,
-                                                tier, None)
-                                 + rng.uniform(-4, 4), order, p_i))
-        buys.sort(key=lambda b: b[0])
-        for _dl, ref, p_i in buys:
-            vec = [0, 0, 0]
-            vec[p_i] = 1
-            genome.append({"do": "upgrade", "ref": ref, "path": vec})
+                    vec = [0, 0, 0]
+                    vec[p_i] = 1
+                    entries.append({
+                        "do": "upgrade", "ref": order, "path": vec,
+                        "prio": 1 if p_i == main else 2,
+                        "deadline": self._deadline(t["tower"], main, p_i,
+                                                   tier, None)
+                        + rng.uniform(-4, 4),
+                        "est": TIER_EST.get(tier, 800)})
+        genome = self._schedule(entries)
         self.last_strategy = {"kind": label, "explore": self.explore,
                               "placement": ("track"
                                             + ("+flow" if track.oriented
@@ -1027,6 +1139,82 @@ def _selftest():
               f"carry prime {stats['carry_prime']}/{stats['carry']}, "
               f"buddy near {stats['buddy_near']}/{stats['buddy']}, "
               f"glue upstream {stats['glue_upstream']}/{stats['glue']}")
+
+    # ----- economy policy: choose_buy reservation rules
+    now = 1000.0
+
+    def q_item(**kw):
+        return {"_wake": 0, **kw}
+    est = lambda it: it["est"]
+    q = [q_item(do="place", tower="dart", round=1, prio=0, est=200),
+         q_item(do="upgrade", ref=0, path=[1, 0, 0], round=5, prio=1,
+                est=300),
+         q_item(do="upgrade", ref=0, path=[0, 0, 1], round=5, prio=2,
+                est=250)]
+    assert choose_buy(q, 1, 700, est, now) == 0, "awake head must go first"
+    q[0]["_wake"] = now + 30
+    assert choose_buy(q, 1, 700, est, now) is None, \
+        "future-round items must wait"
+    assert choose_buy(q, 5, 700, est, now) == 1, \
+        "surplus above the reserve may be spent"
+    assert choose_buy(q, 5, 350, est, now) is None, \
+        "reserved cash must not leak to lower priorities"
+    assert choose_buy(q, 5, 350, est, now, emergency=True) == 1, \
+        "emergency buys any affordable defense"
+    assert choose_buy(q, 1, 350, est, now, emergency=True) == 1, \
+        "emergency ignores the round gate"
+    q2 = [q_item(do="place", tower="a", round=1, prio=0, est=2000,
+                 _wake=now + 30),
+          q_item(do="place", tower="b", round=1, prio=0, est=200)]
+    assert choose_buy(q2, 1, 250, est, now) == 1, \
+        "equal-priority siblings buy while the head saves"
+
+    # ----- buy scheduling: paced by income, threats before deadlines
+    if mask_path.exists():
+        b4 = MetaBrain("selftest_map", "easy", target_round=40,
+                       explore=0.0, knowledge=k, runs_path="/nonexistent")
+        sol = k["solutions"]["camo"]
+        late_place = camo_checked = 0
+        for i in range(30):
+            g = b4.next_genome(rng, 4, tpools, tower_pool=pool,
+                               track=track)
+            assert all("round" in x and "prio" in x and "est" in x
+                       for x in g)
+            rounds = [x["round"] for x in g]
+            assert rounds == sorted(rounds), "genome not round-ordered"
+            assert rounds[-1] <= 38, "buy scheduled past the episode"
+            place_rounds = {x["ref"]: x["round"] for x in g
+                            if x["do"] == "place"}
+            assert min(place_rounds.values()) <= 2, "no opener at start"
+            if max(place_rounds.values()) >= 6:
+                late_place += 1
+            types = {x["ref"]: x["tower"] for x in g if x["do"] == "place"}
+            best_round = None
+            reached = {}
+            for x in g:
+                if x["do"] == "upgrade":
+                    assert x["round"] >= place_rounds[x["ref"]], \
+                        "upgrade scheduled before its tower"
+                    key2 = (x["ref"], x["path"].index(1))
+                    reached[key2] = reached.get(key2, 0) + 1
+                    req = sol.get(types[x["ref"]], "none")
+                    if req not in (None, "none") \
+                            and key2 == (x["ref"], req[0]) \
+                            and reached[key2] == req[1]:
+                        r_c = x["round"]
+                        best_round = min(best_round or 99, r_c)
+                elif sol.get(x["tower"], "none") is None:
+                    best_round = min(best_round or 99, x["round"])
+            if best_round is not None:
+                camo_checked += 1
+                assert best_round <= 22, \
+                    f"camo answer scheduled at r{best_round}"
+        assert late_place >= 10, \
+            "big buys should be paced, not all placed at round 1"
+        assert camo_checked >= 25
+        print(f"economy OK: reservation policy verified, schedules paced "
+              f"({late_place}/30 layouts hold a big buy past r6), camo "
+              f"answered by r22 in {camo_checked}/30")
 
     print("selftest OK: genome format, two-path rule, exploration floor,")
     print("posterior learning, evolution engagement, spot learning, and")

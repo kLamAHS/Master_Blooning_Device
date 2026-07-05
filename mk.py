@@ -2367,6 +2367,13 @@ def run_episode(screen, cfg, genome, final_round, abort_lives=50,
     dbg(f"sensors: cash={read_cash(screen, cfg)} "
         f"lives={read_lives(screen, cfg)}")
 
+    try:
+        from meta import choose_buy
+    except ImportError:                       # no brain: old greedy rule
+        def choose_buy(q, _round, _cash, _cost, now, emergency=False):
+            return next((j for j, it in enumerate(q)
+                         if it.get("_wake", 0) <= now), None)
+
     clean = screen.grab() if flow_sensor else None
     press_key("space")
     time.sleep(0.3)
@@ -2377,6 +2384,8 @@ def run_episode(screen, cfg, genome, final_round, abort_lives=50,
     landed_by_ref, towers = {}, {}
     lives_by_round = {}
     broke_at = [None, 0.0]   # cash watermark: level + time of last set
+    emergency_until = [0.0]  # leak emergency: reserves off until this time
+    prev_round_lives = [None]
 
     def set_watermark(price=None):
         """Record the cash level of a money-failure. Being broke for a
@@ -2447,6 +2456,17 @@ def run_episode(screen, cfg, genome, final_round, abort_lives=50,
                     lives_by_round[str(last_round)] = lives
                 print(f"   [round {last_round:>3}]  lives={lives}  "
                       f"({len(queue)} buys pending)")
+                if lives is not None and prev_round_lives[0] is not None \
+                        and prev_round_lives[0] - lives >= 8:
+                    # Leaking hard: a good player dumps savings on any
+                    # defense NOW instead of hoarding for the big buy.
+                    if time.time() >= emergency_until[0]:
+                        print(f"   leaking ({prev_round_lives[0]} -> "
+                              f"{lives}): reserves off, buying any "
+                              f"affordable defense")
+                    emergency_until[0] = time.time() + 45
+                if lives is not None:
+                    prev_round_lives[0] = lives
 
         if lives == 0:
             zero_streak += 1
@@ -2475,10 +2495,15 @@ def run_episode(screen, cfg, genome, final_round, abort_lives=50,
             pass
         if accepted is not None:
             round_seen_at = time.time()
-        if not queue and time.time() - round_seen_at > 60 \
+        buyable_now = any(it.get("round", 0) <= (last_round or 0)
+                          for it in queue)
+        if not buyable_now and time.time() - round_seen_at > 60 \
                 and (lives is None or lives < 40):
-            # Round frozen for a minute, nothing to buy, critical lives:
-            # that is the defeat screen, whatever the pixels say.
+            # Round frozen for a minute, nothing buyable at this round,
+            # critical lives: that is the defeat screen, whatever the
+            # pixels say. (Checked against ELIGIBLE buys, not the raw
+            # queue -- future-scheduled items must not keep a dead
+            # episode waiting forever.)
             dbg("round frozen 60s with critical lives -- treating as "
                 "defeat")
             outcome = "defeat"
@@ -2492,10 +2517,26 @@ def run_episode(screen, cfg, genome, final_round, abort_lives=50,
 
         # Try the next buy (one attempt per loop, so rounds keep reading).
         if queue and last_round is not None:
-            # Find the first queue item that isn't sleeping on a cooldown,
-            # so a stuck/expensive upgrade never blocks the whole build.
-            idx = next((j for j, it in enumerate(queue)
-                        if it.get("_wake", 0) <= time.time()), None)
+            def _cost_of(it):
+                """Learned price first, genome estimate second -- feeds
+                the reserve math in choose_buy."""
+                if it.get("do") == "place":
+                    known = PRICES.get(price_key(it["tower"].lower()))
+                else:
+                    known = None
+                    lnd = landed_by_ref.get(it.get("ref"))
+                    ent = towers.get(tuple(lnd)) if lnd else None
+                    if ent:
+                        pi = it["path"].index(1) if 1 in it["path"] else 0
+                        known = PRICES.get(price_key(
+                            ent["tower"].lower(), pi,
+                            ent["path"][pi] + 1))
+                return known or it.get("est")
+
+            idx = choose_buy(queue, last_round,
+                             read_cash(screen, cfg), _cost_of,
+                             time.time(),
+                             emergency=time.time() < emergency_until[0])
             item = queue[idx] if idx is not None else None
             if item is None:
                 pass                           # all pending buys cooling down
@@ -2547,7 +2588,13 @@ def run_episode(screen, cfg, genome, final_round, abort_lives=50,
                             item["_wake"] = time.time() + 4
             else:                              # upgrade
                 landed = landed_by_ref.get(item["ref"])
-                if landed is None:             # its tower was skipped
+                if item["ref"] not in landed_by_ref:
+                    # Its tower isn't DOWN yet (scheduled for later, or
+                    # still saving up): wait. Only a ref explicitly
+                    # marked None -- a skipped placement -- may kill its
+                    # upgrades.
+                    item["_wake"] = time.time() + 3
+                elif landed is None:           # its tower was skipped
                     queue.pop(idx)
                 else:
                     entry = towers.get(tuple(landed))
@@ -2901,7 +2948,8 @@ def cmd_farm(args):
             genome = brain.next_genome(
                 rng, args.towers, pools, is_locked=is_locked,
                 large_towers=LARGE_TOWERS, tower_pool=tower_pool,
-                price_of=lambda t: PRICES.get(price_key(t)),
+                price_of=lambda t, p=None, tr=None: PRICES.get(
+                    price_key(t) if p is None else price_key(t, p, tr)),
                 track=track)
         else:
             genome = random_genome(rng, args.towers)

@@ -131,7 +131,10 @@ ROLES = {
     "carry":     ["tack", "super", "wizard", "druid", "boomerang", "dartling"],
     "amplifier": ["alchemist", "village", "ice", "glue", "engineer"],
     "control":   ["ice", "glue", "sniper", "ninja", "bomb", "spike"],
-    "opener":    ["dart", "ninja", "sniper", "boomerang", "spike"],
+    # Openers must be genuinely CHEAP -- they hold rounds 1-8 on start
+    # cash. (Spike factory was here once: a $1000 "opener" that income
+    # pacing correctly scheduled for round 5, i.e. not an opener.)
+    "opener":    ["dart", "ninja", "sniper", "boomerang", "glue"],
 }
 
 # Threat solutions among land towers the bot can actually buy.

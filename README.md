@@ -321,6 +321,31 @@ posteriors still multiply every score, and the `--explore` fraction of
 placements stays fully random, so position learning and emergence both
 survive the geometry.
 
+### Buying is scheduled, reserved, and leak-reactive
+
+The old farm bought greedily — four towers as fast as possible, then
+whatever upgrade happened to be affordable. Meta thesis #5 says the
+opposite: *money efficiency and save-up windows matter more than
+theoretical DPS.* So every buy now carries a **round** (when it should
+happen), a **priority**, and a **cost estimate**:
+
+- **Paced by income.** Buys are scheduled along a rough income curve so
+  the plan never wants more money than the game can have produced — an
+  opener goes down at round 1, a $2,500 super is *planned* for ~round
+  15 instead of being dribbled away on trinkets, and threat answers
+  keep hard dates (camo before 24, lead before 28) whatever the curve
+  says.
+- **Reservation.** The most important due purchase reserves its price.
+  Lower-priority buys (crosspaths, luxuries) only spend the *surplus*
+  above the reservation — being efficient now is what makes the big
+  thing affordable later.
+- **Leak emergency.** If a round costs 8+ lives, reserves come off for
+  45 seconds and the bot buys any affordable defense immediately, like
+  a player dumping savings when the defense cracks.
+
+The executor still verifies everything against real cash — estimates
+pace the plan, reality decides the purchase.
+
 To see what the bot currently believes — where its experience confirms
 or contradicts the research, which elite layouts evolution is breeding
 from, and which round bucket kills it (annotated with the nearest known
