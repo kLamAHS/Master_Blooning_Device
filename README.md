@@ -11,6 +11,89 @@ script becomes your data collector for Stage 2 (it already logs every round to
 > an account flagged or banned. Use this **offline, single player only**,
 > ideally on a throwaway account. Never in races, co-op, or events.
 
+## Usage guide — every command, in order
+
+Each step's details live in the section noted. Setup steps (1–5) happen
+once; after that your daily loop is just steps 6–8.
+
+1. **Install** (once per machine, §1):
+
+   ```
+   pip install -r requirements.txt      # plus the Tesseract OCR engine
+   ```
+
+2. **Set the game up** (once, §2): Settings → Gameplay → **Auto Start ON**
+   and **Disable Nudge Mode ON**; play windowed or fullscreen and don't
+   move the window afterwards.
+
+3. **Verify the round OCR** (once per machine, §3 step 3). Load into the
+   map — Easy → Standard — but don't start round 1, then:
+
+   ```
+   python mk.py watch                   # want: parsed=1 on every read
+   ```
+
+4. **Scan the map** (once per map, "Emergent mode" section). Same clean,
+   un-started map:
+
+   ```
+   python mk.py scan monkey_meadow                # land spots
+   python mk.py scan monkey_meadow --tower sub    # optional water pass
+   ```
+
+5. **Calibrate the three restart buttons** (once, Stage 2 section) so
+   `farm` can chain episodes unattended. Use:
+
+   ```
+   python mk.py locate                  # prints live mouse coordinates
+   ```
+
+   Lose a game on purpose and hover the defeat screen's RESTART, press
+   Esc mid-game and hover the pause menu's RESTART, then hover the
+   confirm dialog's OK — and put the three values in `config.json` as
+   `defeat_restart`, `pause_restart`, `restart_confirm`.
+
+6. **(Optional) prove the pipeline** with the hand-written control plan
+   (§3):
+
+   ```
+   python mk.py play plans/monkey_meadow_easy.json
+   ```
+
+7. **Farm learning episodes** — the main loop (Stage 2 + Stage 3
+   sections). Load the map fresh at round 1 and walk away:
+
+   ```
+   python mk.py farm monkey_meadow --episodes 15 --towers 4
+   ```
+
+   Meta-guided layouts are the default. Useful flags: `--explore 0.5`
+   (more randomness), `--no-meta` (pure random, the old Stage 2),
+   `--no-evolve` (no genetic layer), `--pool classic` (original 10
+   towers only), `--final-round 40`, `--abort-lives 50`, `--seed N`.
+
+8. **Review what it learned** (Stage 3 section, no game needed):
+
+   ```
+   python mk.py learn monkey_meadow
+   ```
+
+9. **When the research spreadsheet gets a new version**, regenerate the
+   knowledge base (needs `pip install openpyxl`):
+
+   ```
+   python tools/extract_meta.py
+   ```
+
+10. **After touching the code**, run the offline sanity checks:
+
+    ```
+    python meta.py selftest
+    ```
+
+**Emergency stop, anytime:** slam the mouse into the top-left corner of
+the screen, or Ctrl+C in the terminal.
+
 ## 1. Install
 
 You need Python 3.10+.
@@ -47,7 +130,7 @@ Accessibility + Screen Recording permissions so it can click and screenshot.
    in a stuck confirm-state that ignores the cursor, which wrecks the
    bot's retry-at-the-next-spot behavior (worst for big towers like the
    super monkey).
-3. Keep default hotkeys (or edit `TOWER_HOTKEYS` in `btd6_bot.py` to match
+3. Keep default hotkeys (or edit `TOWER_HOTKEYS` in `mk.py` to match
    yours).
 4. Don't move or resize the window after calibrating — every coordinate
    depends on it.
@@ -58,7 +141,7 @@ Accessibility + Screen Recording permissions so it can click and screenshot.
 snaps every placement to the nearest safe green point automatically, and
 upgrades follow their tower — so the template's rough coordinates work
 as-is. To move a tower, nudge its hint toward where you want it (eyeball
-fractions from the preview image, or use `python btd6_bot.py locate` to
+fractions from the preview image, or use `python mk.py locate` to
 hover for exact values). `locate` is also handy for one-off points like
 `"deselect_point"` in config.json.
 
@@ -75,7 +158,7 @@ during the scan.
 Standard) but don't start the round, then run:
 
 ```
-python btd6_bot.py watch
+python mk.py watch
 ```
 
 `watch` now **recalibrates every time it starts**: it finds the blue
@@ -91,7 +174,7 @@ needed anymore.
 **Step 4 — let it play.**
 
 ```
-python btd6_bot.py play plans/monkey_meadow_easy.json
+python mk.py play plans/monkey_meadow_easy.json
 ```
 
 On Windows the bot brings the game window to the front by itself and starts
@@ -116,8 +199,8 @@ fools naive color checks — and the before/after comparison cancels out red
 map decorations too. Every legal placement gets written out.
 
 ```
-python btd6_bot.py scan monkey_meadow                # land spots (dart ghost)
-python btd6_bot.py scan monkey_meadow --tower sub    # add a water pass
+python mk.py scan monkey_meadow                # land spots (dart ghost)
+python mk.py scan monkey_meadow --tower sub    # add a water pass
 ```
 
 Run it with the map loaded and round 1 not yet started (empty map, no bloons
@@ -156,7 +239,7 @@ dialog's OK. Put them in `config.json` as `defeat_restart`,
 `pause_restart`, `restart_confirm`. Then:
 
 ```
-python btd6_bot.py farm monkey_meadow --episodes 15 --towers 4
+python mk.py farm monkey_meadow --episodes 15 --towers 4
 ```
 
 Load the map fresh and walk away. Random layouts mostly *die* — that's
@@ -164,6 +247,114 @@ the point: the model needs both classes. Expect early rounds to survive
 and leads/MOABs to filter the weak. After a few dozen episodes across an
 evening or two, the dataset is ready for training, and learned prices
 accumulate as a free side effect.
+
+## Stage 3: the meta brain — priors from research, tactics from experience
+
+A lot of BTD6 is already figured out. `research/btd6_meta_research_v55.xlsx`
+holds that community meta distilled into rankings — tower scores, roles,
+synergy shells, crosspath builds, round threats, mode priorities — and
+`tools/extract_meta.py` compiles it into the machine-readable
+`meta_knowledge.json` (rerun it whenever the spreadsheet gets a new
+version; it needs `pip install openpyxl`, the bot itself doesn't).
+
+The design rule in `meta.py`: **the meta is a prior, never a rulebook.**
+Every choice — which tower, which spot, which upgrade path — is a
+Thompson-sampling draw from a Beta posterior whose pseudo-counts *start*
+at the spreadsheet's score and are updated by the bot's own episodes in
+`runs_log.jsonl`. With no data the bot plays roughly what the research
+says is good (carry + amplifier + control + opener, camo answered before
+round 24, lead before 28, buys ordered by threat deadline). After ~6
+episodes featuring a tower, its own results outweigh the spreadsheet — a
+meta darling that keeps dying on *this* map gets sampled less, an
+off-meta pick that keeps surviving gets sampled more.
+
+Emergence is protected two ways on top of that:
+
+- **The explore knob.** Every decision has an `--explore` chance
+  (default 0.30) of ignoring the meta entirely and going uniform random,
+  so no tower/path/spot ever starves and the dataset keeps both classes.
+- **Evolution.** Once a few episodes have survived deep, layouts start
+  being bred from the best ones found so far — mutated (move a tower,
+  swap its species, push a build deeper, add/drop a tower) and crossed
+  over between two elites. Parents are the bot's own discoveries, and
+  mutations are free to wander off-meta. `--no-evolve` disables it.
+
+```
+python mk.py farm monkey_meadow --episodes 15 --towers 4          # meta on
+python mk.py farm monkey_meadow --episodes 15 --explore 1.0      # pure random
+python mk.py farm monkey_meadow --episodes 15 --no-meta          # old Stage 2
+```
+
+The meta pool also unlocks towers the random farm never used —
+boomerang, mortar, spike, village, super, engineer (`--pool classic`
+restricts to the original ten). Every logged episode now records a
+`"strategy"` field (meta / evolve / crossover, roles, mutations), so the
+dataset itself shows *how* each layout was conceived.
+
+### Placement is geometry-aware
+
+The scan mask contains more than "where can I build" — the track itself
+is the big blob of interior cells that *refuse* placement. The brain
+builds a **track model** from it: a 0→1 progress coordinate along the
+path, and per-spot **coverage** (how much track a tower's range actually
+touches — bends and long straights beat corner decorations, which is
+why some spots hit more bloons for longer). Each tower then gets placed
+by what it wants:
+
+- **DPS carries** claim the highest-coverage real estate first.
+- **Alchemist / Village** sit inside buff radius of teammates, the
+  carry above all — a brew that reaches nobody buffs nobody.
+- **Glue / Ice** cover the stretch *just upstream* of the carry's kill
+  zone: glue applied too early wears off before the DPS sees the
+  bloons, and glue applied downstream of it does nothing.
+- **Spike factories** favor late track, where leaks go to die.
+- **Snipers / mortars** (global range) stay *off* prime spots that
+  range-limited towers need.
+
+One thing pixels can't tell: which end of the track is the entry. So
+`farm` senses it — on its first episode the map is empty, and the first
+thing that moves near the track *is* the bloons entering. The result is
+saved into the mask file (`"flow_entry"`), so it's sensed once per map.
+Until it's known, placement runs direction-agnostic (debuffers co-locate
+with the carry instead of aiming upstream). The learned per-region
+posteriors still multiply every score, and the `--explore` fraction of
+placements stays fully random, so position learning and emergence both
+survive the geometry.
+
+### Buying is scheduled, reserved, and leak-reactive
+
+The old farm bought greedily — four towers as fast as possible, then
+whatever upgrade happened to be affordable. Meta thesis #5 says the
+opposite: *money efficiency and save-up windows matter more than
+theoretical DPS.* So every buy now carries a **round** (when it should
+happen), a **priority**, and a **cost estimate**:
+
+- **Paced by income.** Buys are scheduled along a rough income curve so
+  the plan never wants more money than the game can have produced — an
+  opener goes down at round 1, a $2,500 super is *planned* for ~round
+  15 instead of being dribbled away on trinkets, and threat answers
+  keep hard dates (camo before 24, lead before 28) whatever the curve
+  says.
+- **Reservation.** The most important due purchase reserves its price.
+  Lower-priority buys (crosspaths, luxuries) only spend the *surplus*
+  above the reservation — being efficient now is what makes the big
+  thing affordable later.
+- **Leak emergency.** If a round costs 8+ lives, reserves come off for
+  45 seconds and the bot buys any affordable defense immediately, like
+  a player dumping savings when the defense cracks.
+
+The executor still verifies everything against real cash — estimates
+pace the plan, reality decides the purchase.
+
+To see what the bot currently believes — where its experience confirms
+or contradicts the research, which elite layouts evolution is breeding
+from, and which round bucket kills it (annotated with the nearest known
+threat, e.g. "deaths cluster near r24 — camo"):
+
+```
+python mk.py learn monkey_meadow            # or: python meta.py report monkey_meadow
+python meta.py selftest                     # offline sanity checks, no game needed
+```
 
 ## Plan file format
 
@@ -224,6 +415,21 @@ game's settings for an option to disable seasonal decorations and rescan.
   can't make it wrong. Once a price is learned, upgrades wait for the
   exact amount before pressing, and `play` prints your plan's total
   estimated cost at startup with a count of not-yet-learned purchases.
+  **Poisoned prices heal themselves:** any price that wasn't verified in
+  the current session (loaded from disk, or read off a red row) gets
+  re-checked visually after ~45 s of blocking a buy — one menu open, and
+  a green-row sighting overwrites the bad value (a `$210` recorded as
+  `$2105` no longer gates the upgrade forever).
+- **Money-failure watermarks are misread-proof.** When a buy fails on
+  cash, the bot notes the cash level and holds spending until income
+  clears it — but the noted level is capped at the item's known price
+  (being broke for a `$110` upgrade *means* cash < $110, whatever the
+  counter OCR claims), and every watermark expires after 40 s. A junk
+  read like `$6005` when the real cash is `$600` can stall buys for
+  seconds, not rounds. A press that "didn't take" on a green (affordable)
+  row also re-reads the row itself before judging: if the row moved on to
+  the next tier, the purchase actually landed and the cash reads were
+  noise.
 - **`runs_log.jsonl` — one line per run**: final round reached, outcome
   (`victory` / `defeat` / `interrupted`), and the full tower layout
   with each tower's real position and upgrade tiers. Farm episodes also

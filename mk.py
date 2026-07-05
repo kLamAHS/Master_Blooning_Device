@@ -974,9 +974,11 @@ def read_cash(screen, cfg):
 
 def read_cash_confirmed(screen, cfg):
     """Two reads that must corroborate: equal -> that value; one a clean
-    SUFFIX of the other (prepended-junk signature) -> the shorter; else
-    None. Used where a single bad read does lasting damage (watermarks,
-    price recording)."""
+    AFFIX of the other -> the shorter. A junk glyph can attach at either
+    end of the digit run ('851' inside '6851' = prepended, '600' inside
+    '6005' = appended), and both signatures poison watermarks the same
+    way, so both resolve to the shorter read. Else None. Used where a
+    single bad read does lasting damage (watermarks, price recording)."""
     a = read_cash(screen, cfg)
     time.sleep(0.15)
     b = read_cash(screen, cfg)
@@ -985,9 +987,9 @@ def read_cash_confirmed(screen, cfg):
     if a == b:
         return a
     sa, sb = str(a), str(b)
-    if sa.endswith(sb):
+    if sa.endswith(sb) or sa.startswith(sb):
         return b
-    if sb.endswith(sa):
+    if sb.endswith(sa) or sb.startswith(sa):
         return a
     return None
 
@@ -1782,10 +1784,32 @@ def act_upgrade(screen, cfg, action, tower=None, timeout=8):
                     tower["path"][i] += 1
             else:
                 if info and info[0] == "cash":
-                    # The row VISUALLY showed a cash price, so a press that
-                    # moves nothing means we couldn't afford it (likely a
-                    # bad price read, e.g. '$' OCR'd as '5') -- it is NOT
-                    # an XP lock, and marking it as one would be poison.
+                    # A GREEN row is the game itself saying "affordable",
+                    # and the no-move verdict rests on the same cash reads
+                    # that misread in the first place. Ask the ROW before
+                    # judging: if its price/state moved on, the purchase
+                    # actually landed and the cash reads were noise --
+                    # missing that would desync the tier tracking AND
+                    # poison the watermark.
+                    re_read = None
+                    if side:
+                        scan = scan_panel_rows(screen, side)
+                        re_read = (scan or {}).get(i) \
+                            or read_upgrade_row(screen, side, i)
+                    if re_read is not None and re_read[0] != "unread" \
+                            and re_read != info:
+                        dbg(f"cash read missed a landed buy (path {i + 1}:"
+                            f" row moved {info} -> {re_read})")
+                        if pkey and info[1]:
+                            record_price(pkey, info[1], src="seen")
+                        if tower:
+                            tower["path"][i] += 1
+                        if rows is not None:
+                            rows[i] = re_read
+                        continue
+                    # Row unchanged: the press really didn't take (stale
+                    # green after cash dropped, or an input hiccup) --
+                    # NOT an XP lock; marking it locked would be poison.
                     dbg(f"press didn't take on a cash row (path {i + 1}) "
                         f"-- treating as broke")
                     status = "broke"
@@ -2243,6 +2267,34 @@ def snap_plan_to_mask(plan, plan_path):
     print(f"Placements snapped to safe points from {mask_path.name}.")
 
 
+def sense_flow_entry(screen, clean, track, timeout=7.0):
+    """Which end of the track do bloons come from? Pixels of a still map
+    can't say -- but the round just started on an EMPTY map, so the first
+    thing that MOVES near the track is the bloons entering. Frame-diff
+    against the pre-start clean frame, masked to a corridor around the
+    track cells so HUD animation, confetti, and map decorations can't
+    vote. Returns the normalized [x, y] of the first motion, or None."""
+    h, w = clean.shape[:2]
+    corridor = np.zeros((h, w), np.uint8)
+    rad = max(6, int(track.step * 0.9 * w))
+    for cx, cy in track.cells:
+        cv2.circle(corridor, (int(cx * w), int(cy * h)), rad, 255, -1)
+    corridor[:int(0.14 * h)] = 0          # HUD strip animates every round
+    t_end = time.time() + timeout
+    while time.time() < t_end:
+        cur = screen.grab()
+        diff = cv2.absdiff(cur[..., :3], clean[..., :3])
+        moving = ((diff.max(axis=2) > 45) & (corridor > 0)).astype(np.uint8)
+        n, _lab, stats, cent = cv2.connectedComponentsWithStats(moving, 8)
+        blobs = [(stats[i, 4], cent[i]) for i in range(1, n)
+                 if stats[i, 4] >= 30]
+        if blobs:
+            _area, (cx, cy) = max(blobs, key=lambda b: b[0])
+            return [round(cx / w, 4), round(cy / h, 4)]
+        time.sleep(0.12)
+    return None
+
+
 # ---------------------------------------------------------------------------
 # STAGE 2: the data farm. Random layouts -> unattended episodes ->
 # (layout, final_round, outcome) rows in runs_log.jsonl.
@@ -2269,9 +2321,9 @@ def random_genome(rng, n_towers):
                 spots.append(cand)
                 break
     types = [rng.choice(FARM_TOWERS) for _ in spots]
-    for spot, ttype in zip(spots, types):
+    for ref, (spot, ttype) in enumerate(zip(spots, types)):
         genome.append({"do": "place", "tower": ttype,
-                       "at": [spot[0], spot[1]]})
+                       "at": [spot[0], spot[1]], "ref": ref})
     ups = []
     for ref, ttype in enumerate(types):
         main = rng.randrange(3)
@@ -2294,9 +2346,14 @@ def random_genome(rng, n_towers):
     return genome
 
 
-def run_episode(screen, cfg, genome, final_round, abort_lives=50):
+def run_episode(screen, cfg, genome, final_round, abort_lives=50,
+                flow_sensor=None):
     """Play one random layout to survival or defeat. Returns
-    (outcome, final_round_reached, towers, lives_by_round)."""
+    (outcome, final_round_reached, towers, lives_by_round).
+    flow_sensor, when given, is called once with the pre-start clean
+    frame right after the round starts -- its window to watch where the
+    first bloons appear (nothing has been bought yet, so leaking a few
+    seconds of round 1 costs nothing)."""
     # (Re)calibrate sensors on the clean, un-started map -- the best frame
     # we'll ever get. Cash preflight runs UNCONDITIONALLY: a box that
     # clips the leading digit still 'reads', and only the digit snap
@@ -2310,13 +2367,49 @@ def run_episode(screen, cfg, genome, final_round, abort_lives=50):
     dbg(f"sensors: cash={read_cash(screen, cfg)} "
         f"lives={read_lives(screen, cfg)}")
 
+    try:
+        from meta import choose_buy
+    except ImportError:                       # no brain: old greedy rule
+        def choose_buy(q, _round, _cash, _cost, now, emergency=False):
+            return next((j for j, it in enumerate(q)
+                         if it.get("_wake", 0) <= now), None)
+
+    clean = screen.grab() if flow_sensor else None
     press_key("space")
     time.sleep(0.3)
     press_key("space")                        # fast-forward
+    if flow_sensor:
+        flow_sensor(clean)
     queue = list(genome)
     landed_by_ref, towers = {}, {}
     lives_by_round = {}
-    broke_at = [None]     # cash watermark: level of the last money-failure
+    broke_at = [None, 0.0]   # cash watermark: level + time of last set
+    emergency_until = [0.0]  # leak emergency: reserves off until this time
+    prev_round_lives = [None]
+
+    def set_watermark(price=None):
+        """Record the cash level of a money-failure. Being broke for a
+        KNOWN price means cash < price BY DEFINITION, so the watermark is
+        capped at price-5 -- a junk read like $6005 (real $600) can then
+        never freeze the whole build behind an unreachable level."""
+        lvl = read_cash_confirmed(screen, cfg)
+        if price and (lvl is None or lvl >= price):
+            lvl = price - 5
+        broke_at[0] = lvl
+        broke_at[1] = time.time()
+
+    def watermark_holds(cash):
+        """Should this buy wait for income to grow past the watermark?
+        Watermarks EXPIRE after 40s: income only rises, so a hold that
+        old has done its job -- and if the level itself was a misread,
+        expiry is what un-sticks the run (each item also has its own
+        _wake cooldown, so retries stay cheap)."""
+        if broke_at[0] is None or cash is None:
+            return False
+        if time.time() - broke_at[1] > 40:
+            broke_at[0] = None
+            return False
+        return cash <= broke_at[0] + 100
     round_seen_at = time.time()   # for the frozen-defeat-screen net
     observing = False             # queue empty: just watching the run
     # Safe deselect spots for THIS episode: mask points farthest from every
@@ -2363,6 +2456,17 @@ def run_episode(screen, cfg, genome, final_round, abort_lives=50):
                     lives_by_round[str(last_round)] = lives
                 print(f"   [round {last_round:>3}]  lives={lives}  "
                       f"({len(queue)} buys pending)")
+                if lives is not None and prev_round_lives[0] is not None \
+                        and prev_round_lives[0] - lives >= 8:
+                    # Leaking hard: a good player dumps savings on any
+                    # defense NOW instead of hoarding for the big buy.
+                    if time.time() >= emergency_until[0]:
+                        print(f"   leaking ({prev_round_lives[0]} -> "
+                              f"{lives}): reserves off, buying any "
+                              f"affordable defense")
+                    emergency_until[0] = time.time() + 45
+                if lives is not None:
+                    prev_round_lives[0] = lives
 
         if lives == 0:
             zero_streak += 1
@@ -2391,10 +2495,15 @@ def run_episode(screen, cfg, genome, final_round, abort_lives=50):
             pass
         if accepted is not None:
             round_seen_at = time.time()
-        if not queue and time.time() - round_seen_at > 60 \
+        buyable_now = any(it.get("round", 0) <= (last_round or 0)
+                          for it in queue)
+        if not buyable_now and time.time() - round_seen_at > 60 \
                 and (lives is None or lives < 40):
-            # Round frozen for a minute, nothing to buy, critical lives:
-            # that is the defeat screen, whatever the pixels say.
+            # Round frozen for a minute, nothing buyable at this round,
+            # critical lives: that is the defeat screen, whatever the
+            # pixels say. (Checked against ELIGIBLE buys, not the raw
+            # queue -- future-scheduled items must not keep a dead
+            # episode waiting forever.)
             dbg("round frozen 60s with critical lives -- treating as "
                 "defeat")
             outcome = "defeat"
@@ -2408,10 +2517,26 @@ def run_episode(screen, cfg, genome, final_round, abort_lives=50):
 
         # Try the next buy (one attempt per loop, so rounds keep reading).
         if queue and last_round is not None:
-            # Find the first queue item that isn't sleeping on a cooldown,
-            # so a stuck/expensive upgrade never blocks the whole build.
-            idx = next((j for j, it in enumerate(queue)
-                        if it.get("_wake", 0) <= time.time()), None)
+            def _cost_of(it):
+                """Learned price first, genome estimate second -- feeds
+                the reserve math in choose_buy."""
+                if it.get("do") == "place":
+                    known = PRICES.get(price_key(it["tower"].lower()))
+                else:
+                    known = None
+                    lnd = landed_by_ref.get(it.get("ref"))
+                    ent = towers.get(tuple(lnd)) if lnd else None
+                    if ent:
+                        pi = it["path"].index(1) if 1 in it["path"] else 0
+                        known = PRICES.get(price_key(
+                            ent["tower"].lower(), pi,
+                            ent["path"][pi] + 1))
+                return known or it.get("est")
+
+            idx = choose_buy(queue, last_round,
+                             read_cash(screen, cfg), _cost_of,
+                             time.time(),
+                             emergency=time.time() < emergency_until[0])
             item = queue[idx] if idx is not None else None
             if item is None:
                 pass                           # all pending buys cooling down
@@ -2425,8 +2550,7 @@ def run_episode(screen, cfg, genome, final_round, abort_lives=50):
                         item["_dbg"] = msg
                         dbg(msg)
                     item["_wake"] = time.time() + 3    # saving up: silent
-                elif broke_at[0] is not None and cash is not None \
-                        and cash <= broke_at[0] + 100:
+                elif watermark_holds(cash):
                     msg = f"{ttype}: watermark hold (${cash} <= " \
                           f"${broke_at[0]}+100)"
                     if item.get("_dbg") != msg:
@@ -2437,7 +2561,11 @@ def run_episode(screen, cfg, genome, final_round, abort_lives=50):
                     st, landed = act_place(screen, cfg,
                                            {**item, "timeout": 10})
                     if landed is not None:
-                        landed_by_ref[place_i] = landed
+                        # Key by the genome's own ref when present: place
+                        # items can execute out of order (broke/no-spot
+                        # items sleep on _wake), and pop-order keying
+                        # would then wire upgrades to the wrong tower.
+                        landed_by_ref[item.get("ref", place_i)] = landed
                         towers[tuple(landed)] = {"tower": item["tower"],
                                                  "at": landed,
                                                  "path": [0, 0, 0]}
@@ -2445,7 +2573,7 @@ def run_episode(screen, cfg, genome, final_round, abort_lives=50):
                         queue.pop(idx)
                         broke_at[0] = None
                     elif st == "broke":
-                        broke_at[0] = read_cash_confirmed(screen, cfg)
+                        set_watermark(base)
                         item["_wake"] = time.time() + 5
                     else:                              # no_spot: real fail
                         item["_fails"] = item.get("_fails", 0) + 1
@@ -2453,14 +2581,20 @@ def run_episode(screen, cfg, genome, final_round, abort_lives=50):
                             print(f"   skipping {item['tower']} at "
                                   f"{item['at']} -- no placeable spot "
                                   f"nearby (rescan if this looks wrong)")
-                            landed_by_ref[place_i] = None
+                            landed_by_ref[item.get("ref", place_i)] = None
                             place_i += 1
                             queue.pop(idx)
                         else:
                             item["_wake"] = time.time() + 4
             else:                              # upgrade
                 landed = landed_by_ref.get(item["ref"])
-                if landed is None:             # its tower was skipped
+                if item["ref"] not in landed_by_ref:
+                    # Its tower isn't DOWN yet (scheduled for later, or
+                    # still saving up): wait. Only a ref explicitly
+                    # marked None -- a skipped placement -- may kill its
+                    # upgrades.
+                    item["_wake"] = time.time() + 3
+                elif landed is None:           # its tower was skipped
                     queue.pop(idx)
                 else:
                     entry = towers.get(tuple(landed))
@@ -2490,13 +2624,17 @@ def run_episode(screen, cfg, genome, final_round, abort_lives=50):
                             dbg(msg)
                         item["_saving"] = item.get("_saving", time.time())
                         pk = price_key(ttype, pi, tier)
-                        if PRICES_SRC.get(pk) == "short" \
+                        if PRICES_SRC.get(pk) not in ("seen", "buy") \
                                 and time.time() - item["_saving"] > 45 \
-                                and not item.get("_rechecked"):
-                            # Unverified red-read price: one menu open to
-                            # re-read it -- a green sighting overwrites and
-                            # heals a poisoned value (e.g. $340 -> $7340).
-                            item["_rechecked"] = True
+                                and time.time() >= item.get("_recheck_at",
+                                                            0):
+                            # This price was never verified THIS session
+                            # (red-row read, or loaded from prices.json --
+                            # possibly poisoned, e.g. $210 recorded as
+                            # $2105 gates the buy forever). One menu open
+                            # re-reads it; a green sighting overwrites and
+                            # heals. Repeats every 60s while still stuck.
+                            item["_recheck_at"] = time.time() + 60
                             dbg(f"{ttype} path{pi + 1}: re-checking "
                                 f"unverified ${known}")
                             st = act_upgrade(screen, cfg,
@@ -2517,7 +2655,7 @@ def run_episode(screen, cfg, genome, final_round, abort_lives=50):
                             item["_wake"] = time.time() + 3
                     elif broke_at[0] is not None \
                             and (cash := read_cash(screen, cfg)) is not None \
-                            and cash <= broke_at[0] + 100:
+                            and watermark_holds(cash):
                         msg = (f"{ttype} path{pi + 1}: watermark hold "
                                f"(${cash} <= ${broke_at[0]}+100)")
                         if item.get("_dbg") != msg:
@@ -2535,7 +2673,8 @@ def run_episode(screen, cfg, genome, final_round, abort_lives=50):
                         elif st in ("locked", "closed"):
                             queue.pop(idx)     # recorded; done with it
                         elif st == "broke":
-                            broke_at[0] = read_cash_confirmed(screen, cfg)
+                            set_watermark(
+                                PRICES.get(price_key(ttype, pi, tier)))
                             item["_fails"] = item.get("_fails", 0) + 1
                             item["_wake"] = time.time() + min(
                                 10 * 2 ** (item["_fails"] - 1), 60)
@@ -2764,15 +2903,83 @@ def cmd_farm(args):
         print(f"Game starts at round {start_round} on this difficulty -- "
               f"restart verification will expect it.")
 
+    # STAGE 3: the meta brain. Spreadsheet-derived priors + everything in
+    # runs_log.jsonl -> Thompson-sampled layouts that start meta-informed
+    # and drift toward whatever actually survives on THIS map. Missing
+    # knowledge file or --no-meta degrades cleanly to uniform random.
+    brain, tower_pool, track = None, FARM_TOWERS, None
+    if not args.no_meta:
+        try:
+            import meta as meta_mod
+            brain = meta_mod.MetaBrain(args.name, args.difficulty,
+                                       target_round=args.final_round,
+                                       explore=args.explore,
+                                       evolve=not args.no_evolve)
+            if args.pool == "full":
+                tower_pool = FARM_TOWERS + meta_mod.META_EXTRA_TOWERS
+            n_map = sum(1 for r in brain.history if brain.usable(r))
+            print(f"Meta brain ON: {len(brain.towers)} tower priors, "
+                  f"{n_map} usable past episodes on this map, "
+                  f"explore={brain.explore:.2f}, "
+                  f"evolution={'on' if not args.no_evolve else 'off'}, "
+                  f"pool={len(tower_pool)} towers.")
+            mask_data = json.loads(mask_path.read_text())
+            track = meta_mod.TrackModel(mask_data)
+            if track.ok:
+                if mask_data.get("flow_entry"):
+                    track.orient(mask_data["flow_entry"])
+                print(f"Track model: {len(track.cells)} path cells; flow "
+                      + ("known (entry saved in mask)" if track.oriented
+                         else "unknown -- will watch where bloons enter "
+                              "on episode 1"))
+            else:
+                track = None
+                print("Track model unavailable (no track blob in mask) "
+                      "-- placement falls back to distance pools.")
+        except Exception as e:
+            print(f"Meta brain unavailable ({e}) -- falling back to "
+                  f"uniform random layouts.")
+            brain = None
+
     for ep in range(1, args.episodes + 1):
-        genome = random_genome(rng, args.towers)
+        if brain:
+            pools = {"near": MASK_NEAR, "mid": MASK_MID,
+                     "all": MASK_POINTS, "roomy": MASK_ROOMY}
+            genome = brain.next_genome(
+                rng, args.towers, pools, is_locked=is_locked,
+                large_towers=LARGE_TOWERS, tower_pool=tower_pool,
+                price_of=lambda t, p=None, tr=None: PRICES.get(
+                    price_key(t) if p is None else price_key(t, p, tr)),
+                track=track)
+        else:
+            genome = random_genome(rng, args.towers)
+        sensor = None
+        if track is not None and not track.oriented:
+            def sensor(clean):
+                pt = sense_flow_entry(screen, clean, track)
+                if pt:
+                    track.orient(pt)
+                    try:
+                        d = json.loads(mask_path.read_text())
+                        d["flow_entry"] = pt
+                        mask_path.write_text(json.dumps(d))
+                    except Exception:
+                        _log_crash("flow_entry save")
+                    print(f"   flow sensed: bloons enter near "
+                          f"[{pt[0]:.2f}, {pt[1]:.2f}] -- saved to "
+                          f"{mask_path.name}")
+                else:
+                    print("   flow not sensed this episode -- placement "
+                          "stays direction-agnostic, will retry")
         print(f"\n=== Episode {ep}/{args.episodes}: "
               f"{sum(1 for g in genome if g['do'] == 'place')} towers, "
               f"{sum(1 for g in genome if g['do'] == 'upgrade')} upgrades")
+        if brain:
+            print(brain.describe_genome(genome))
         try:
             outcome, reached, towers, lives_by_round = run_episode(
                 screen, cfg, genome, args.final_round,
-                abort_lives=args.abort_lives)
+                abort_lives=args.abort_lives, flow_sensor=sensor)
         except KeyboardInterrupt:
             raise
         except Exception:
@@ -2785,17 +2992,21 @@ def cmd_farm(args):
             except Exception:
                 _log_crash(f"episode {ep} (recovery clear_ui)")
         print(f"=== Episode {ep}: {outcome} at round {reached}")
+        row = {"time": datetime.now().isoformat(timespec="seconds"),
+               "mode": "farm", "map": args.name,
+               "difficulty": args.difficulty,
+               "final_round": reached, "outcome": outcome,
+               "strategy": brain.last_strategy if brain
+               else {"kind": "uniform"},
+               "lives_by_round": lives_by_round,
+               "towers": towers}
         try:
             with open(runs_path, "a") as f:
-                f.write(json.dumps({
-                    "time": datetime.now().isoformat(timespec="seconds"),
-                    "mode": "farm", "map": args.name,
-                    "difficulty": args.difficulty,
-                    "final_round": reached, "outcome": outcome,
-                    "lives_by_round": lives_by_round,
-                    "towers": towers}) + "\n")
+                f.write(json.dumps(row) + "\n")
         except Exception:
             _log_crash(f"episode {ep} (dataset write)")
+        if brain:
+            brain.observe(row)     # posteriors sharpen mid-session too
         if ep < args.episodes:
             try:
                 # Clicks land wherever the OS focus is -- re-assert it, or
@@ -2811,6 +3022,28 @@ def cmd_farm(args):
                          "restart calibration points in config.json.")
     print(f"\nDone. {args.episodes} labeled episodes appended to "
           f"{runs_path.name}.")
+
+
+def cmd_learn(args):
+    """Offline: show the meta brain's current beliefs for a map -- which
+    towers its own episodes confirm or contradict the spreadsheet on,
+    the elite layouts evolution draws from, where defenses die, and the
+    map's prime real estate if a scan mask exists."""
+    import meta as meta_mod
+    brain = meta_mod.MetaBrain(args.name, args.difficulty,
+                               target_round=args.final_round)
+    track = mask_pts = None
+    mask_path = find_mask_path({"map": args.name}, Path.cwd() / "_")
+    if mask_path:
+        try:
+            data = json.loads(mask_path.read_text())
+            track = meta_mod.TrackModel(data)
+            if track.ok and data.get("flow_entry"):
+                track.orient(data["flow_entry"])
+            mask_pts = data.get("valid_strict") or data.get("valid")
+        except Exception:
+            track = None
+    print(brain.report(track=track, mask_points=mask_pts))
 
 
 def cmd_play(args):
@@ -3056,14 +3289,39 @@ def main():
                              "the reliable ones")
     p_farm.add_argument("--seed", type=int, default=None,
                         help="RNG seed for reproducible layouts")
+    p_farm.add_argument("--no-meta", action="store_true", dest="no_meta",
+                        help="ignore meta_knowledge.json and play uniform "
+                             "random layouts (the old Stage-2 behavior)")
+    p_farm.add_argument("--explore", type=float, default=0.30,
+                        help="fraction of decisions that ignore the meta "
+                             "and go uniform random; 1.0 = pure random, "
+                             "0.0 = pure exploit (default: 0.30)")
+    p_farm.add_argument("--no-evolve", action="store_true", dest="no_evolve",
+                        help="disable the genetic layer that mutates and "
+                             "crosses over the best layouts found so far")
+    p_farm.add_argument("--pool", choices=["classic", "full"],
+                        default="full",
+                        help="tower pool for meta layouts: classic = the "
+                             "original 10 land towers; full also allows "
+                             "boomerang/mortar/spike/village/super/"
+                             "engineer (default: full)")
     p_farm.add_argument("-q", "--quiet", action="store_true",
                         help="suppress per-decision debug output")
+    p_learn = sub.add_parser(
+        "learn", help="STAGE 3: report what the meta brain has learned "
+                      "from runs_log.jsonl (no game needed)")
+    p_learn.add_argument("name", help="map name, e.g. monkey_meadow")
+    p_learn.add_argument("--difficulty", default="easy")
+    p_learn.add_argument("--final-round", type=int, default=40,
+                         dest="final_round",
+                         help="round that counts as survival (default: 40)")
     args = parser.parse_args()
     print(f"btd6_bot build {BUILD}")
     global DEBUG
     DEBUG = not getattr(args, "quiet", False)
     {"locate": cmd_locate, "watch": cmd_watch,
-     "play": cmd_play, "scan": cmd_scan, "farm": cmd_farm}[args.command](args)
+     "play": cmd_play, "scan": cmd_scan, "farm": cmd_farm,
+     "learn": cmd_learn}[args.command](args)
 
 
 if __name__ == "__main__":

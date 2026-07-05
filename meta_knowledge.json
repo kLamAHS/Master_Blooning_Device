@@ -1,0 +1,1020 @@
+{
+ "version": "v55",
+ "source": "research/btd6_meta_research_v55.xlsx",
+ "generated_by": "tools/extract_meta.py",
+ "thesis": [],
+ "towers": {
+  "dart": {
+   "score": 63.0,
+   "role": "cheap start, PMFC, XBM",
+   "status": "Niche/meta only in specific shells",
+   "crosspath_note": "Depends: PMFC wants buffs, XBM easy but lower ceiling",
+   "partners": [
+    "village",
+    "alchemist"
+   ],
+   "avoid_for": "Expert late-game solo carry",
+   "notes": "Great for starts and challenges; not usually top generic late-game meta.",
+   "builds": [
+    {
+     "main": 2,
+     "cross": 0,
+     "weight": 0.5,
+     "label": "Crossbow Master line (2-0-5)"
+    },
+    {
+     "main": 1,
+     "cross": 0,
+     "weight": 0.3,
+     "label": "Fan Club line (2-5-0)"
+    },
+    {
+     "main": 0,
+     "cross": 2,
+     "weight": 0.2,
+     "label": "Juggernaut line (5-0-2)"
+    }
+   ],
+   "placement": {
+    "range": 0.057,
+    "style": "coverage"
+   }
+  },
+  "boomerang": {
+   "score": 82.0,
+   "role": "MOAB control, cleanup",
+   "status": "Strong support",
+   "crosspath_note": "MOAB Press spam, Perma Charge as DPS",
+   "partners": [
+    "alchemist",
+    "village",
+    "glue"
+   ],
+   "avoid_for": "BAD damage alone",
+   "notes": "MOAB Press remains broadly useful.",
+   "builds": [
+    {
+     "main": 2,
+     "cross": 1,
+     "weight": 0.6,
+     "label": "MOAB Press (0-2-4)"
+    },
+    {
+     "main": 1,
+     "cross": 0,
+     "weight": 0.4,
+     "label": "Perma Charge line (2-5-0)"
+    }
+   ],
+   "placement": {
+    "range": 0.077,
+    "style": "coverage"
+   }
+  },
+  "bomb": {
+   "score": 78.0,
+   "role": "ceramic/MOAB burst",
+   "status": "Strong but support-dependent",
+   "crosspath_note": "Recursive/Assassin/Elim",
+   "partners": [
+    "bomb",
+    "village",
+    "glue"
+   ],
+   "avoid_for": "Camo without support",
+   "notes": "Ability burst good into MOABs/BAD.",
+   "builds": [
+    {
+     "main": 1,
+     "cross": 0,
+     "weight": 0.6,
+     "label": "MOAB Assassin line (2-4-0)"
+    },
+    {
+     "main": 2,
+     "cross": 0,
+     "weight": 0.4,
+     "label": "Recursive Cluster (2-0-4)"
+    }
+   ],
+   "placement": {
+    "range": 0.071,
+    "style": "coverage"
+   }
+  },
+  "tack": {
+   "score": 90.0,
+   "role": "close-range DPS",
+   "status": "High meta where geometry works",
+   "crosspath_note": "205 Tack Zone usually; top for inferno cleanup",
+   "partners": [
+    "alchemist",
+    "village",
+    "ice",
+    "glue"
+   ],
+   "avoid_for": "Long-range maps",
+   "notes": "One of the clearest buff-scaling carries.",
+   "builds": [
+    {
+     "main": 2,
+     "cross": 0,
+     "weight": 0.7,
+     "label": "The Tack Zone (2-0-5)"
+    },
+    {
+     "main": 0,
+     "cross": 2,
+     "weight": 0.3,
+     "label": "Ring of Fire / Inferno (5-0-2)"
+    }
+   ],
+   "placement": {
+    "range": 0.041,
+    "style": "coverage"
+   }
+  },
+  "ice": {
+   "score": 89.0,
+   "role": "debuff/control",
+   "status": "High meta support",
+   "crosspath_note": "Embrittle/Super Brittle or Impale",
+   "partners": [],
+   "avoid_for": "BAD slow",
+   "notes": "Turns projectile spam into late-game DPS.",
+   "builds": [
+    {
+     "main": 0,
+     "cross": 1,
+     "weight": 0.55,
+     "label": "Embrittlement / Super Brittle (5-2-0)"
+    },
+    {
+     "main": 2,
+     "cross": 1,
+     "weight": 0.45,
+     "label": "Icicle Impale (0-2-5)"
+    }
+   ],
+   "placement": {
+    "range": 0.036,
+    "style": "upstream"
+   }
+  },
+  "glue": {
+   "score": 94.0,
+   "role": "debuff, slow, cleanup",
+   "status": "S-tier support",
+   "crosspath_note": "Glue Storm/Strike, MOAB Glue, Solver",
+   "partners": [],
+   "avoid_for": "BAD slow",
+   "notes": "v55 specifically addressed Glue Strike strength.",
+   "builds": [
+    {
+     "main": 1,
+     "cross": 0,
+     "weight": 0.45,
+     "label": "Glue Strike / Storm (2-5-0)"
+    },
+    {
+     "main": 2,
+     "cross": 1,
+     "weight": 0.35,
+     "label": "MOAB Glue (0-1-3)"
+    },
+    {
+     "main": 0,
+     "cross": 2,
+     "weight": 0.2,
+     "label": "Bloon Solver (5-0-2)"
+    }
+   ],
+   "placement": {
+    "range": 0.082,
+    "style": "upstream"
+   }
+  },
+  "sniper": {
+   "score": 84.0,
+   "role": "MOAB stall, income outside CHIMPS",
+   "status": "Strong utility",
+   "crosspath_note": "Maim/Cripple; Elite Sniper outside CHIMPS",
+   "partners": [
+    "village",
+    "alchemist"
+   ],
+   "avoid_for": "Dense cleanup",
+   "notes": "Global range but line-of-sight/targeting quirks matter.",
+   "builds": [
+    {
+     "main": 0,
+     "cross": 1,
+     "weight": 0.7,
+     "label": "Maim / Cripple MOAB (4-2-0)"
+    },
+    {
+     "main": 2,
+     "cross": 0,
+     "weight": 0.3,
+     "label": "Full Auto line (2-0-4)"
+    }
+   ],
+   "placement": {
+    "range": null,
+    "style": "offside"
+   }
+  },
+  "sub": {
+   "score": 80.0,
+   "role": "intel, cooldown, burst",
+   "status": "Map-dependent high value",
+   "crosspath_note": "Energizer / First Strike",
+   "partners": [
+    "village"
+   ],
+   "avoid_for": "No-water maps",
+   "notes": "Advanced Intel changes range assumptions.",
+   "builds": [
+    {
+     "main": 1,
+     "cross": 0,
+     "weight": 0.5,
+     "label": "First Strike (2-4-0)"
+    },
+    {
+     "main": 0,
+     "cross": 1,
+     "weight": 0.5,
+     "label": "Energizer (5-2-0)"
+    }
+   ],
+   "placement": {
+    "range": 0.075,
+    "style": "coverage"
+   }
+  },
+  "buccaneer": {
+   "score": 77.0,
+   "role": "water DPS/econ/control",
+   "status": "Mode/map-dependent",
+   "crosspath_note": "Pirate Lord, Trade Empire",
+   "partners": [
+    "farm",
+    "village"
+   ],
+   "avoid_for": "Dry maps/CHIMPS income",
+   "notes": "Great outside CHIMPS with water and economy.",
+   "builds": [
+    {
+     "main": 2,
+     "cross": 0,
+     "weight": 0.6,
+     "label": "Trade Empire line (2-0-4)"
+    },
+    {
+     "main": 0,
+     "cross": 2,
+     "weight": 0.4,
+     "label": "Pirate Lord line (4-0-2)"
+    }
+   ],
+   "placement": {
+    "range": 0.082,
+    "style": "coverage"
+   }
+  },
+  "heli": {
+   "score": 81.0,
+   "role": "mobile DPS/control",
+   "status": "Reliable, costly",
+   "crosspath_note": "Apache Prime, Downdraft, Chinook outside CHIMPS",
+   "partners": [
+    "alchemist",
+    "village",
+    "glue"
+   ],
+   "avoid_for": "Efficiency on true experts",
+   "notes": "Map independence is the selling point.",
+   "builds": [
+    {
+     "main": 0,
+     "cross": 2,
+     "weight": 0.6,
+     "label": "Apache line (4-0-2)"
+    },
+    {
+     "main": 1,
+     "cross": 0,
+     "weight": 0.4,
+     "label": "Downdraft (2-3-0)"
+    }
+   ],
+   "placement": {
+    "range": 0.08,
+    "style": "coverage"
+   }
+  },
+  "mortar": {
+   "score": 73.0,
+   "role": "global utility, decamo, ceramic damage",
+   "status": "Niche/strong utility",
+   "crosspath_note": "Shattering Shells, Artillery Battery",
+   "partners": [
+    "bomb",
+    "glue",
+    "village"
+   ],
+   "avoid_for": "Easy plug-and-play DPS",
+   "notes": "Shattering Shells utility can be decisive.",
+   "builds": [
+    {
+     "main": 1,
+     "cross": 0,
+     "weight": 0.5,
+     "label": "Artillery Battery (2-4-0)"
+    },
+    {
+     "main": 2,
+     "cross": 1,
+     "weight": 0.5,
+     "label": "Shattering Shells (0-2-4)"
+    }
+   ],
+   "placement": {
+    "range": null,
+    "style": "offside"
+   }
+  },
+  "dartling": {
+   "score": 82.0,
+   "role": "line DPS / BAD DPS",
+   "status": "Strong with placement",
+   "crosspath_note": "MAD, Ray of Doom, BEZ",
+   "partners": [
+    "village",
+    "alchemist",
+    "engineer",
+    "glue"
+   ],
+   "avoid_for": "Hands-off targeting",
+   "notes": "Micro and straight lines determine output.",
+   "builds": [
+    {
+     "main": 0,
+     "cross": 2,
+     "weight": 0.5,
+     "label": "Laser Cannon / MAD line (4-0-2)"
+    },
+    {
+     "main": 2,
+     "cross": 0,
+     "weight": 0.5,
+     "label": "Ray of Doom line (2-0-4)"
+    }
+   ],
+   "placement": {
+    "range": null,
+    "style": "coverage"
+   }
+  },
+  "wizard": {
+   "score": 88.0,
+   "role": "cleanup, DDT, abilities",
+   "status": "High meta",
+   "crosspath_note": "Prince of Darkness, Phoenix",
+   "partners": [
+    "alchemist",
+    "village",
+    "ice"
+   ],
+   "avoid_for": "BAD solo",
+   "notes": "PoD is one of the safest generic late-game stabilizers.",
+   "builds": [
+    {
+     "main": 2,
+     "cross": 1,
+     "weight": 0.65,
+     "label": "Prince of Darkness (0-2-5)"
+    },
+    {
+     "main": 1,
+     "cross": 0,
+     "weight": 0.35,
+     "label": "Summon Phoenix (2-5-0)"
+    }
+   ],
+   "placement": {
+    "range": 0.071,
+    "style": "coverage"
+   }
+  },
+  "super": {
+   "score": 89.0,
+   "role": "buff-scaling carry",
+   "status": "High meta but expensive",
+   "crosspath_note": "Sun Avatar; Dark Knight for utility",
+   "partners": [
+    "village",
+    "alchemist",
+    "engineer",
+    "glue",
+    "ice"
+   ],
+   "avoid_for": "Cheap early",
+   "notes": "High ceiling because it takes buffs extremely well.",
+   "builds": [
+    {
+     "main": 0,
+     "cross": 2,
+     "weight": 0.6,
+     "label": "Sun Avatar (3-0-2)"
+    },
+    {
+     "main": 0,
+     "cross": 1,
+     "weight": 0.4,
+     "label": "Sun Avatar (3-2-0)"
+    }
+   ],
+   "placement": {
+    "range": 0.089,
+    "style": "coverage"
+   }
+  },
+  "ninja": {
+   "score": 86.0,
+   "role": "Sabo, shinobi, sticky",
+   "status": "High meta support",
+   "crosspath_note": "Bloon Sabo, Shinobi stacks",
+   "partners": [
+    "alchemist",
+    "ninja"
+   ],
+   "avoid_for": "No-support raw DPS",
+   "notes": "Shinobi stacking is numerically enormous.",
+   "builds": [
+    {
+     "main": 1,
+     "cross": 0,
+     "weight": 0.55,
+     "label": "Bloon Sabotage / Shinobi (0-4-0)"
+    },
+    {
+     "main": 0,
+     "cross": 2,
+     "weight": 0.45,
+     "label": "Bloonjitsu / Grandmaster (4-0-2)"
+    }
+   ],
+   "placement": {
+    "range": 0.071,
+    "style": "coverage"
+   }
+  },
+  "alchemist": {
+   "score": 95.0,
+   "role": "buff/debuff",
+   "status": "S-tier support",
+   "crosspath_note": "401/420 brew; Perishing for debuff",
+   "partners": [],
+   "avoid_for": "Solo popping",
+   "notes": "Brew is one of the most universal value engines.",
+   "builds": [
+    {
+     "main": 0,
+     "cross": 1,
+     "weight": 0.6,
+     "label": "Berserker Brew (4-2-0)"
+    },
+    {
+     "main": 0,
+     "cross": 2,
+     "weight": 0.4,
+     "label": "Berserker Brew (4-0-1)"
+    }
+   ],
+   "placement": {
+    "range": 0.08,
+    "style": "buddy"
+   }
+  },
+  "druid": {
+   "score": 86.0,
+   "role": "cluster carry",
+   "status": "Strong setup carry",
+   "crosspath_note": "Avatar of Wrath + Poplusts",
+   "partners": [
+    "alchemist",
+    "village",
+    "glue"
+   ],
+   "avoid_for": "Spread-out footprints",
+   "notes": "Powerful but setup-dependent.",
+   "builds": [
+    {
+     "main": 2,
+     "cross": 1,
+     "weight": 0.7,
+     "label": "Poplust / Avatar of Wrath (0-1-4/5)"
+    },
+    {
+     "main": 0,
+     "cross": 2,
+     "weight": 0.3,
+     "label": "Ball Lightning (4-0-2)"
+    }
+   ],
+   "placement": {
+    "range": 0.062,
+    "style": "coverage"
+   }
+  },
+  "village": {
+   "score": 96.0,
+   "role": "camo, MIB, discounts, Homeland",
+   "status": "S-tier support",
+   "crosspath_note": "230/240/250; 420 for primary",
+   "partners": [],
+   "avoid_for": "Raw popping",
+   "notes": "Solves properties and multiplies DPS.",
+   "builds": [
+    {
+     "main": 1,
+     "cross": 0,
+     "weight": 0.8,
+     "label": "Radar / MIB / Call to Arms (2-3-0)"
+    },
+    {
+     "main": 0,
+     "cross": 1,
+     "weight": 0.2,
+     "label": "Primary Expertise (4-2-0)"
+    }
+   ],
+   "placement": {
+    "range": 0.071,
+    "style": "buddy"
+   }
+  },
+  "engineer": {
+   "score": 84.0,
+   "role": "Overclock, sentry, trap",
+   "status": "High support/value",
+   "crosspath_note": "040/050 Overclock, XXXL Trap outside CHIMPS",
+   "partners": [
+    "village"
+   ],
+   "avoid_for": "Early solo carry",
+   "notes": "Overclock scales with target cost/output.",
+   "builds": [
+    {
+     "main": 1,
+     "cross": 0,
+     "weight": 0.7,
+     "label": "Overclock (2-4-0)"
+    },
+    {
+     "main": 0,
+     "cross": 1,
+     "weight": 0.3,
+     "label": "Sentry Expert line (4-2-0)"
+    }
+   ],
+   "placement": {
+    "range": 0.071,
+    "style": "coverage"
+   }
+  },
+  "beast": {
+   "score": 74.0,
+   "role": "control/DPS via merged beasts",
+   "status": "Skill/setup-dependent",
+   "crosspath_note": "Orca/Megalodon, Condor/Pouakai, T-Rex",
+   "partners": [
+    "village",
+    "ice"
+   ],
+   "avoid_for": "Simple generic advice",
+   "notes": "Power depends heavily on placement/merge planning.",
+   "builds": [],
+   "placement": {
+    "range": 0.06,
+    "style": "coverage"
+   }
+  },
+  "spike": {
+   "score": 83,
+   "role": "cleanup/control",
+   "partners": [
+    "village",
+    "alchemist",
+    "engineer"
+   ],
+   "notes": "Not ranked in the sheet; inferred from Round Threats mentions (Spike Storm on R90-99).",
+   "status": "inferred",
+   "builds": [
+    {
+     "main": 1,
+     "cross": 2,
+     "weight": 0.55,
+     "label": "Spike Storm (0-4-2)"
+    },
+    {
+     "main": 2,
+     "cross": 1,
+     "weight": 0.45,
+     "label": "Perma-Spike (0-2-5)"
+    }
+   ],
+   "placement": {
+    "range": 0.036,
+    "style": "downstream"
+   },
+   "inferred": true
+  }
+ },
+ "heroes": {
+  "Geraldo": {
+   "role": "Universal toolkit / strongest expert flexibility",
+   "best_for": "CHIMPS planning, early-game smoothing, single-target boosts",
+   "strengths": "Shop items patch holes: camo, pierce, buffs, totems, spikes, glue.",
+   "caveats": "High knowledge and micro; item timings matter.",
+   "score": 96.0,
+   "micro": 90.0
+  },
+  "Corvus": {
+   "role": "High-skill solo/carry utility",
+   "best_for": "Players willing to micro spells",
+   "strengths": "Huge ceiling, flexible response to rushes.",
+   "caveats": "Very high micro and learning load.",
+   "score": 93.0,
+   "micro": 100.0
+  },
+  "Sauda": {
+   "role": "Easy early-game anchor",
+   "best_for": "Beginner/intermediate maps, short-range strong spots",
+   "strengths": "Cheap, strong early, low micro.",
+   "caveats": "Falls with bad placement/long maps; less universal on true experts.",
+   "score": 84.0,
+   "micro": 20.0
+  },
+  "Psi": {
+   "role": "Scaling control",
+   "best_for": "Long games, dangerous late waves",
+   "strengths": "Global-ish control and strong round handling as levels scale.",
+   "caveats": "Weak early; needs XP/time.",
+   "score": 86.0,
+   "micro": 35.0
+  },
+  "Adora": {
+   "role": "Buffed late-game carry amplifier",
+   "best_for": "Temple/Sun Avatar or high-damage shells",
+   "strengths": "High damage when supported; strong ability windows.",
+   "caveats": "Sacrifice/micro and cost planning.",
+   "score": 85.0,
+   "micro": 70.0
+  },
+  "Etienne": {
+   "role": "Camo simplifier + UCAV",
+   "best_for": "When camo coverage tax is painful",
+   "strengths": "Global camo at level 8 makes builds simpler.",
+   "caveats": "Less raw carry value than top heroes.",
+   "score": 79.0,
+   "micro": 35.0
+  },
+  "Benjamin": {
+   "role": "Cash snowball outside CHIMPS",
+   "best_for": "Non-CHIMPS farming/economy modes",
+   "strengths": "Turns early cash into faster farms and defenses.",
+   "caveats": "Bad/disabled for CHIMPS optimization.",
+   "score": 78.0,
+   "micro": 15.0
+  },
+  "Pat Fusty": {
+   "role": "Damage buff / knockback support",
+   "best_for": "Tack, low-damage high-projectile towers",
+   "strengths": "Rallying Roar multiplies fast towers; v55 smoothed progression.",
+   "caveats": "Range and placement constrained.",
+   "score": 83.0,
+   "micro": 50.0
+  },
+  "Brickell": {
+   "role": "Water carry/support",
+   "best_for": "Sub/Buccaneer-focused maps",
+   "strengths": "Strong water synergy and ability power.",
+   "caveats": "Map water dependency.",
+   "score": 82.0,
+   "micro": 55.0
+  },
+  "Dan D'Monke / He-Man": {
+   "role": "Transforming hybrid support/carry",
+   "best_for": "New v55 hero testing",
+   "strengths": "Level 3 transformation; level 10 rally/berserk modes.",
+   "caveats": "Newer and still settling in; events restrictions around launch.",
+   "score": 80.0,
+   "micro": 60.0
+  }
+ },
+ "roles": {
+  "carry": [
+   "tack",
+   "super",
+   "wizard",
+   "druid",
+   "boomerang",
+   "dartling"
+  ],
+  "amplifier": [
+   "alchemist",
+   "village",
+   "ice",
+   "glue",
+   "engineer"
+  ],
+  "control": [
+   "ice",
+   "glue",
+   "sniper",
+   "ninja",
+   "bomb",
+   "spike"
+  ],
+  "opener": [
+   "dart",
+   "ninja",
+   "sniper",
+   "boomerang",
+   "glue"
+  ]
+ },
+ "solutions": {
+  "camo": {
+   "ninja": null,
+   "wizard": [
+    2,
+    2
+   ],
+   "village": [
+    1,
+    2
+   ],
+   "sniper": [
+    1,
+    1
+   ],
+   "dart": [
+    2,
+    2
+   ],
+   "mortar": [
+    2,
+    3
+   ]
+  },
+  "lead": {
+   "bomb": null,
+   "mortar": null,
+   "wizard": [
+    1,
+    1
+   ],
+   "alchemist": [
+    0,
+    2
+   ],
+   "glue": [
+    0,
+    2
+   ],
+   "tack": [
+    0,
+    3
+   ],
+   "ice": [
+    0,
+    2
+   ],
+   "sniper": [
+    0,
+    1
+   ],
+   "boomerang": [
+    2,
+    2
+   ],
+   "druid": [
+    0,
+    2
+   ],
+   "super": [
+    0,
+    2
+   ],
+   "spike": [
+    2,
+    2
+   ]
+  },
+  "moab": {
+   "sniper": [
+    0,
+    4
+   ],
+   "bomb": [
+    1,
+    3
+   ],
+   "boomerang": [
+    2,
+    4
+   ],
+   "glue": [
+    2,
+    3
+   ],
+   "ninja": [
+    1,
+    4
+   ],
+   "ice": [
+    2,
+    5
+   ],
+   "wizard": [
+    2,
+    5
+   ],
+   "super": [
+    0,
+    3
+   ],
+   "tack": [
+    2,
+    5
+   ],
+   "druid": [
+    2,
+    5
+   ],
+   "spike": [
+    1,
+    4
+   ]
+  }
+ },
+ "threats": [
+  {
+   "rounds": [
+    24,
+    33,
+    36,
+    37
+   ],
+   "threat": "Camo / camo density",
+   "kind": "camo",
+   "tests": "Detection and targeting",
+   "answers": "Village 020, Sub intel, Ninja, Etienne, Geraldo items",
+   "notes": "Avoid buying dead DPS that cannot see camo."
+  },
+  {
+   "rounds": [
+    28,
+    30
+   ],
+   "threat": "Lead",
+   "kind": "lead",
+   "tests": "Damage type",
+   "answers": "Alch buff, Bomb, Wizard, Gwen, hot shots, AMD",
+   "notes": "Lead popping is a build tax."
+  },
+  {
+   "rounds": [
+    40
+   ],
+   "threat": "MOAB",
+   "kind": "moab",
+   "tests": "Single-target burst + children",
+   "answers": "Moab Press, sticky bomb, maim, strong tower focus",
+   "notes": "First major boss-style check."
+  },
+  {
+   "rounds": [
+    63
+   ],
+   "threat": "Ceramic waves",
+   "kind": "ceramic",
+   "tests": "Pierce and cleanup",
+   "answers": "Recursive, Solver, Ring of Fire, Downdraft, Glue",
+   "notes": "Classic defense killer."
+  },
+  {
+   "rounds": [
+    75,
+    76,
+    78
+   ],
+   "threat": "Dense ceramics/regrow/camo",
+   "kind": "ceramic",
+   "tests": "Cleanup, anti-regrow, camo",
+   "answers": "Embrittle, Glue, Necromancer, Ring of Fire, Sabotage",
+   "notes": "Layer management matters."
+  },
+  {
+   "rounds": [
+    80
+   ],
+   "threat": "ZOMG",
+   "kind": "moab",
+   "tests": "Sustained MOAB DPS",
+   "answers": "Maim, MOAB Glue, First Strike, carry DPS",
+   "notes": "Pre-BAD scaling test."
+  },
+  {
+   "rounds": [
+    90,
+    93,
+    95
+   ],
+   "threat": "DDTs",
+   "kind": "ddt",
+   "tests": "Camo + lead + black + speed",
+   "answers": "Impale, MIB, Sabo, Maim, PoD, Spike Storm",
+   "notes": "Late-game build validation."
+  },
+  {
+   "rounds": [
+    96,
+    98
+   ],
+   "threat": "Dense fortified MOABs",
+   "kind": "moab",
+   "tests": "Pierce, stall, cleanup, ability timing",
+   "answers": "Glue Storm, Sabo, MOAB Glue, Cripple, strong carry",
+   "notes": "Often harder than 100 for bad builds."
+  },
+  {
+   "rounds": [
+    99
+   ],
+   "threat": "Fortified DDTs",
+   "kind": "ddt",
+   "tests": "DDT control and burst",
+   "answers": "Impale, Sabo, First Strike, Spike Storm, MIB",
+   "notes": "Do not spend all abilities on 98."
+  },
+  {
+   "rounds": [
+    100
+   ],
+   "threat": "BAD",
+   "kind": "bad",
+   "tests": "Raw single-target DPS",
+   "answers": "First Strike, Spike Storm, Tack Zone buffs, Avatar/Savatar shell",
+   "notes": "BAD cannot be slowed by many common stall tools."
+  }
+ ],
+ "modes": {
+  "chimps": {
+   "priority": "Efficiency, save-up, no income, no selling",
+   "approach": "Hero + cheap stabilizers + one carry + layered support",
+   "avoid": "Farm logic, sacrifice/sell plans",
+   "notes": "The spreadsheet's rankings lean CHIMPS because it is the strictest meta test."
+  },
+  "impoppable": {
+   "priority": "Affordability + income optional",
+   "approach": "Ben/farms can trivialize save-ups; still respect DDTs/BAD",
+   "avoid": "Overfarming with no defense",
+   "notes": "Selling and income open more options."
+  },
+  "boss_events": {
+   "priority": "Economy into burst and paragons",
+   "approach": "Farms, optimized tier timing, debuffs, paragon planning",
+   "avoid": "CHIMPS-only thinking",
+   "notes": "Very event/rules specific, so not fully covered here."
+  },
+  "freeplay": {
+   "priority": "Scaling and paragons",
+   "approach": "Temples, paragons, debuffs, stalling, buffs",
+   "avoid": "Low-ceiling midgame carries",
+   "notes": "Freeplay meta differs sharply from CHIMPS."
+  },
+  "half_cash": {
+   "priority": "Cheap starts and high efficiency",
+   "approach": "Sauda/Geraldo, free darts, subs/ninjas, value supports",
+   "avoid": "Expensive greedy carries",
+   "notes": "Early game is the bottleneck."
+  },
+  "alternate_bloons_rounds": {
+   "priority": "Property coverage",
+   "approach": "Camo/lead/purple fixes early",
+   "avoid": "Normal-mode starts",
+   "notes": "Prioritize flexible damage types."
+  },
+  "co_op": {
+   "priority": "Role specialization",
+   "approach": "One player economy, one support, one carry",
+   "avoid": "Uncoordinated duplicate supports",
+   "notes": "Placement footprint and cash routing matter."
+  }
+ }
+}
