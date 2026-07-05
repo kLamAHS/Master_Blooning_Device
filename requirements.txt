@@ -3,3 +3,7 @@ mss
 opencv-python
 numpy
 pytesseract
+
+# Only needed to regenerate meta_knowledge.json from the research
+# spreadsheet (tools/extract_meta.py) -- the bot itself never imports it:
+# pip install openpyxl

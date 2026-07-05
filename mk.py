@@ -2269,9 +2269,9 @@ def random_genome(rng, n_towers):
                 spots.append(cand)
                 break
     types = [rng.choice(FARM_TOWERS) for _ in spots]
-    for spot, ttype in zip(spots, types):
+    for ref, (spot, ttype) in enumerate(zip(spots, types)):
         genome.append({"do": "place", "tower": ttype,
-                       "at": [spot[0], spot[1]]})
+                       "at": [spot[0], spot[1]], "ref": ref})
     ups = []
     for ref, ttype in enumerate(types):
         main = rng.randrange(3)
@@ -2437,7 +2437,11 @@ def run_episode(screen, cfg, genome, final_round, abort_lives=50):
                     st, landed = act_place(screen, cfg,
                                            {**item, "timeout": 10})
                     if landed is not None:
-                        landed_by_ref[place_i] = landed
+                        # Key by the genome's own ref when present: place
+                        # items can execute out of order (broke/no-spot
+                        # items sleep on _wake), and pop-order keying
+                        # would then wire upgrades to the wrong tower.
+                        landed_by_ref[item.get("ref", place_i)] = landed
                         towers[tuple(landed)] = {"tower": item["tower"],
                                                  "at": landed,
                                                  "path": [0, 0, 0]}
@@ -2453,7 +2457,7 @@ def run_episode(screen, cfg, genome, final_round, abort_lives=50):
                             print(f"   skipping {item['tower']} at "
                                   f"{item['at']} -- no placeable spot "
                                   f"nearby (rescan if this looks wrong)")
-                            landed_by_ref[place_i] = None
+                            landed_by_ref[item.get("ref", place_i)] = None
                             place_i += 1
                             queue.pop(idx)
                         else:
@@ -2764,11 +2768,46 @@ def cmd_farm(args):
         print(f"Game starts at round {start_round} on this difficulty -- "
               f"restart verification will expect it.")
 
+    # STAGE 3: the meta brain. Spreadsheet-derived priors + everything in
+    # runs_log.jsonl -> Thompson-sampled layouts that start meta-informed
+    # and drift toward whatever actually survives on THIS map. Missing
+    # knowledge file or --no-meta degrades cleanly to uniform random.
+    brain, tower_pool = None, FARM_TOWERS
+    if not args.no_meta:
+        try:
+            import meta as meta_mod
+            brain = meta_mod.MetaBrain(args.name, args.difficulty,
+                                       target_round=args.final_round,
+                                       explore=args.explore,
+                                       evolve=not args.no_evolve)
+            if args.pool == "full":
+                tower_pool = FARM_TOWERS + meta_mod.META_EXTRA_TOWERS
+            n_map = sum(1 for r in brain.history if brain.usable(r))
+            print(f"Meta brain ON: {len(brain.towers)} tower priors, "
+                  f"{n_map} usable past episodes on this map, "
+                  f"explore={brain.explore:.2f}, "
+                  f"evolution={'on' if not args.no_evolve else 'off'}, "
+                  f"pool={len(tower_pool)} towers.")
+        except Exception as e:
+            print(f"Meta brain unavailable ({e}) -- falling back to "
+                  f"uniform random layouts.")
+            brain = None
+
     for ep in range(1, args.episodes + 1):
-        genome = random_genome(rng, args.towers)
+        if brain:
+            pools = {"near": MASK_NEAR, "mid": MASK_MID,
+                     "all": MASK_POINTS, "roomy": MASK_ROOMY}
+            genome = brain.next_genome(
+                rng, args.towers, pools, is_locked=is_locked,
+                large_towers=LARGE_TOWERS, tower_pool=tower_pool,
+                price_of=lambda t: PRICES.get(price_key(t)))
+        else:
+            genome = random_genome(rng, args.towers)
         print(f"\n=== Episode {ep}/{args.episodes}: "
               f"{sum(1 for g in genome if g['do'] == 'place')} towers, "
               f"{sum(1 for g in genome if g['do'] == 'upgrade')} upgrades")
+        if brain:
+            print(brain.describe_genome(genome))
         try:
             outcome, reached, towers, lives_by_round = run_episode(
                 screen, cfg, genome, args.final_round,
@@ -2785,17 +2824,21 @@ def cmd_farm(args):
             except Exception:
                 _log_crash(f"episode {ep} (recovery clear_ui)")
         print(f"=== Episode {ep}: {outcome} at round {reached}")
+        row = {"time": datetime.now().isoformat(timespec="seconds"),
+               "mode": "farm", "map": args.name,
+               "difficulty": args.difficulty,
+               "final_round": reached, "outcome": outcome,
+               "strategy": brain.last_strategy if brain
+               else {"kind": "uniform"},
+               "lives_by_round": lives_by_round,
+               "towers": towers}
         try:
             with open(runs_path, "a") as f:
-                f.write(json.dumps({
-                    "time": datetime.now().isoformat(timespec="seconds"),
-                    "mode": "farm", "map": args.name,
-                    "difficulty": args.difficulty,
-                    "final_round": reached, "outcome": outcome,
-                    "lives_by_round": lives_by_round,
-                    "towers": towers}) + "\n")
+                f.write(json.dumps(row) + "\n")
         except Exception:
             _log_crash(f"episode {ep} (dataset write)")
+        if brain:
+            brain.observe(row)     # posteriors sharpen mid-session too
         if ep < args.episodes:
             try:
                 # Clicks land wherever the OS focus is -- re-assert it, or
@@ -2811,6 +2854,16 @@ def cmd_farm(args):
                          "restart calibration points in config.json.")
     print(f"\nDone. {args.episodes} labeled episodes appended to "
           f"{runs_path.name}.")
+
+
+def cmd_learn(args):
+    """Offline: show the meta brain's current beliefs for a map -- which
+    towers its own episodes confirm or contradict the spreadsheet on,
+    the elite layouts evolution draws from, and where defenses die."""
+    import meta as meta_mod
+    brain = meta_mod.MetaBrain(args.name, args.difficulty,
+                               target_round=args.final_round)
+    print(brain.report())
 
 
 def cmd_play(args):
@@ -3056,14 +3109,39 @@ def main():
                              "the reliable ones")
     p_farm.add_argument("--seed", type=int, default=None,
                         help="RNG seed for reproducible layouts")
+    p_farm.add_argument("--no-meta", action="store_true", dest="no_meta",
+                        help="ignore meta_knowledge.json and play uniform "
+                             "random layouts (the old Stage-2 behavior)")
+    p_farm.add_argument("--explore", type=float, default=0.30,
+                        help="fraction of decisions that ignore the meta "
+                             "and go uniform random; 1.0 = pure random, "
+                             "0.0 = pure exploit (default: 0.30)")
+    p_farm.add_argument("--no-evolve", action="store_true", dest="no_evolve",
+                        help="disable the genetic layer that mutates and "
+                             "crosses over the best layouts found so far")
+    p_farm.add_argument("--pool", choices=["classic", "full"],
+                        default="full",
+                        help="tower pool for meta layouts: classic = the "
+                             "original 10 land towers; full also allows "
+                             "boomerang/mortar/spike/village/super/"
+                             "engineer (default: full)")
     p_farm.add_argument("-q", "--quiet", action="store_true",
                         help="suppress per-decision debug output")
+    p_learn = sub.add_parser(
+        "learn", help="STAGE 3: report what the meta brain has learned "
+                      "from runs_log.jsonl (no game needed)")
+    p_learn.add_argument("name", help="map name, e.g. monkey_meadow")
+    p_learn.add_argument("--difficulty", default="easy")
+    p_learn.add_argument("--final-round", type=int, default=40,
+                         dest="final_round",
+                         help="round that counts as survival (default: 40)")
     args = parser.parse_args()
     print(f"btd6_bot build {BUILD}")
     global DEBUG
     DEBUG = not getattr(args, "quiet", False)
     {"locate": cmd_locate, "watch": cmd_watch,
-     "play": cmd_play, "scan": cmd_scan, "farm": cmd_farm}[args.command](args)
+     "play": cmd_play, "scan": cmd_scan, "farm": cmd_farm,
+     "learn": cmd_learn}[args.command](args)
 
 
 if __name__ == "__main__":

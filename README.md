@@ -165,6 +165,59 @@ and leads/MOABs to filter the weak. After a few dozen episodes across an
 evening or two, the dataset is ready for training, and learned prices
 accumulate as a free side effect.
 
+## Stage 3: the meta brain — priors from research, tactics from experience
+
+A lot of BTD6 is already figured out. `research/btd6_meta_research_v55.xlsx`
+holds that community meta distilled into rankings — tower scores, roles,
+synergy shells, crosspath builds, round threats, mode priorities — and
+`tools/extract_meta.py` compiles it into the machine-readable
+`meta_knowledge.json` (rerun it whenever the spreadsheet gets a new
+version; it needs `pip install openpyxl`, the bot itself doesn't).
+
+The design rule in `meta.py`: **the meta is a prior, never a rulebook.**
+Every choice — which tower, which spot, which upgrade path — is a
+Thompson-sampling draw from a Beta posterior whose pseudo-counts *start*
+at the spreadsheet's score and are updated by the bot's own episodes in
+`runs_log.jsonl`. With no data the bot plays roughly what the research
+says is good (carry + amplifier + control + opener, camo answered before
+round 24, lead before 28, buys ordered by threat deadline). After ~6
+episodes featuring a tower, its own results outweigh the spreadsheet — a
+meta darling that keeps dying on *this* map gets sampled less, an
+off-meta pick that keeps surviving gets sampled more.
+
+Emergence is protected two ways on top of that:
+
+- **The explore knob.** Every decision has an `--explore` chance
+  (default 0.30) of ignoring the meta entirely and going uniform random,
+  so no tower/path/spot ever starves and the dataset keeps both classes.
+- **Evolution.** Once a few episodes have survived deep, layouts start
+  being bred from the best ones found so far — mutated (move a tower,
+  swap its species, push a build deeper, add/drop a tower) and crossed
+  over between two elites. Parents are the bot's own discoveries, and
+  mutations are free to wander off-meta. `--no-evolve` disables it.
+
+```
+python mk.py farm monkey_meadow --episodes 15 --towers 4          # meta on
+python mk.py farm monkey_meadow --episodes 15 --explore 1.0      # pure random
+python mk.py farm monkey_meadow --episodes 15 --no-meta          # old Stage 2
+```
+
+The meta pool also unlocks towers the random farm never used —
+boomerang, mortar, spike, village, super, engineer (`--pool classic`
+restricts to the original ten). Every logged episode now records a
+`"strategy"` field (meta / evolve / crossover, roles, mutations), so the
+dataset itself shows *how* each layout was conceived.
+
+To see what the bot currently believes — where its experience confirms
+or contradicts the research, which elite layouts evolution is breeding
+from, and which round bucket kills it (annotated with the nearest known
+threat, e.g. "deaths cluster near r24 — camo"):
+
+```
+python mk.py learn monkey_meadow            # or: python meta.py report monkey_meadow
+python meta.py selftest                     # offline sanity checks, no game needed
+```
+
 ## Plan file format
 
 Each entry in `"actions"` fires as soon as the round counter reaches its
