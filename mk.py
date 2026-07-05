@@ -1199,9 +1199,17 @@ def ui_clear(screen, cfg):
 
 
 def clear_ui(screen, cfg):
-    """Restore a clean state: no ghost, no panel (either side), no pause.
-    Escalation: unpause -> right-click (cancels ghosts) -> the detected
-    panel's own X button -> clicks on known-empty ground."""
+    """Restore a clean state: no ghost, no panel (either side), no pause,
+    no leftover RESTART? dialog. Escalation: dismiss dialog -> unpause ->
+    right-click (cancels ghosts) -> the detected panel's own X button ->
+    clicks on known-empty ground. The dialog check runs FIRST because the
+    dialog is modal: while it's up every other recovery click lands on
+    nothing, and the round counter behind it stays readable -- so without
+    this the 'clean state' test can pass with the dialog still open."""
+    if looks_restart_confirm(screen):
+        dbg("stray RESTART? dialog -- dismissing via CANCEL")
+        click_norm(screen, RESTART_GEOM["cancel"])
+        time.sleep(0.6)
     unpause_if_needed(screen, cfg)
     if ui_clear(screen, cfg):
         return True
@@ -1305,21 +1313,55 @@ def unpause_if_needed(screen, cfg):
     return False
 
 
+# Defeat screen + RESTART? confirmation dialog geometry, normalized to
+# the game client area (re-measured from the user's windowed screenshots).
+DEFEAT_GEOM = {
+    # Blue bands the DEFEAT dialog is checked by. body_a used to sit at
+    # y 0.310-0.360 -- INSIDE the orange DEFEAT lettering (y 0.28-0.37),
+    # so the >=45% blue test hovered at its threshold and the bot often
+    # didn't know it was dead. It now spans the clean run from below the
+    # lettering into the ROUND panel's top (both blues pass the filter).
+    "body_a": [0.32, 0.377, 0.36, 0.043],
+    "body_b": [0.32, 0.506, 0.36, 0.020],   # gap between inner panels
+    "title": [0.38, 0.285, 0.24, 0.065],    # orange DEFEAT lettering
+}
+RESTART_GEOM = {
+    # The green-ribboned "RESTART?" confirmation dialog (same layout over
+    # the defeat screen and over the pause menu).
+    "header": [0.28, 0.355, 0.44, 0.040],   # green ribbon + white text
+    "body": [0.30, 0.440, 0.40, 0.045],     # blue body above the question
+    "cancel": [0.398, 0.675],               # orange CANCEL button
+}
+
+
 def looks_defeated(screen):
-    """Is the DEFEAT screen up? Two light-blue body strips (above the
-    ROUND box and in the gap between the dialog's inner panels) plus the
-    orange DEFEAT title. Decoupled from OCR: on the defeat screen lives
-    is a lone '0' that reads unreliably while the round counter stays
-    readable, so digit-based exits can all fail at once."""
-    strip_a = screen.grab([0.32, 0.310, 0.36, 0.050])
-    strip_b = screen.grab([0.32, 0.506, 0.36, 0.020])
+    """Is the DEFEAT screen up? Two light-blue body strips (below the
+    DEFEAT lettering and in the gap between the dialog's inner panels)
+    plus the orange DEFEAT title. Decoupled from OCR: on the defeat
+    screen lives is a lone '0' that reads unreliably while the round
+    counter stays readable, so digit-based exits can all fail at once."""
+    strip_a = screen.grab(DEFEAT_GEOM["body_a"])
+    strip_b = screen.grab(DEFEAT_GEOM["body_b"])
     if _lightblue_fraction(strip_a) < 0.45 \
             or _lightblue_fraction(strip_b) < 0.45:
         return False
-    title = screen.grab([0.38, 0.285, 0.24, 0.065])
+    title = screen.grab(DEFEAT_GEOM["title"])
     hsv = cv2.cvtColor(title, cv2.COLOR_BGR2HSV)
     orange = cv2.inRange(hsv, (3, 120, 120), (24, 255, 255))
     return float((orange > 0).mean()) > 0.08
+
+
+def looks_restart_confirm(screen):
+    """Is the 'RESTART?' confirmation dialog up? Green header ribbon
+    carrying white text, with the dialog's light-blue body below it.
+    This is the gate that makes restarts honest: a restart button press
+    only counts once this dialog is SEEN, and its confirm click only
+    counts once it's gone -- no more firing clicks into a screen that
+    didn't have the expected buttons on it."""
+    header = screen.grab(RESTART_GEOM["header"])
+    if _green_fraction(header) < 0.35 or _white_fraction(header) < 0.04:
+        return False
+    return _lightblue_fraction(screen.grab(RESTART_GEOM["body"])) > 0.45
 
 
 def _green_fraction(img):
@@ -1843,17 +1885,16 @@ def cmd_watch(args):
             print(f"  raw={text!r:<12} parsed={value}   "
                   f"cash={read_cash(screen, cfg)}   "
                   f"lives={read_lives(screen, cfg)}")
-            la = _lightblue_fraction(
-                screen.grab([0.32, 0.310, 0.36, 0.050]))
-            lb2 = _lightblue_fraction(
-                screen.grab([0.32, 0.506, 0.36, 0.020]))
-            tt = screen.grab([0.38, 0.285, 0.24, 0.065])
+            la = _lightblue_fraction(screen.grab(DEFEAT_GEOM["body_a"]))
+            lb2 = _lightblue_fraction(screen.grab(DEFEAT_GEOM["body_b"]))
+            tt = screen.grab(DEFEAT_GEOM["title"])
             oo = float((cv2.inRange(cv2.cvtColor(tt, cv2.COLOR_BGR2HSV),
                                     (3, 120, 120),
                                     (24, 255, 255)) > 0).mean())
             print(f"    defeat-signals: blueA={la:.2f} blueB={lb2:.2f} "
                   f"orange={oo:.2f} (need A,B>=0.45, orange>0.08) -> "
-                  f"{looks_defeated(screen)}")
+                  f"{looks_defeated(screen)}   "
+                  f"restart-dialog={looks_restart_confirm(screen)}")
             time.sleep(1.0)
     except KeyboardInterrupt:
         print("\nDone.")
@@ -2528,34 +2569,114 @@ def run_episode(screen, cfg, genome, final_round, abort_lives=50):
     return outcome, last_round, clean, lives_by_round
 
 
+def _wait_until(cond, timeout, poll=0.3):
+    """Poll cond() until it's truthy or timeout seconds pass."""
+    t_end = time.time() + timeout
+    while True:
+        if cond():
+            return True
+        if time.time() >= t_end:
+            return False
+        time.sleep(poll)
+
+
+def _confirm_restart_dialog(screen, cfg):
+    """The RESTART? dialog is up: press its green RESTART until the
+    dialog actually closes. A click that leaves the dialog standing did
+    not restart anything and must not count as one."""
+    for _ in range(3):
+        click_norm(screen, cfg["restart_confirm"])
+        time.sleep(0.9)
+        if not looks_restart_confirm(screen):
+            return True
+    return False
+
+
+def _fresh_game_verified(screen, cfg, start_round, timeout=25):
+    """After a CONFIRMED restart click: wait out the map reload until the
+    HUD reads like a NEW game -- round at/below the start round AND lives
+    alive again, on two consecutive samples. A readable low round alone
+    (the old acceptance test) is NOT proof: a live game in its first
+    minutes reads exactly the same, which is how completely failed
+    restarts got declared done. One concession: if the lives reader is
+    dead this run (it never returns anything -- recalibration only
+    happens at the NEXT episode's preflight), round-only evidence is
+    accepted at double the consecutive-sample count rather than failing
+    a restart that in fact worked."""
+    t_end = time.time() + timeout
+    good = 0
+    lives_ever_read = False
+    while time.time() < t_end:
+        if looks_defeated(screen) or looks_restart_confirm(screen):
+            good = 0
+        else:
+            value = read_round(screen, cfg)[0]
+            lives = read_lives(screen, cfg)
+            lives_ever_read = lives_ever_read or lives is not None
+            fresh_round = value is not None and value <= max(1, start_round)
+            if fresh_round and lives is not None and lives > 0:
+                good += 2
+            elif fresh_round and not lives_ever_read:
+                good += 1
+            else:
+                good = 0        # includes lives reading 0: still defeated
+            if good >= 4:
+                return True
+        time.sleep(0.8)
+    return False
+
+
 def restart_game(screen, cfg, outcome, start_round=1):
-    """Get back to a fresh round 1. The path is chosen from the CURRENT
-    screen state, not the outcome label: a live game (counter readable)
-    must go through the pause menu; a defeat screen through its own
-    RESTART button. One retry re-evaluates state, so a wrong first guess
-    (e.g. hud_lost on a game that was actually still running) recovers."""
-    for attempt in range(2):
-        clear_ui(screen, cfg)
-        defeated = looks_defeated(screen)
-        live = (not defeated) and read_round(screen, cfg)[0] is not None
-        dbg(f"restart attempt {attempt + 1}: "
-            f"{'DEFEAT screen (defeat route)' if defeated else ('game looks LIVE (pause route)' if live else 'ended (defeat route)')}")
-        if live:
-            press_key("esc")
-            time.sleep(0.8)
+    """Get back to a fresh game, verifying EVERY step by looking. Each
+    attempt re-reads the screen and takes the route that matches what is
+    actually there (leftover RESTART? dialog > defeat screen > pause
+    menu > Esc to raise the pause menu): a restart button is only pressed
+    on the screen it belongs to, the press only counts once the RESTART?
+    dialog is seen, the confirm only counts once that dialog closes, and
+    success is only declared by _fresh_game_verified. The previous
+    version fired all three clicks blind and accepted any readable round
+    <= start_round -- on a live early-round game a failed restart
+    'verified' instantly (the bot moved on convinced it had restarted),
+    and on an unrecognized defeat screen the blind confirm clicked into
+    a dialog that had never opened."""
+    for attempt in range(4):
+        if attempt:
+            time.sleep(1.2)
+        if looks_restart_confirm(screen):
+            how = "leftover RESTART? dialog"
+        elif looks_defeated(screen):
+            how = "defeat screen"
+            click_norm(screen, cfg["defeat_restart"])
+        elif looks_paused(screen):
+            how = "pause menu"
             click_norm(screen, cfg["pause_restart"])
         else:
-            click_norm(screen, cfg["defeat_restart"])
-        time.sleep(0.8)
-        click_norm(screen, cfg["restart_confirm"])
-        time.sleep(2.0)
-        for _ in range(12):
-            value = read_round(screen, cfg)[0]
-            # Hard mode starts at round 3 -- 'fresh game' means the
-            # detected start round, not literally 1.
-            if value is not None and value <= max(1, start_round):
-                return True
-            time.sleep(1.0)
+            clear_ui(screen, cfg)
+            press_key("esc")
+            if _wait_until(lambda: looks_paused(screen), 3.0):
+                how = "pause menu (via Esc)"
+                click_norm(screen, cfg["pause_restart"])
+            else:
+                # Esc raised nothing. Likeliest: an end screen the defeat
+                # detector missed -- and round-readability proves nothing,
+                # since the round counter stays visible on the defeat
+                # screen. One press of the defeat RESTART, kept honest by
+                # the dialog gate below (on a live game it just clicks
+                # map and the missing dialog sends us around again).
+                how = "unrecognized screen -- trying the defeat button"
+                click_norm(screen, cfg["defeat_restart"])
+        dbg(f"restart attempt {attempt + 1}: {how}")
+        if not _wait_until(lambda: looks_restart_confirm(screen), 4.0):
+            dbg("restart: RESTART? dialog did not appear -- re-evaluating")
+            continue
+        if not _confirm_restart_dialog(screen, cfg):
+            dbg("restart: RESTART? dialog would not close -- re-evaluating")
+            continue
+        if _fresh_game_verified(screen, cfg, start_round):
+            dbg("restart verified: fresh HUD (round back at start, "
+                "lives repopulated)")
+            return True
+        dbg("restart: dialog confirmed but no fresh HUD appeared")
     return False
 
 
@@ -2677,6 +2798,9 @@ def cmd_farm(args):
             _log_crash(f"episode {ep} (dataset write)")
         if ep < args.episodes:
             try:
+                # Clicks land wherever the OS focus is -- re-assert it, or
+                # a stolen focus turns the whole restart into no-ops.
+                focus_game_window(hwnd)
                 ok = restart_game(screen, cfg, outcome,
                                   start_round=start_round)
             except Exception:
