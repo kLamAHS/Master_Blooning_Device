@@ -681,13 +681,34 @@ def _cash_box_from_text(screen, cfg=None):
             round(2.0 * bh / screen.h, 4)]
 
 
+def _plausible_cash_shape(box):
+    """Shape sanity for a cash-counter box (screen fractions). The real
+    counter is a short, wide strip pinned to the top HUD; bounds are
+    generous, but a box a third of the screen tall can never pass. This
+    is the brake on the snap's geometric growth: each session's snap
+    widens its search window from the SAVED box, so one rogue tall
+    'character' compounds session over session (0.055 -> 0.0845 ->
+    0.1676 -> 0.3249 in the field) unless implausible shapes are
+    refused both when produced and when loaded."""
+    if not box:
+        return False
+    x, y, w, h = box
+    return (0.015 <= h <= 0.10          # digit strip, not a map chunk
+            and w <= 0.35               # never wider than the HUD zone
+            and 1.0 <= w / h <= 12.0    # wide strip (fractions, so a
+            and y + h <= 0.16)          # 2-digit run is ~1.15) / top HUD
+
+
 def _snap_cash_box_to_digits(screen, box, min_x=0.0):
     """Char-level refinement: given a roughly-right cash box, use
     tesseract's per-character boxes on a widened crop to trim it to the
     DIGITS ONLY -- excluding the '$', the glyph that keeps OCR-ing as a
     leading 5/3, and any coin sliver to its left. min_x fences the
     widened window so it can never grow leftward into the LIVES digits
-    (which once produced a lives-overlapping 'refit')."""
+    (which once produced a lives-overlapping 'refit'). Char heights are
+    median-filtered so one tall non-digit blob (coin, glow) can't set
+    the scale, and the result must pass _plausible_cash_shape or the
+    snap returns nothing rather than an inflated box."""
     x, y, w, h = box
     wide = [max(min_x, x - h), max(0.0, y - 0.3 * h), w + 2 * h, h * 1.6]
     crop = screen.grab(wide)
@@ -712,6 +733,14 @@ def _snap_cash_box_to_digits(screen, box, min_x=0.0):
     digits = [ch for ch in chars[last_dollar + 1:] if ch[0].isdigit()]
     if len(digits) < 2:
         return None
+    # One coin blob or glow misread as a tall 'digit' must not set the
+    # vertical scale: keep only chars near the MEDIAN height, so the box
+    # is sized by the actual digit run.
+    heights = sorted(d[4] - d[2] for d in digits)
+    med = max(heights[len(heights) // 2], 1)
+    digits = [d for d in digits if 0.55 * med <= d[4] - d[2] <= 1.6 * med]
+    if len(digits) < 2:
+        return None
     scale = 3.0                                # preprocess upscales 3x
     dx1 = min(d[1] for d in digits) / scale
     dx2 = max(d[3] for d in digits) / scale
@@ -720,9 +749,10 @@ def _snap_cash_box_to_digits(screen, box, min_x=0.0):
     bh = max(dy2 - dy1, 8)
     nx0 = wide[0] + max(0.0, dx1 - 0.25 * bh) / screen.w
     ny0 = wide[1] + max(0.0, dy1 - 0.35 * bh) / screen.h
-    return [round(nx0, 4), round(ny0, 4),
-            round((dx2 - dx1 + 2.2 * bh) / screen.w, 4),  # rightward room
-            round(1.7 * bh / screen.h, 4)]
+    snapped = [round(nx0, 4), round(ny0, 4),
+               round((dx2 - dx1 + 2.2 * bh) / screen.w, 4),  # right room
+               round(1.7 * bh / screen.h, 4)]
+    return snapped if _plausible_cash_shape(snapped) else None
 
 
 def _cash_boxes_from_heart(screen):
@@ -975,11 +1005,18 @@ def preflight_cash_box(screen, cfg, recalibrate=False):
     """Locate/verify the cash counter: text search first, then coin
     anchor, then heart-derived candidates -- each verified by actually
     reading it. Any candidate (including a previously SAVED box) that
-    overlaps the lives counter is discarded on sight: lives reads
-    'succeed' fluently, so a mispositioned box never self-corrects
-    without this guard. All-fail dumps crops to debug/."""
-    if _overlaps_lives(cfg.get("cash_box"), cfg):
+    overlaps the lives counter or fails cash-counter shape sanity is
+    discarded on sight: a mispositioned or inflated box still reads
+    'fluently' (lone noise digits), so it never self-corrects without
+    these guards. All-fail dumps crops to debug/."""
+    saved = cfg.get("cash_box")
+    if saved and _overlaps_lives(saved, cfg):
         dbg("saved cash_box overlaps the LIVES counter -- discarding it")
+        cfg["cash_box"] = None
+        save_config_value("cash_box", None)
+    elif saved and not _plausible_cash_shape(saved):
+        dbg(f"saved cash_box {saved} has implausible cash-counter "
+            f"proportions -- discarding it")
         cfg["cash_box"] = None
         save_config_value("cash_box", None)
     original = cfg.get("cash_box")
@@ -1008,7 +1045,8 @@ def preflight_cash_box(screen, cfg, recalibrate=False):
     candidates += [("heart-relative geometry", b)
                    for b in _cash_boxes_from_heart(screen)]
     candidates = [(how, b) for how, b in candidates
-                  if not _overlaps_lives(b, cfg)]
+                  if not _overlaps_lives(b, cfg)
+                  and _plausible_cash_shape(b)]
     for how, box in candidates:
         cfg["cash_box"] = box
         ok = False
