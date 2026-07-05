@@ -51,7 +51,7 @@ import numpy as np
 import mss
 import pyautogui
 
-BUILD = "2026-07-05.r8"   # printed at startup: ties every log to a build
+BUILD = "2026-07-06.r9"   # printed at startup: ties every log to a build
 
 DEBUG = True     # verbose decision logging; pass --quiet to farm/play
 
@@ -1604,6 +1604,16 @@ def act_place(screen, cfg, action):
     key = TOWER_HOTKEYS[action["tower"].lower()]
     spot = action["at"]
     candidates = placement_candidates(spot, action["tower"].lower())
+    # Never retry ON another tower this run already placed: those clicks
+    # can only fail (or select the neighbor), and watching the bot try
+    # to stack glue on glue for a minute is silly.
+    avoid = action.get("avoid") or []
+    if avoid:
+        min_d = 0.045 if action["tower"].lower() in LARGE_TOWERS else 0.024
+        far = [c for c in candidates
+               if all((c[0] - a[0]) ** 2 + (c[1] - a[1]) ** 2
+                      >= min_d ** 2 for a in avoid)]
+        candidates = far or candidates
     deadline = time.time() + action.get("timeout", 60)
 
     cash_before = read_cash(screen, cfg)
@@ -2561,11 +2571,20 @@ def run_episode(screen, cfg, genome, final_round, abort_lives=50,
                 ent = towers.get(tuple(lnd)) if lnd else None
                 return bool(ent) and max(ent["path"]) >= g["tier"]
 
-            idx = choose_buy(queue, last_round,
-                             read_cash(screen, cfg), _cost_of,
-                             time.time(),
-                             emergency=time.time() < emergency_until[0],
-                             gate_ok=_gate_ok)
+            cash_now = read_cash(screen, cfg)
+            rush = time.time() < emergency_until[0]
+            try:
+                idx = choose_buy(queue, last_round, cash_now, _cost_of,
+                                 time.time(), emergency=rush,
+                                 gate_ok=_gate_ok)
+            except TypeError:
+                # A meta.py from a different version than mk.py (mixed
+                # zip extractions, stale __pycache__). Never crash the
+                # episode over it -- run without gates.
+                dbg("stale meta.choose_buy without gate support -- "
+                    "running ungated (re-download / clear __pycache__)")
+                idx = choose_buy(queue, last_round, cash_now, _cost_of,
+                                 time.time(), emergency=rush)
             item = queue[idx] if idx is not None else None
             if item is None:
                 pass                           # all pending buys cooling down
@@ -2587,8 +2606,10 @@ def run_episode(screen, cfg, genome, final_round, abort_lives=50,
                         dbg(msg)
                     item["_wake"] = time.time() + 4    # watermark gate
                 else:
-                    st, landed = act_place(screen, cfg,
-                                           {**item, "timeout": 10})
+                    st, landed = act_place(
+                        screen, cfg,
+                        {**item, "timeout": 10,
+                         "avoid": [t["at"] for t in towers.values()]})
                     if landed is not None:
                         # Key by the genome's own ref when present: place
                         # items can execute out of order (broke/no-spot
@@ -2969,6 +2990,16 @@ def cmd_farm(args):
     if not args.no_meta:
         try:
             import meta as meta_mod
+            api = getattr(meta_mod, "META_API", 0)
+            if api != 3:
+                print("!" * 64)
+                print(f"!! meta.py reports API {api}, this mk.py needs 3.")
+                print("!! You are mixing files from different versions --")
+                print("!! re-download the whole branch and delete any")
+                print("!! __pycache__ folders. Farming WITHOUT the meta")
+                print("!! brain so nothing crashes.")
+                print("!" * 64)
+                raise ImportError(f"meta API {api} != 3")
             brain = meta_mod.MetaBrain(args.name, args.difficulty,
                                        target_round=args.final_round,
                                        explore=args.explore,

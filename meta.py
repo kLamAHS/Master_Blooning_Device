@@ -34,6 +34,11 @@ RUNS_PATH = Path(__file__).parent / "runs_log.jsonl"
 # experience outweighs the spreadsheet.
 PRIOR_STRENGTH = 6.0
 
+# Version handshake with mk.py. A stale meta.py sitting next to a newer
+# mk.py (mixed zip extractions, leftover __pycache__) once CRASHED every
+# episode with a TypeError; mk.py now checks this and degrades politely.
+META_API = 3
+
 # Rough base-cost rank (medium prices) used ONLY to order purchases when
 # the learned price book hasn't seen a tower yet. Being off by $100 just
 # reorders two buys; the greedy executor still waits for real cash.
@@ -153,6 +158,27 @@ ASPECT = 9.0 / 16.0
 
 def _dist(a, b):
     return math.hypot(a[0] - b[0], (a[1] - b[1]) * ASPECT)
+
+
+# Minimum spacing between planned towers, in width-fractions. A tower
+# footprint is ~0.013 wide-radius, so two centers need ~0.028 -- the old
+# 0.015 planned towers ON TOP of each other and the executor burned a
+# minute of retries discovering the game wouldn't allow it.
+SEP = 0.028
+SEP_LARGE = 0.045
+
+
+def _spread(cands, taken, sep):
+    """Candidates at least sep away from every taken spot; if none
+    qualify, the single candidate FARTHEST from the layout (never an
+    overlapping one at random)."""
+    free = [c for c in cands
+            if all(_dist(c, t) >= sep for t in taken)]
+    if free:
+        return free
+    if not taken or not cands:
+        return cands
+    return [max(cands, key=lambda c: min(_dist(c, t) for t in taken))]
 
 
 class TrackModel:
@@ -376,6 +402,9 @@ class MetaBrain:
                         if c in partners
                         or ttype in self.towers.get(c, {}).get("partners", []))
             w *= 1.0 + 0.25 * mates
+            # Sharply diminishing returns on duplicates: a second glue
+            # is occasionally right, a third 000 glue never is.
+            w *= 0.3 ** sum(1 for c in chosen if c == ttype)
             if w > best_w:
                 best, best_w = ttype, w
         return best
@@ -397,10 +426,7 @@ class MetaBrain:
         if not pool:
             return None
         cands = [rng.choice(pool) for _ in range(min(30, len(pool)))]
-        free = [c for c in cands
-                if all((c[0] - t[0]) ** 2 + (c[1] - t[1]) ** 2 > 0.02 ** 2
-                       for t in taken)]
-        cands = free or cands
+        cands = _spread(cands, taken, SEP_LARGE if large else SEP)
         if rng.random() < self.explore or not self.pos_post:
             return list(rng.choice(cands))
         best, best_w = None, -1.0
@@ -436,7 +462,7 @@ class MetaBrain:
                 or pools.get("all") or []
         if not base:
             return None
-        cands = [rng.choice(base) for _ in range(min(50, len(base)))]
+        cands = [rng.choice(base) for _ in range(min(70, len(base)))]
         if style == "buddy" and placed:
             # A random sample can easily miss the small disc around the
             # teammates a buffer exists to stand in -- guarantee the
@@ -447,9 +473,7 @@ class MetaBrain:
             if nearby:
                 cands = [rng.choice(nearby)
                          for _ in range(min(30, len(nearby)))] + cands[:20]
-        free = [c for c in cands
-                if all(_dist(c, t) > 0.015 for t in taken)]
-        cands = free or cands
+        cands = _spread(cands, taken, SEP_LARGE if large else SEP)
 
         # The carry anchors the geometry for debuffers and buffers.
         carries = set(self.roles.get("carry", []))
@@ -494,7 +518,18 @@ class MetaBrain:
                 s = 1.0 / (1.0 + 40.0 * track.exposure(c, 0.06))
             else:                                    # coverage
                 s = exp
-            s *= 0.5 + self._pos_theta(rng, c)
+                if track.oriented:
+                    sp = track.span(c, r)
+                    if sp:
+                        # All else equal, kill bloons EARLY: damage near
+                        # the entry leaves room for error; a defense
+                        # camped at the exit pops with zero margin.
+                        s *= 1.25 - 0.50 * sp[1]
+            # Learned-region posterior nudges the score +/-20%. (It once
+            # swung 0.5x-1.5x, which drowned out the small absolute
+            # exposure differences of short-range towers -- heroes were
+            # landing on 1%-coverage spots on pure noise.)
+            s *= 0.8 + 0.4 * self._pos_theta(rng, c)
             if s > best_s:
                 best, best_s = c, s
         if best is None:
@@ -772,13 +807,24 @@ class MetaBrain:
         # read "boomerang#1(carry) bottom t2", never "upgrade ref2".
         carry_order = next((o for o, (r, *_x) in enumerate(placed)
                             if picks[r][1] == "carry"), None)
-        entries = []
+        entries, spot_notes = [], []
         for order, (ref, ttype, spot, main, cross, label) in enumerate(placed):
             role = picks[ref][1]
             p_prio, p_dl = place_plan.get(role, (1, 12.0))
+            name = f"{ttype}#{order}({role})"
+            if track and track.ok:
+                prof = self.towers.get(ttype, {}).get("placement") \
+                    or (HERO_PLACEMENT if ttype == "hero" else {})
+                r_t = prof.get("range") or 0.06
+                sp = track.span(spot, r_t)
+                cov = (f"covers path {sp[0]:.2f}-{sp[2]:.2f} "
+                       f"({track.exposure(spot, r_t):.0%} of track)"
+                       if sp else "NO track in range")
+                spot_notes.append(
+                    f"{name} @ [{spot[0]:.2f},{spot[1]:.2f}]  {cov}")
             entry = {"do": "place", "tower": ttype,
                      "at": [spot[0], spot[1]], "ref": order,
-                     "name": f"{ttype}#{order}({role})",
+                     "name": name,
                      "prio": p_prio, "deadline": p_dl,
                      "est": base_cost(ttype)}
             if ref in base_by:
@@ -843,7 +889,8 @@ class MetaBrain:
                         entry["by"] = int(dl)  # HARD cap: pre-threat
                     entries.append(entry)
         genome = self._schedule(entries)
-        meta = {"builds": [f"{t} {l}" for _r, t, _s, _m, _c, l in placed]}
+        meta = {"builds": [f"{t} {l}" for _r, t, _s, _m, _c, l in placed],
+                "spots": spot_notes}
         return genome, meta
 
     # --------------------------------------------------------- evolution
@@ -871,6 +918,13 @@ class MetaBrain:
                      f"+r{other.get('final_round')})")
         if not towers:
             return None
+        # Crossover (and old stacked-parent rows) can put two towers on
+        # the same spot -- the game refuses that, so prune here.
+        pruned = []
+        for t in towers:
+            if all(_dist(t["at"], u["at"]) >= SEP for u in pruned):
+                pruned.append(t)
+        towers = pruned
         if hero and not any(t["tower"] == "hero" for t in towers):
             others = [(x["tower"], x["at"]) for x in towers]
             spot = self._spot_for(rng, "hero", pools,
@@ -986,8 +1040,11 @@ class MetaBrain:
         elif s.get("roles"):
             extra = f" [{', '.join(s['roles'])}]"
         spots = f" spots={s['placement']}" if s.get("placement") else ""
-        return (f"   strategy={s.get('kind', '?')}{spots}{extra}\n"
-                f"   layout: {kinds} (+{ups} upgrades)")
+        out = (f"   strategy={s.get('kind', '?')}{spots}{extra}\n"
+               f"   layout: {kinds} (+{ups} upgrades)")
+        for note in s.get("spots", []):
+            out += f"\n      {note}"
+        return out
 
     def report(self, track=None, mask_points=None):
         lines = [f"MetaBrain report -- map '{self.map_name}', "
@@ -1200,11 +1257,21 @@ def _selftest():
                  "buddy": 0, "buddy_near": 0,
                  "glue": 0, "glue_upstream": 0}
         carries = set(k["roles"]["carry"])
+        min_gap, triples = 9.9, 0
         for i in range(60):
             g = b3.next_genome(rng, 4, tpools, tower_pool=pool,
                                track=track)
             here = {x["ref"]: (x["tower"], x["at"]) for x in g
                     if x["do"] == "place"}
+            pts_here = [at for _t, at in here.values()]
+            for ai in range(len(pts_here)):
+                for bi in range(ai + 1, len(pts_here)):
+                    min_gap = min(min_gap,
+                                  _dist(pts_here[ai], pts_here[bi]))
+            counts = {}
+            for t, _at in here.values():
+                counts[t] = counts.get(t, 0) + 1
+            triples += any(v >= 3 for v in counts.values())
             spots = {t: at for t, at in here.values()}
             carry = next((t for t, _ in here.values() if t in carries),
                          None)
@@ -1231,6 +1298,10 @@ def _selftest():
                         stats["glue"] += 1
                         if gs[1] <= cs[1] + 0.06:
                             stats["glue_upstream"] += 1
+        assert min_gap >= SEP - 1e-9, \
+            f"towers planned {min_gap:.3f} apart -- stacked on each other"
+        assert triples == 0, \
+            f"{triples} exploit layouts stacked 3+ copies of one tower"
         assert stats["carry_prime"] >= 0.8 * stats["carry"], \
             f"carries not on prime real estate: {stats}"
         assert stats["buddy_near"] >= 0.8 * max(stats["buddy"], 1), \

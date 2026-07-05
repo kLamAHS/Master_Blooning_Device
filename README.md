@@ -313,6 +313,22 @@ by what it wants:
 - **Snipers / mortars** (global range) stay *off* prime spots that
   range-limited towers need.
 
+Towers keep real spacing: planned spots stay a footprint apart (more
+for supers/villages), placement retries never target a spot another
+tower already holds, and duplicate tower types get sharply diminishing
+sampling weight — a second glue is occasionally right, a third 000 glue
+never is. Coverage towers also prefer *early* track when the flow is
+known: damage near the entry leaves room for error, a defense camped at
+the exit pops with zero margin. Every episode prints its reasoning per
+tower —
+
+```
+glue#0(control) @ [0.70,0.55]  covers path 0.31-0.43 (4% of track)
+boomerang#1(carry) @ [0.58,0.60]  covers path 0.21-0.64 (12% of track)
+```
+
+— so a misplaced tower is visible at a glance instead of a mystery.
+
 One thing pixels can't tell: which end of the track is the entry. So
 `farm` senses it — on its first episode the map is empty, and the first
 thing that moves near the track *is* the bloons entering. The result is
