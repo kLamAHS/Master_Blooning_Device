@@ -541,11 +541,30 @@ decoration.
   the attempt repairs.
 
 The end-to-end loop is regression-tested offline against a simulated
-game (`python tools/simulate_solve.py --seeds 5 --ablate`): the real
-brain/policy/repair stack must beat a hidden-quirk CHIMPS sim on every
-seed, and the `--ablate` flag re-runs each seed with learning disabled
-to prove the learning is pulling its weight (currently: ~9.5 episodes
-to win with learning vs ~20 without, 10/10 seeds).
+game:
+
+```
+python tools/simulate_solve.py --seeds 10 --episodes 120 --ablate
+```
+
+The real brain/policy/repair stack must beat a hidden-quirk CHIMPS sim
+(each seed hides a different "only this carry works here" quirk no prior
+can know) on every seed, and the `--ablate` flag re-runs each seed with
+learning disabled to prove the learning pulls its weight. Two measured
+results, both reproducible with the command above:
+
+- **Robustness (the headline).** At the tighter default 60-episode
+  budget, learning solves all 10/10 seeds while prior-only search fails
+  the hidden-quirk seeds it can't stumble into (typically 2/10 unsolved
+  in budget). Learning's real value is finding the off-meta core the
+  map demands, not a faster easy win.
+- **Speed.** At a generous 120-episode budget where prior-only search
+  eventually solves every seed too, learning still gets there ~2.5×
+  faster — mean **8.1** episodes vs **20.1** without.
+
+(Beware the ablation's mean-episodes number at tight budgets: it
+averages only the seeds it *did* solve — the easy ones — so it can read
+deceptively low while quietly abandoning the hard maps.)
 
 ## Plan file format
 
