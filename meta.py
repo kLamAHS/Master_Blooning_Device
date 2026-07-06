@@ -1459,19 +1459,29 @@ class MetaBrain:
             solvers = self.solutions[kind]
             now = [(t["tower"], t["path"]) for t in towers]
             if covers(kind, originals):
-                # It HAD the answer and still died: deepen it.
+                # It HAD the answer and still died: deepen it -- but
+                # never at the cost of the champion's own deep path.
+                # Pushing a tier-2 crosspath answer to tier 3 makes it
+                # the tower's ONLY deep path and _merge_need would cap
+                # the tier-4/5 main down to 2: the "repair" would gut
+                # the very build being attempted. Such towers are
+                # skipped; the carry reinforcement below covers them.
                 for t in towers:
                     req = solvers.get(t["tower"], "absent")
-                    if req is not None and req != "absent" \
-                            and t["path"][req[0]] >= req[1] \
-                            and t["path"][req[0]] < 5 \
-                            and not is_locked(t["tower"], req[0],
-                                              t["path"][req[0]] + 1):
-                        t["path"] = self._merge_need(
-                            t["path"], req[0], t["path"][req[0]] + 1)
-                        fixes.append(f"deepen:{t['tower']} vs {kind}")
-                        boosted = True
-                        break
+                    if req is None or req == "absent":
+                        continue
+                    cur = t["path"][req[0]]
+                    if not (cur >= req[1] and cur < 5) \
+                            or is_locked(t["tower"], req[0], cur + 1):
+                        continue
+                    if cur + 1 > 2 and any(q != req[0] and t["path"][q] > 2
+                                           for q in range(3)):
+                        continue      # would cannibalize the main path
+                    t["path"] = self._merge_need(t["path"], req[0],
+                                                 cur + 1)
+                    fixes.append(f"deepen:{t['tower']} vs {kind}")
+                    boosted = True
+                    break
             elif covers(kind, now):
                 # It died BECAUSE the answer was missing, and the
                 # coverage pass above just added it -- that IS the
@@ -2214,6 +2224,37 @@ def _selftest():
                    bA2.last_strategy["mutations"]), \
             f"owned answer that failed must deepen: " \
             f"{bA2.last_strategy['mutations']}"
+
+        # Deepen must NEVER gut the champion's own deep path: a tier-2
+        # CROSSPATH threat answer (boomerang's lead = bottom [2,2]) on a
+        # tower whose main is tier 4 must not be pushed to tier 3, which
+        # would cap the tier-4 main down to tier 2. The repair falls
+        # through to reinforcing the carry instead.
+        bA3 = MetaBrain("selftest_map", "easy", target_round=40,
+                        explore=0.0, knowledge=k,
+                        runs_path="/nonexistent")
+        bA3.observe({"mode": "solve", "map": "selftest_map",
+                     "difficulty": "easy", "game_mode": "standard",
+                     "outcome": "defeat", "final_round": 29,
+                     "towers": [
+                         {"tower": "boomerang", "at": list(pts[10]),
+                          "path": [0, 4, 2]},
+                         {"tower": "ninja", "at": list(pts[60]),
+                          "path": [0, 2, 0]}]}, quiet=True)
+        g3 = bA3.attempt_genome(rng, tpools, track=track)
+        boom = {}
+        for x in g3:
+            if x["do"] == "place" and x["tower"] == "boomerang":
+                boom["ref"] = x["ref"]; boom["path"] = [0, 0, 0]
+        for x in g3:
+            if x["do"] == "upgrade" and x["ref"] == boom.get("ref"):
+                boom["path"][x["path"].index(1)] += 1
+        assert boom["path"][1] >= 4, \
+            f"deepen gutted the champion main: boomerang {boom['path']}"
+        assert not any(f.startswith("deepen:boomerang") for f in
+                       bA3.last_strategy["mutations"]), \
+            f"crosspath deepen should have been skipped: " \
+            f"{bA3.last_strategy['mutations']}"
         print(f"chimps/attempt OK: coverage {cstats}, attempt fixes "
               f"{fixes}")
 

@@ -106,10 +106,18 @@ class LogisticModel:
         self.std = {}
 
     def _vector(self, feats):
-        return {k: (v - self.mean.get(k, 0.0)) / self.std.get(k, 1.0)
-                for k, v in feats.items() if k in self.std}
+        # Iterate the MODEL's features, not the input's: a key missing
+        # from `feats` means raw 0 (e.g. zero ninjas), exactly as fit()
+        # treated it. Iterating the input instead silently imputed the
+        # feature MEAN for absent keys -- a layout with none of a
+        # beneficial tower could outrank one with some of it.
+        return {k: (feats.get(k, 0.0) - self.mean[k]) / self.std[k]
+                for k in self.std}
 
     def fit(self, feat_rows, targets):
+        if not feat_rows:
+            self.mean, self.std, self.w, self.b = {}, {}, {}, 0.0
+            return self          # no data: predict() returns 0.5 flat
         keys = sorted({k for f in feat_rows for k in f})
         n = len(feat_rows)
         self.mean, self.std = {}, {}
@@ -295,9 +303,14 @@ class OutcomeLearner:
             return None, "degenerate"
         return labels, "progress"
 
-    def gate(self, folds=4, rng=None):
-        """Out-of-fold AUC with stratified folds. The model may screen
-        candidates only while this reports open=True."""
+    def gate(self, folds=4, repeats=5, rng=None):
+        """Mean out-of-fold AUC over several independent stratified
+        fold shuffles. The model may screen candidates only while this
+        reports open=True. A SINGLE CV split on a few dozen episodes
+        has enough variance that shuffled-noise labels cleared the
+        threshold roughly one time in three -- averaging over repeated
+        splits is what makes the gate's promise (noise stays closed)
+        actually hold."""
         if self._gate is not None:
             return self._gate
         n = len(self.rewards)
@@ -315,31 +328,38 @@ class OutcomeLearner:
             self._gate = report
             return report
         rng = rng or random.Random(1234)
-        pos = [i for i, y in enumerate(labels) if y]
-        neg = [i for i, y in enumerate(labels) if not y]
-        rng.shuffle(pos)
-        rng.shuffle(neg)
-        folds = max(2, min(folds, len(pos), len(neg)))
-        assign = {}
-        for group in (pos, neg):
-            for j, i in enumerate(group):
-                assign[i] = j % folds
-        oof = [None] * n
-        for fold in range(folds):
-            train_idx = [i for i in range(n) if assign[i] != fold]
-            test_idx = [i for i in range(n) if assign[i] == fold]
-            m = LogisticModel().fit([self.feats[i] for i in train_idx],
-                                    [self.rewards[i] for i in train_idx])
-            for i in test_idx:
-                oof[i] = m.predict(self.feats[i])
-        auc = auc_score(oof, labels)
+        aucs = []
+        for _rep in range(repeats):
+            pos = [i for i, y in enumerate(labels) if y]
+            neg = [i for i, y in enumerate(labels) if not y]
+            rng.shuffle(pos)
+            rng.shuffle(neg)
+            k = max(2, min(folds, len(pos), len(neg)))
+            assign = {}
+            for group in (pos, neg):
+                for j, i in enumerate(group):
+                    assign[i] = j % k
+            oof = [None] * n
+            for fold in range(k):
+                train_idx = [i for i in range(n) if assign[i] != fold]
+                test_idx = [i for i in range(n) if assign[i] == fold]
+                m = LogisticModel().fit(
+                    [self.feats[i] for i in train_idx],
+                    [self.rewards[i] for i in train_idx])
+                for i in test_idx:
+                    oof[i] = m.predict(self.feats[i])
+            a = auc_score(oof, labels)
+            if a is not None:
+                aucs.append(a)
+        auc = sum(aucs) / len(aucs) if aucs else None
         report["auc"] = auc
         if auc is not None and auc >= GATE_MIN_AUC:
             report["open"] = True
-            report["why"] = (f"out-of-fold AUC {auc:.2f} on {n} episodes "
+            report["why"] = (f"mean out-of-fold AUC {auc:.2f} over "
+                             f"{len(aucs)} CV repeats on {n} episodes "
                              f"({kind} labels)")
         else:
-            report["why"] = (f"out-of-fold AUC {auc:.2f} < "
+            report["why"] = (f"mean out-of-fold AUC {auc:.2f} < "
                              f"{GATE_MIN_AUC} -- no proven skill yet"
                              if auc is not None else "AUC undefined")
         self._gate = report
@@ -501,7 +521,7 @@ def model_benefit(rows):
         m = s.get("model") or {}
         return bool(m.get("used"))
     finished = [r for r in rows
-                if r.get("outcome") in ("survived", "defeat")
+                if r.get("outcome") in ("survived", "victory", "defeat")
                 and isinstance(r.get("final_round"), int)]
     with_m = [r["final_round"] for r in finished if arm(r)]
     without = [r["final_round"] for r in finished if not arm(r)]
@@ -572,17 +592,52 @@ def _selftest():
     assert ol.score_towers(good) > ol.score_towers(bad), \
         "model failed to prefer camo coverage"
 
-    # Shuffled labels: the gate must CLOSE (no fake skill).
-    shuffled = [dict(r) for r in rows]
-    outcomes = [(r["outcome"], r["final_round"]) for r in shuffled]
-    rng.shuffle(outcomes)
-    for r, (o, fr) in zip(shuffled, outcomes):
-        r["outcome"], r["final_round"] = o, fr
-    ol2 = OutcomeLearner(knowledge)
-    ol2.prepare(shuffled, reward_fn, target_round=40)
-    g2 = ol2.gate()
-    assert not g2["open"] or g2["auc"] < 0.75, \
-        f"gate opened confidently on noise: {g2}"
+    # Shuffled labels: the gate must CLOSE, and not by luck -- three
+    # independent shuffles, every one strictly below the threshold.
+    # (A single 4-fold split used to clear 0.62 on pure noise about
+    # one time in three; the repeated-CV mean is what fixed it.)
+    for shuffle_seed in (11, 12, 13):
+        srng = random.Random(shuffle_seed)
+        shuffled = [dict(r) for r in rows]
+        outcomes = [(r["outcome"], r["final_round"]) for r in shuffled]
+        srng.shuffle(outcomes)
+        for r, (o, fr) in zip(shuffled, outcomes):
+            r["outcome"], r["final_round"] = o, fr
+        ol2 = OutcomeLearner(knowledge)
+        ol2.prepare(shuffled, reward_fn, target_round=40)
+        g2 = ol2.gate()
+        assert not g2["open"] and g2["auc"] < GATE_MIN_AUC, \
+            f"gate opened on shuffled noise (seed {shuffle_seed}): {g2}"
+
+    # Missing feature keys mean raw ZERO, not the feature mean: a
+    # layout with none of a beneficial tower must score below one with
+    # enough of it (this was a real non-monotone-encoding bug).
+    mono_rows = []
+    for i in range(24):
+        cnt = i % 4
+        mono_rows.append({
+            "outcome": "survived" if cnt >= 2 else "defeat",
+            "final_round": 40 if cnt >= 2 else 20,
+            "towers": [{"tower": "dart", "at": [0.4, 0.4],
+                        "path": [1, 0, 0]}] * max(cnt, 1)
+            if cnt else [{"tower": "bomb", "at": [0.4, 0.4],
+                          "path": [1, 0, 0]}]})
+    ol_m = OutcomeLearner(knowledge)
+    ol_m.prepare(mono_rows, reward_fn, target_round=40)
+    ol_m.train_full()
+    none_of = ol_m.score_towers([{"tower": "bomb", "at": [0.4, 0.4],
+                                  "path": [1, 0, 0]}])
+    lots_of = ol_m.score_towers([{"tower": "dart", "at": [0.4, 0.4],
+                                  "path": [1, 0, 0]}] * 3)
+    assert lots_of > none_of, \
+        f"missing-key encoding broken: none={none_of} >= lots={lots_of}"
+
+    # Zero usable rows: scoring degrades to 0.5, never crashes.
+    ol_e = OutcomeLearner(knowledge)
+    ol_e.prepare([], reward_fn)
+    assert not ol_e.gate()["open"]
+    assert abs(ol_e.score_towers([{"tower": "dart", "at": [0.1, 0.1],
+                                   "path": [0, 0, 0]}]) - 0.5) < 1e-9
 
     # Too little data: gate closed.
     ol3 = OutcomeLearner(knowledge)
@@ -641,17 +696,21 @@ def _selftest():
     assert threat_near(25, threats)["kind"] == "camo"
     assert threat_near(50, threats) is None
 
-    # Benefit report needs both arms.
+    # Benefit report needs both arms, and solve-mode wins ('victory')
+    # must count -- dropping them hid exactly the episodes where
+    # screening worked.
     assert model_benefit(dead) is None
-    mixed = ([{"outcome": "defeat", "final_round": 20,
+    mixed = ([{"outcome": "victory", "final_round": 100,
                "strategy": {"model": {"used": True}}}] * 4
              + [{"outcome": "defeat", "final_round": 10,
                  "strategy": {}}] * 4)
     b = model_benefit(mixed)
-    assert b and b["screened_mean_round"] > b["unscreened_mean_round"]
+    assert b and b["screened_mean_round"] == 100.0 \
+        and b["unscreened_mean_round"] == 10.0
 
     print("learner selftest OK: gate opens on signal, stays closed on")
-    print("noise and tiny data; model prefers threat coverage; income")
+    print("noise (3 shuffles, strict) and tiny data; missing-key")
+    print("encoding is monotone; model prefers threat coverage; income")
     print("curve learns a slow economy and stays monotone; hazard maps")
     print("death clusters to known threats.")
 

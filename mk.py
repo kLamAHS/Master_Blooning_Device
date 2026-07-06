@@ -2561,9 +2561,16 @@ def run_episode(screen, cfg, genome, final_round, abort_lives=50,
         if (lives == 0 and prev_lives == 0) or zero_streak >= 3:
             outcome = "defeat"                # defeat screen (HUD stays!)
             break
-        if abort_lives and lives is not None and 0 < lives < abort_lives:
+        near_final = (play_out and last_round is not None
+                      and last_round >= final_round - 1)
+        if abort_lives and lives is not None and 0 < lives < abort_lives \
+                and not near_final:
             # A lost cause: abort while the game is LIVE, so the restart
-            # takes the pause route -- the one with a proven field record.
+            # takes the pause route -- the one with a proven field
+            # record. But NEVER abort on (or one short of) the final
+            # round of a play-out: a champion that reaches round 80 with
+            # 40 lives is about to WIN, not to be written off -- let it
+            # finish so the victory actually registers.
             print(f"   lives {lives} < {abort_lives}: aborting this "
                   f"episode early")
             outcome = "defeat"
@@ -2846,43 +2853,49 @@ def run_episode(screen, cfg, genome, final_round, abort_lives=50,
                                 print(f"   giving up on an upgrade ({st})")
                                 queue.pop(idx)
 
-        endgame_watch = (play_out and last_round is not None
-                         and last_round >= final_round)
-        # During the endgame watch, a dark counter with READABLE lives
-        # is a stuck ghost/panel (the victory screen covers the whole
-        # HUD, lives included) -- those still get cleared. Only the
-        # everything-dark state is left alone: poking at a victory
-        # screen navigates menus blindly.
-        if misreads == 12 and not (endgame_watch and lives is None):
+        endgame = (play_out and last_round is not None
+                   and last_round >= final_round)
+        if misreads == 12:                    # HUD covered a while
             if looks_defeated(screen):
                 dbg("DEFEAT screen recognized (via dark counter)")
                 outcome = "defeat"
                 break
             dbg("counter dark for a while -- clearing UI")
-            clear_ui(screen, cfg)
+            restored = clear_ui(screen, cfg)
+            if endgame and not restored:
+                # The HUD stayed covered THROUGH a clear attempt on the
+                # final round, and it is NOT the defeat screen. A
+                # transient overlay (a stuck ghost, a level-up/reward
+                # popup) would have been dismissed by clear_ui and the
+                # HUD would be back. Only the victory screen -- the game
+                # is over, there is no live HUD left to restore --
+                # survives this. That is the win. (Requiring the clear
+                # to FAIL is what stops a dismissible popup from faking
+                # a victory the way a bare misread count would.)
+                dbg("HUD stayed covered through a clear on the final "
+                    "round with no defeat screen -- victory screen")
+                outcome = "survived"
+                break
         if last_round is not None and last_round >= final_round:
             if not play_out:
                 outcome = "survived"
                 break
-            # Play THROUGH the final round: the victory screen covers
-            # the WHOLE HUD -- round counter unreadable AND lives
-            # unreadable, with no defeat screen (the defeat screen
-            # keeps the round counter visible, and a mere stuck ghost
-            # keeps lives visible). As a last resort, a final round
-            # that sat finished for minutes counts too -- a leak on
-            # the final round still hits the defeat/lives checks
-            # above first.
-            final_seen = final_seen or time.time()
-            if misreads >= 8 and lives is None and prev_lives is None:
-                dbg("whole HUD covered after the final round with no "
-                    "defeat screen -- that's the victory screen")
-                outcome = "survived"
-                break
-            if time.time() - final_seen > 240:
-                dbg("final round stable for 4 minutes with lives up -- "
-                    "counting it as survived")
-                outcome = "survived"
-                break
+            # Safety net for a win the covered-HUD path above missed:
+            # the final round is reached, every planned buy is done, and
+            # the counter has sat unchanged for minutes with lives never
+            # hitting 0 (a real leak trips the defeat/lives checks
+            # first). Gated on an empty queue so it can never fire
+            # mid-plan while the round is legitimately still grinding
+            # through the build.
+            if not queue:
+                final_seen = final_seen or time.time()
+                if time.time() - final_seen > 240:
+                    dbg("final round + build complete, counter stable "
+                        "4 min, lives up -- counting as survived")
+                    outcome = "survived"
+                    break
+            else:
+                final_seen = None
         else:
             final_seen = None
         if misreads >= 25:                    # HUD truly gone: unknown state
@@ -3049,24 +3062,44 @@ def make_flow_sensor(screen, track, mask_path):
     return sensor
 
 
+def _stable_round(screen, cfg, tries=6):
+    """A round value confirmed by two consecutive equal reads, retried
+    up to `tries` times. One flaky read used to collapse the starting
+    round to 1 and misclassify CHIMPS (starts r6) as impoppable (r3)."""
+    prev = None
+    for _ in range(tries):
+        v = read_round(screen, cfg)[0]
+        if v is not None and v == prev:
+            return v
+        prev = v
+        time.sleep(0.25)
+    return prev
+
+
 def detect_loaded_rung(screen, cfg, flag_difficulty=None,
                        flag_mode=None):
     """What game is actually loaded? Starting lives pin the difficulty
     (200/150/100 = easy/medium/hard, 1 = a one-life mode) and the
     starting round separates CHIMPS (starts at round 6) from impoppable
     (round 3). Returns (lives, start_round, difficulty, game_mode) --
-    explicit flags always win over detection."""
+    explicit flags always win over detection.
+
+    The observed round only SEEDS detection; once the rung is known
+    (detected or forced by flags), its canonical start round from
+    campaign.RUNG_INFO is authoritative, so a single flaky OCR read at
+    detection time can't send the whole run down the wrong ladder."""
     import campaign
     lv = read_lives(screen, cfg)
-    r1 = read_round(screen, cfg)[0]
-    time.sleep(0.3)
-    r2 = read_round(screen, cfg)[0]
-    start_round = r1 if (r1 is not None and r1 == r2 and r1 <= 6) else 1
-    rung = campaign.detect_rung(lv, start_round)
+    seen = _stable_round(screen, cfg)
+    seed_round = seen if (seen is not None and seen <= 6) else 1
+    rung = campaign.detect_rung(lv, seed_round)
     difficulty = flag_difficulty or (rung[0] if rung else None)
     game_mode = flag_mode or (rung[1] if rung else "standard")
+    # Canonical start round for the resolved rung wins over the read.
+    start_round = campaign.rung_start(difficulty, game_mode) \
+        if difficulty else seed_round
     if rung and flag_difficulty and rung[0] != flag_difficulty:
-        print(f"NOTE: HUD ({lv} lives, start r{start_round}) suggests "
+        print(f"NOTE: HUD ({lv} lives, start r{seed_round}) suggests "
               f"'{rung[0]}/{rung[1]}' but --difficulty "
               f"{flag_difficulty} was given -- using the flag.")
     return lv, start_round, difficulty, game_mode
@@ -3137,12 +3170,21 @@ def cmd_farm(args):
               f"{args.difficulty}/{game_mode} (--final-round "
               f"overrides).")
 
-    if lv is not None and args.abort_lives and lv <= args.abort_lives:
+    rung_lives = campaign.RUNG_INFO.get(
+        (args.difficulty, game_mode), {}).get("lives")
+    one_life = (game_mode == "chimps" or args.difficulty == "impoppable"
+                or (rung_lives is not None and rung_lives <= 3)
+                or (lv is not None and lv <= 3))
+    if args.abort_lives and one_life:
         # A 1-life mode with --abort-lives 50 would abort every episode
         # on sight ("0 < 1 < 50"). Any leak already ends those games.
-        print(f"abort-lives {args.abort_lives} >= starting lives {lv} "
-              f"-- disabling the early-abort (defeat itself is the "
-              f"signal here).")
+        # Keyed on the RUNG, not just the lives read, so an unreadable
+        # startup lives count on a chimps/impoppable rung still disables
+        # it instead of insta-aborting once per-episode calibration
+        # recovers the "1".
+        print(f"one-life rung ({args.difficulty}/{game_mode}) -- "
+              f"disabling the early-abort (defeat itself is the signal "
+              f"here).")
         args.abort_lives = 0
 
     if start_round != 1:
@@ -3338,7 +3380,16 @@ def cmd_solve(args):
     PRICE_DIFFICULTY = difficulty
     target = args.final_round or campaign.rung_target(difficulty,
                                                       game_mode)
-    one_life = lv is not None and lv <= 3
+    # One-life is a property of the RUNG, not of one startup lives read.
+    # Deriving it from `lv` alone meant an unreadable-lives launch (the
+    # very case the preflight tells the user to fix with --mode chimps)
+    # kept abort_lives=50, and the per-episode recalibration then read
+    # 1 life and insta-aborted every episode as "0 < 1 < 50".
+    rung_lives = campaign.RUNG_INFO.get((difficulty, game_mode), {}) \
+        .get("lives")
+    one_life = (game_mode == "chimps" or difficulty == "impoppable"
+                or (rung_lives is not None and rung_lives <= 3)
+                or (lv is not None and lv <= 3))
     abort_lives = 0 if one_life else args.abort_lives
     rung_name = difficulty if game_mode == "standard" else game_mode
     print(f"Rung: {args.name} / {rung_name} -- survive round {target} "
@@ -3447,9 +3498,15 @@ def cmd_solve(args):
         brain.observe(row)
         policy.update(brain._reward(row),
                       was_attempt=decision["kind"] == "attempt")
-        progress.record_episode(
-            args.name, difficulty, game_mode, outcome, reached,
-            was_attempt=decision["kind"] == "attempt")
+        try:
+            progress.record_episode(
+                args.name, difficulty, game_mode, outcome, reached,
+                was_attempt=decision["kind"] == "attempt")
+        except Exception:
+            # progress.json is a convenience scoreboard, not the run --
+            # a transient file lock (Windows AV/editor/OneDrive) must
+            # not crash an unattended session or skip the restart.
+            _log_crash(f"solve episode {ep} (progress write)")
         if outcome == "victory":
             victory = True
             break
