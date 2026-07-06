@@ -21,6 +21,12 @@ Subcommands
   farm <map_name>      STAGE 2: play random layouts unattended, restarting
                        between games, logging (layout, final_round,
                        outcome) to runs_log.jsonl -- the training dataset.
+  solve <map_name>     STAGE 4: play to WIN the loaded rung (difficulty
+                       and mode auto-detected, CHIMPS included) --
+                       explore/attempt episodes until the final round is
+                       actually beaten, then record it in progress.json.
+  campaign             Show the per-map ladder scoreboard (easy ->
+                       medium -> hard -> CHIMPS) from progress.json.
 
 Safety
 ------
@@ -51,7 +57,7 @@ import numpy as np
 import mss
 import pyautogui
 
-BUILD = "2026-07-06.r9"   # printed at startup: ties every log to a build
+BUILD = "2026-07-06.r10"  # printed at startup: ties every log to a build
 
 DEBUG = True     # verbose decision logging; pass --quiet to farm/play
 
@@ -155,6 +161,10 @@ DEFAULT_CONFIG = {
     # invalid-tint typically scores 20-60, valid ground scores near 0.
     # Tune only if the scan preview disagrees with the map.
     "scan_red_shift": 12.0,
+
+    # Ability hotkeys pressed on threat rounds / leak emergencies by
+    # farm and solve. Pressing them with no ability trained is a no-op.
+    "ability_keys": ["1", "2", "3"],
 
     # Full path to the tesseract binary if it is not on PATH (Windows
     # usually needs this). null = try to auto-detect.
@@ -2390,13 +2400,24 @@ def random_genome(rng, n_towers, hero=False):
 
 
 def run_episode(screen, cfg, genome, final_round, abort_lives=50,
-                flow_sensor=None):
-    """Play one random layout to survival or defeat. Returns
-    (outcome, final_round_reached, towers, lives_by_round).
+                flow_sensor=None, play_out=False, danger_rounds=None,
+                abilities=False):
+    """Play one layout to survival or defeat. Returns (outcome,
+    final_round_reached, towers, lives_by_round, cash_by_round,
+    spent_by_round).
     flow_sensor, when given, is called once with the pre-start clean
     frame right after the round starts -- its window to watch where the
     first bloons appear (nothing has been bought yet, so leaking a few
-    seconds of round 1 costs nothing)."""
+    seconds of round 1 costs nothing).
+    play_out: don't declare survival at the START of the final round --
+    play THROUGH it and only call it survived once the victory screen
+    covers the HUD (or the final round has sat finished for minutes).
+    That is the difference between farming a target and actually
+    BEATING the game, where round 100's BAD dies or you do.
+    danger_rounds + abilities: on known threat rounds (and during leak
+    emergencies) press the ability hotkeys every few seconds -- a free
+    no-op when nothing is trained, exactly how a player dumps abilities
+    on r24/r63/r90+."""
     # (Re)calibrate sensors on the clean, un-started map -- the best frame
     # we'll ever get. Cash preflight runs UNCONDITIONALLY: a box that
     # clips the leading digit still 'reads', and only the digit snap
@@ -2427,9 +2448,18 @@ def run_episode(screen, cfg, genome, final_round, abort_lives=50,
     queue = list(genome)
     landed_by_ref, towers = {}, {}
     lives_by_round = {}
+    cash_by_round = {}       # cash at the start of each round (telemetry
+    spent_by_round = {}      # for the learned income curve)
     broke_at = [None, 0.0]   # cash watermark: level + time of last set
     emergency_until = [0.0]  # leak emergency: reserves off until this time
     prev_round_lives = [None]
+    last_ping = [0.0]        # ability-hotkey pinger cooldown
+    final_seen = None        # play_out: when the final round was reached
+
+    def record_spend(amount):
+        if amount:
+            key = str(last_round if last_round is not None else 0)
+            spent_by_round[key] = spent_by_round.get(key, 0) + amount
 
     def set_watermark(price=None):
         """Record the cash level of a money-failure. Being broke for a
@@ -2498,6 +2528,9 @@ def run_episode(screen, cfg, genome, final_round, abort_lives=50,
                 last_round = accepted
                 if lives is not None:
                     lives_by_round[str(last_round)] = lives
+                cash_now = read_cash(screen, cfg)
+                if cash_now is not None:
+                    cash_by_round[str(last_round)] = cash_now
                 print(f"   [round {last_round:>3}]  lives={lives}  "
                       f"({len(queue)} buys pending)")
                 if lives is not None and prev_round_lives[0] is not None \
@@ -2558,6 +2591,17 @@ def run_episode(screen, cfg, genome, final_round, abort_lives=50,
                 dbg("DEFEAT screen recognized visually")
                 outcome = "defeat"
                 break
+
+        # Abilities: on known threat rounds and during leak emergencies,
+        # ping the ability hotkeys. Untrained abilities make the presses
+        # no-ops; trained ones fire exactly when a player would use them.
+        if abilities and last_round is not None:
+            hot = (danger_rounds and last_round in danger_rounds) \
+                or time.time() < emergency_until[0]
+            if hot and time.time() - last_ping[0] > 5.0:
+                last_ping[0] = time.time()
+                for key in (cfg.get("ability_keys") or ["1", "2", "3"]):
+                    press_key(str(key))
 
         # Try the next buy (one attempt per loop, so rounds keep reading).
         if queue and last_round is not None:
@@ -2653,6 +2697,8 @@ def run_episode(screen, cfg, genome, final_round, abort_lives=50,
                         place_i += 1
                         queue.pop(idx)
                         broke_at[0] = None
+                        record_spend(PRICES.get(price_key(ttype))
+                                     or item.get("est") or 0)
                     elif st == "broke":
                         est_c = base or item.get("est")
                         lvl = read_cash_confirmed(screen, cfg)
@@ -2750,6 +2796,9 @@ def run_episode(screen, cfg, genome, final_round, abort_lives=50,
                             if st == "bought":
                                 queue.pop(idx)
                                 broke_at[0] = None
+                                record_spend(
+                                    PRICES.get(price_key(ttype, pi, tier))
+                                    or item.get("est") or 0)
                             elif st in ("locked", "closed"):
                                 queue.pop(idx)
                             else:
@@ -2777,6 +2826,9 @@ def run_episode(screen, cfg, genome, final_round, abort_lives=50,
                             queue.pop(idx)
                             broke_at[0] = None
                             attempts = 0
+                            record_spend(
+                                PRICES.get(price_key(ttype, pi, tier))
+                                or item.get("est") or 0)
                         elif st in ("locked", "closed"):
                             queue.pop(idx)     # recorded; done with it
                         elif st == "broke":
@@ -2794,7 +2846,9 @@ def run_episode(screen, cfg, genome, final_round, abort_lives=50,
                                 print(f"   giving up on an upgrade ({st})")
                                 queue.pop(idx)
 
-        if misreads == 12:                    # stuck panel? try to clear
+        endgame_watch = (play_out and last_round is not None
+                         and last_round >= final_round)
+        if misreads == 12 and not endgame_watch:  # stuck panel? clear it
             if looks_defeated(screen):
                 dbg("DEFEAT screen recognized (via dark counter)")
                 outcome = "defeat"
@@ -2802,8 +2856,29 @@ def run_episode(screen, cfg, genome, final_round, abort_lives=50,
             dbg("counter dark for a while -- clearing UI")
             clear_ui(screen, cfg)
         if last_round is not None and last_round >= final_round:
-            outcome = "survived"
-            break
+            if not play_out:
+                outcome = "survived"
+                break
+            # Play THROUGH the final round: the victory screen covers
+            # the round counter (misreads climb while no defeat screen
+            # shows), or the counter just sits on the final number for
+            # minutes after the last buy. Both mean the game is WON --
+            # a leak on the final round still hits the defeat/lives
+            # checks above first. No UI-clearing in this state: poking
+            # at a victory screen navigates menus blindly.
+            final_seen = final_seen or time.time()
+            if misreads >= 8:
+                dbg("HUD covered after the final round with no defeat "
+                    "screen -- that's the victory screen")
+                outcome = "survived"
+                break
+            if time.time() - final_seen > 240:
+                dbg("final round stable for 4 minutes with lives up -- "
+                    "counting it as survived")
+                outcome = "survived"
+                break
+        else:
+            final_seen = None
         if misreads >= 25:                    # HUD truly gone: unknown state
             break
         if not queue and not observing:
@@ -2812,7 +2887,8 @@ def run_episode(screen, cfg, genome, final_round, abort_lives=50,
         time.sleep(1.2 if observing else 0.6)
     clean = [{k: v for k, v in t.items() if not k.startswith("_")}
              for t in towers.values()]
-    return outcome, last_round, clean, lives_by_round
+    return (outcome, last_round, clean, lives_by_round,
+            cash_by_round, spent_by_round)
 
 
 def _wait_until(cond, timeout, poll=0.3):
@@ -2941,6 +3017,55 @@ def _log_crash(where):
     print(f"Crash in {where} -- logged to crash_log.txt.")
 
 
+def make_flow_sensor(screen, track, mask_path):
+    """One-shot sensor for the bloon entry direction, or None when the
+    track is already oriented (the result is saved into the mask, so it
+    only ever runs on a map's first episode)."""
+    if track is None or track.oriented:
+        return None
+
+    def sensor(clean):
+        pt = sense_flow_entry(screen, clean, track)
+        if pt:
+            track.orient(pt)
+            try:
+                d = json.loads(mask_path.read_text())
+                d["flow_entry"] = pt
+                mask_path.write_text(json.dumps(d))
+            except Exception:
+                _log_crash("flow_entry save")
+            print(f"   flow sensed: bloons enter near "
+                  f"[{pt[0]:.2f}, {pt[1]:.2f}] -- saved to "
+                  f"{mask_path.name}")
+        else:
+            print("   flow not sensed this episode -- placement "
+                  "stays direction-agnostic, will retry")
+    return sensor
+
+
+def detect_loaded_rung(screen, cfg, flag_difficulty=None,
+                       flag_mode=None):
+    """What game is actually loaded? Starting lives pin the difficulty
+    (200/150/100 = easy/medium/hard, 1 = a one-life mode) and the
+    starting round separates CHIMPS (starts at round 6) from impoppable
+    (round 3). Returns (lives, start_round, difficulty, game_mode) --
+    explicit flags always win over detection."""
+    import campaign
+    lv = read_lives(screen, cfg)
+    r1 = read_round(screen, cfg)[0]
+    time.sleep(0.3)
+    r2 = read_round(screen, cfg)[0]
+    start_round = r1 if (r1 is not None and r1 == r2 and r1 <= 6) else 1
+    rung = campaign.detect_rung(lv, start_round)
+    difficulty = flag_difficulty or (rung[0] if rung else None)
+    game_mode = flag_mode or (rung[1] if rung else "standard")
+    if rung and flag_difficulty and rung[0] != flag_difficulty:
+        print(f"NOTE: HUD ({lv} lives, start r{start_round}) suggests "
+              f"'{rung[0]}/{rung[1]}' but --difficulty "
+              f"{flag_difficulty} was given -- using the flag.")
+    return lv, start_round, difficulty, game_mode
+
+
 def cmd_farm(args):
     cfg = load_config()
     setup_tesseract(cfg)
@@ -2986,39 +3111,36 @@ def cmd_farm(args):
               "start. Defeat detection needs it, so if episode 1 still "
               "can't read lives, stop and debug with `watch`.")
 
-    lv = read_lives(screen, cfg)
-    detected = None
-    if lv is not None:
-        for base, name in ((200, "easy"), (150, "medium"),
-                           (100, "hard"), (1, "impoppable")):
-            if abs(lv - base) <= 5:
-                detected = name
-                break
+    import campaign
+    lv, start_round, difficulty, game_mode = detect_loaded_rung(
+        screen, cfg, flag_difficulty=args.difficulty)
     if args.difficulty is None:
-        args.difficulty = detected or "easy"
-        PRICE_DIFFICULTY = args.difficulty
-        print(f"Difficulty auto-detected from {lv} starting lives: "
-              f"{args.difficulty}")
-    elif detected and detected != args.difficulty:
-        print(f"NOTE: {lv} starting lives suggests '{detected}' but "
-              f"--difficulty {args.difficulty} was given -- using the flag.")
+        args.difficulty = difficulty or "easy"
+        print(f"Rung auto-detected from {lv} starting lives / start "
+              f"round {start_round}: {args.difficulty}/{game_mode}")
+    PRICE_DIFFICULTY = args.difficulty
 
     if args.final_round is None:
         # Learn the WHOLE game, not the easy half: survival means the
-        # difficulty's real final round. Stopping at 40 on hard scored
+        # rung's real final round. Stopping at 40 on hard scored
         # half-finished runs as perfect wins and never scheduled a
         # single end-game buy.
-        args.final_round = {"easy": 40, "medium": 60, "hard": 80,
-                            "impoppable": 100}.get(args.difficulty, 40)
+        args.final_round = campaign.rung_target(args.difficulty,
+                                                game_mode)
         print(f"Target round auto-set to {args.final_round} for "
-              f"{args.difficulty} (--final-round overrides).")
+              f"{args.difficulty}/{game_mode} (--final-round "
+              f"overrides).")
 
-    r1 = read_round(screen, cfg)[0]
-    time.sleep(0.3)
-    r2 = read_round(screen, cfg)[0]
-    start_round = r1 if (r1 is not None and r1 == r2 and r1 <= 6) else 1
+    if lv is not None and args.abort_lives and lv <= args.abort_lives:
+        # A 1-life mode with --abort-lives 50 would abort every episode
+        # on sight ("0 < 1 < 50"). Any leak already ends those games.
+        print(f"abort-lives {args.abort_lives} >= starting lives {lv} "
+              f"-- disabling the early-abort (defeat itself is the "
+              f"signal here).")
+        args.abort_lives = 0
+
     if start_round != 1:
-        print(f"Game starts at round {start_round} on this difficulty -- "
+        print(f"Game starts at round {start_round} on this rung -- "
               f"restart verification will expect it.")
 
     # STAGE 3: the meta brain. Spreadsheet-derived priors + everything in
@@ -3030,19 +3152,21 @@ def cmd_farm(args):
         try:
             import meta as meta_mod
             api = getattr(meta_mod, "META_API", 0)
-            if api != 3:
+            if api != 4:
                 print("!" * 64)
-                print(f"!! meta.py reports API {api}, this mk.py needs 3.")
+                print(f"!! meta.py reports API {api}, this mk.py needs 4.")
                 print("!! You are mixing files from different versions --")
                 print("!! re-download the whole branch and delete any")
                 print("!! __pycache__ folders. Farming WITHOUT the meta")
                 print("!! brain so nothing crashes.")
                 print("!" * 64)
-                raise ImportError(f"meta API {api} != 3")
+                raise ImportError(f"meta API {api} != 4")
             brain = meta_mod.MetaBrain(args.name, args.difficulty,
                                        target_round=args.final_round,
                                        explore=args.explore,
-                                       evolve=not args.no_evolve)
+                                       evolve=not args.no_evolve,
+                                       mode=game_mode,
+                                       start_round=start_round)
             if args.pool == "full":
                 tower_pool = FARM_TOWERS + meta_mod.META_EXTRA_TOWERS
             n_map = sum(1 for r in brain.history if brain.usable(r))
@@ -3082,40 +3206,27 @@ def cmd_farm(args):
         else:
             genome = random_genome(rng, args.towers,
                                    hero=not args.no_hero)
-        sensor = None
-        if track is not None and not track.oriented:
-            def sensor(clean):
-                pt = sense_flow_entry(screen, clean, track)
-                if pt:
-                    track.orient(pt)
-                    try:
-                        d = json.loads(mask_path.read_text())
-                        d["flow_entry"] = pt
-                        mask_path.write_text(json.dumps(d))
-                    except Exception:
-                        _log_crash("flow_entry save")
-                    print(f"   flow sensed: bloons enter near "
-                          f"[{pt[0]:.2f}, {pt[1]:.2f}] -- saved to "
-                          f"{mask_path.name}")
-                else:
-                    print("   flow not sensed this episode -- placement "
-                          "stays direction-agnostic, will retry")
+        sensor = make_flow_sensor(screen, track, mask_path)
         print(f"\n=== Episode {ep}/{args.episodes}: "
               f"{sum(1 for g in genome if g['do'] == 'place')} towers, "
               f"{sum(1 for g in genome if g['do'] == 'upgrade')} upgrades")
         if brain:
             print(brain.describe_genome(genome))
+        danger = {r for t in (brain.threats if brain else [])
+                  for r in t.get("rounds", [])}
         try:
-            outcome, reached, towers, lives_by_round = run_episode(
+            (outcome, reached, towers, lives_by_round, cash_by_round,
+             spent_by_round) = run_episode(
                 screen, cfg, genome, args.final_round,
-                abort_lives=args.abort_lives, flow_sensor=sensor)
+                abort_lives=args.abort_lives, flow_sensor=sensor,
+                danger_rounds=danger, abilities=not args.no_abilities)
         except KeyboardInterrupt:
             raise
         except Exception:
             _log_crash(f"episode {ep}")
             print("Attempting to recover and continue.")
-            outcome, reached, towers, lives_by_round = ("crashed", None,
-                                                        [], {})
+            (outcome, reached, towers, lives_by_round, cash_by_round,
+             spent_by_round) = ("crashed", None, [], {}, {}, {})
             try:
                 clear_ui(screen, cfg)
             except Exception:
@@ -3124,10 +3235,15 @@ def cmd_farm(args):
         row = {"time": datetime.now().isoformat(timespec="seconds"),
                "mode": "farm", "map": args.name,
                "difficulty": args.difficulty,
+               "game_mode": game_mode,
+               "target_round": args.final_round,
+               "start_round": start_round,
                "final_round": reached, "outcome": outcome,
                "strategy": brain.last_strategy if brain
                else {"kind": "uniform"},
                "lives_by_round": lives_by_round,
+               "cash_by_round": cash_by_round,
+               "spent_by_round": spent_by_round,
                "towers": towers}
         try:
             with open(runs_path, "a") as f:
@@ -3153,17 +3269,259 @@ def cmd_farm(args):
           f"{runs_path.name}.")
 
 
+def cmd_solve(args):
+    """STAGE 4: play the loaded rung to WIN it. Detects what is loaded
+    (difficulty AND mode -- CHIMPS is one life starting at round 6),
+    then lets the campaign policy alternate exploration episodes (which
+    feed the posteriors, the outcome model, and the income curve) with
+    attempt episodes (the repaired champion played straight, zero
+    roulette) until the final round is actually survived. A victory is
+    recorded in progress.json and the per-map ladder advances."""
+    import campaign
+    try:
+        import meta as meta_mod
+    except ImportError:
+        sys.exit("solve needs meta.py next to mk.py.")
+    api = getattr(meta_mod, "META_API", 0)
+    if api != 4:
+        sys.exit(f"meta.py reports API {api}, this mk.py needs 4 -- "
+                 "re-download the whole branch and delete __pycache__.")
+
+    cfg = load_config()
+    setup_tesseract(cfg)
+    screen, hwnd = make_screen(cfg)
+    missing = [k for k in ("defeat_restart", "pause_restart",
+                           "restart_confirm") if not cfg.get(k)]
+    if missing:
+        sys.exit("solve needs the same one-time restart calibration as "
+                 f"farm. Missing in config.json: {', '.join(missing)}.\n"
+                 "See the README's farm section (three `locate` points).")
+    mask_path = find_mask_path({"map": args.name}, Path.cwd() / "_")
+    if mask_path is None:
+        sys.exit(f"No mask found for '{args.name}' -- run `scan "
+                 f"{args.name}` first.")
+    load_mask(mask_path)
+
+    global PRICE_DIFFICULTY
+    rng = random.Random(args.seed)
+    runs_path = Path(__file__).parent / "runs_log.jsonl"
+
+    print(f"Solving '{args.name}': playing until the loaded rung is "
+          f"beaten (budget {args.episodes} episodes this session).")
+    print("Load the map fresh (round not started) and walk away. "
+          "Starting in 5 seconds...")
+    focus_game_window(hwnd)
+    time.sleep(5)
+    if not preflight_round_box(screen, cfg):
+        sys.exit("Round counter unreadable -- fix with `watch` first.")
+    if not preflight_cash_box(screen, cfg):
+        print("Cash not readable yet -- will recalibrate at each "
+              "episode start.")
+    if not preflight_lives_box(screen, cfg):
+        print("Lives not readable yet -- will recalibrate at each "
+              "episode start. Rung detection needs it, so pass "
+              "--difficulty/--mode if detection fails.")
+
+    lv, start_round, difficulty, game_mode = detect_loaded_rung(
+        screen, cfg, flag_difficulty=args.difficulty,
+        flag_mode=args.mode)
+    if difficulty is None:
+        sys.exit(f"Couldn't detect the loaded difficulty (lives read "
+                 f"{lv}, start round {start_round}) -- pass "
+                 f"--difficulty (and --mode chimps if applicable).")
+    PRICE_DIFFICULTY = difficulty
+    target = args.final_round or campaign.rung_target(difficulty,
+                                                      game_mode)
+    one_life = lv is not None and lv <= 3
+    abort_lives = 0 if one_life else args.abort_lives
+    rung_name = difficulty if game_mode == "standard" else game_mode
+    print(f"Rung: {args.name} / {rung_name} -- survive round {target} "
+          f"(start r{start_round}, {lv} lives"
+          + (", early-abort off: one-life mode" if one_life else "")
+          + ").")
+    if game_mode == "chimps":
+        print("CHIMPS: pops-only income (paced by the learned income "
+              "curve), one life, no selling -- the run only counts "
+              "once round 100 actually ENDS.")
+
+    brain = meta_mod.MetaBrain(args.name, difficulty,
+                               target_round=target,
+                               explore=args.explore, evolve=True,
+                               mode=game_mode, start_round=start_round)
+    tower_pool = FARM_TOWERS + (meta_mod.META_EXTRA_TOWERS
+                                if args.pool == "full" else [])
+    mask_data = json.loads(mask_path.read_text())
+    track = meta_mod.TrackModel(mask_data)
+    if track.ok:
+        if mask_data.get("flow_entry"):
+            track.orient(mask_data["flow_entry"])
+    else:
+        track = None
+
+    progress = campaign.Progress()
+    policy = campaign.EpisodePolicy()
+    for row in brain.history:
+        was_attempt = str((row.get("strategy") or {})
+                          .get("kind", "")).startswith("attempt")
+        policy.update(brain._reward(row), was_attempt=was_attempt)
+    ol = brain._outcome_learner(track)
+    gate = ol.gate() if ol is not None else {}
+    print(f"Brain: {len(brain.history)} past episodes on this rung, "
+          f"best progress {policy.best:.2f}; outcome model "
+          f"{'OPEN' if gate.get('open') else 'closed'}"
+          + (f" (AUC {gate['auc']:.2f})" if gate.get("auc") else "")
+          + f"; elites {len(brain.elites())}.")
+
+    pools = {"near": MASK_NEAR, "mid": MASK_MID,
+             "all": MASK_POINTS, "roomy": MASK_ROOMY}
+    danger = {r for t in brain.threats for r in t.get("rounds", [])}
+
+    def price_of(t, p=None, tr=None):
+        return PRICES.get(price_key(t) if p is None
+                          else price_key(t, p, tr))
+
+    victory = False
+    for ep in range(1, args.episodes + 1):
+        decision = policy.decide(rng)
+        brain.explore = decision["explore"]
+        genome = None
+        if decision["kind"] == "attempt":
+            genome = brain.attempt_genome(
+                rng, pools, is_locked=is_locked,
+                large_towers=LARGE_TOWERS, tower_pool=tower_pool,
+                price_of=price_of, track=track, hero=not args.no_hero)
+        if genome is None:
+            brain.explore = decision["explore"]
+            genome = brain.next_genome(
+                rng, args.towers, pools, is_locked=is_locked,
+                large_towers=LARGE_TOWERS, tower_pool=tower_pool,
+                price_of=price_of, track=track, hero=not args.no_hero,
+                novelty=decision.get("novelty", False))
+        sensor = make_flow_sensor(screen, track, mask_path)
+        print(f"\n=== Episode {ep}/{args.episodes} "
+              f"[{decision['kind']}, explore "
+              f"{decision['explore']:.2f}]")
+        print(brain.describe_genome(genome))
+        try:
+            (outcome, reached, towers, lives_by_round, cash_by_round,
+             spent_by_round) = run_episode(
+                screen, cfg, genome, target, abort_lives=abort_lives,
+                flow_sensor=sensor, play_out=True,
+                danger_rounds=danger,
+                abilities=not args.no_abilities)
+        except KeyboardInterrupt:
+            raise
+        except Exception:
+            _log_crash(f"solve episode {ep}")
+            print("Attempting to recover and continue.")
+            (outcome, reached, towers, lives_by_round, cash_by_round,
+             spent_by_round) = ("crashed", None, [], {}, {}, {})
+            try:
+                clear_ui(screen, cfg)
+            except Exception:
+                _log_crash(f"solve episode {ep} (recovery clear_ui)")
+        if outcome == "survived":
+            outcome = "victory"   # play_out=True means round N ENDED
+        print(f"=== Episode {ep}: {outcome} at round {reached}")
+        row = {"time": datetime.now().isoformat(timespec="seconds"),
+               "mode": "solve", "map": args.name,
+               "difficulty": difficulty, "game_mode": game_mode,
+               "target_round": target, "start_round": start_round,
+               "final_round": reached, "outcome": outcome,
+               "strategy": brain.last_strategy,
+               "lives_by_round": lives_by_round,
+               "cash_by_round": cash_by_round,
+               "spent_by_round": spent_by_round,
+               "towers": towers}
+        try:
+            with open(runs_path, "a") as f:
+                f.write(json.dumps(row) + "\n")
+        except Exception:
+            _log_crash(f"solve episode {ep} (dataset write)")
+        brain.observe(row)
+        policy.update(brain._reward(row),
+                      was_attempt=decision["kind"] == "attempt")
+        progress.record_episode(
+            args.name, difficulty, game_mode, outcome, reached,
+            was_attempt=decision["kind"] == "attempt")
+        if outcome == "victory":
+            victory = True
+            break
+        if ep < args.episodes:
+            try:
+                focus_game_window(hwnd)
+                ok = restart_game(screen, cfg, outcome,
+                                  start_round=start_round)
+            except Exception:
+                _log_crash(f"solve episode {ep} (restart)")
+                ok = False
+            if not ok:
+                sys.exit("Couldn't restart into a fresh game -- all "
+                         "progress is saved; check the restart "
+                         "calibration points in config.json.")
+
+    print()
+    if victory:
+        print(f"*** {args.name} / {rung_name} BEATEN -- round {target} "
+              f"survived. ***")
+        nxt = progress.next_rung(args.name)
+        if nxt:
+            nxt_name = nxt[0] if nxt[1] == "standard" else nxt[1]
+            print(f"Next rung: load {args.name} on '{nxt_name}' and "
+                  f"run `python mk.py solve {args.name}` again -- "
+                  f"everything learned carries over.")
+        else:
+            print(f"{args.name} is COMPLETE -- every rung up through "
+                  f"CHIMPS beaten. Scan a new map and keep climbing.")
+    else:
+        best = progress.rung(args.name, difficulty,
+                             game_mode)["best_round"]
+        print(f"Budget exhausted without a win -- deepest round so far "
+              f"{best}/{target}. Everything learned is saved: run "
+              f"`solve` again to keep going, or `learn {args.name}` to "
+              f"see what the brain believes.")
+    print()
+    for line in progress.board([args.name]):
+        print(line)
+
+
+def cmd_campaign(args):
+    """Offline: the ladder scoreboard. Maps come from masks/ (one scan
+    per map = the bot can play it) plus anything already recorded in
+    progress.json."""
+    import campaign
+    progress = campaign.Progress()
+    maps = set()
+    d = Path(__file__).parent / "masks"
+    if d.is_dir():
+        for p in sorted(d.glob("*.json")):
+            stem = p.stem
+            for suffix in ("_dart", "_sub"):
+                if stem.endswith(suffix):
+                    stem = stem[: -len(suffix)]
+            maps.add(stem)
+    maps |= {key.split("|")[0] for key in progress.data["rungs"]}
+    if not maps:
+        print("No maps known yet -- `scan <map>` one, then `solve` it.")
+        return
+    for line in progress.board(sorted(maps)):
+        print(line)
+
+
 def cmd_learn(args):
-    """Offline: show the meta brain's current beliefs for a map -- which
+    """Offline: show the meta brain's current beliefs for a rung -- which
     towers its own episodes confirm or contradict the spreadsheet on,
-    the elite layouts evolution draws from, where defenses die, and the
-    map's prime real estate if a scan mask exists."""
+    the elite layouts evolution draws from, where defenses die, whether
+    the outcome model has earned its vote, and the map's prime real
+    estate if a scan mask exists."""
+    import campaign
     import meta as meta_mod
-    target = args.final_round or {"easy": 40, "medium": 60, "hard": 80,
-                                  "impoppable": 100}.get(args.difficulty,
-                                                         40)
+    target = args.final_round or campaign.rung_target(args.difficulty,
+                                                      args.mode)
     brain = meta_mod.MetaBrain(args.name, args.difficulty,
-                               target_round=target)
+                               target_round=target, mode=args.mode,
+                               start_round=campaign.rung_start(
+                                   args.difficulty, args.mode))
     track = mask_pts = None
     mask_path = find_mask_path({"map": args.name}, Path.cwd() / "_")
     if mask_path:
@@ -3443,23 +3801,76 @@ def main():
                              "original 10 land towers; full also allows "
                              "boomerang/mortar/spike/village/super/"
                              "engineer (default: full)")
+    p_farm.add_argument("--no-abilities", action="store_true",
+                        dest="no_abilities",
+                        help="don't press ability hotkeys on threat "
+                             "rounds")
     p_farm.add_argument("-q", "--quiet", action="store_true",
                         help="suppress per-decision debug output")
+    p_solve = sub.add_parser(
+        "solve", help="STAGE 4: play the loaded rung until it is "
+                      "actually BEATEN (difficulty + mode auto-"
+                      "detected, CHIMPS included)")
+    p_solve.add_argument("name", help="map name matching your mask, "
+                                      "e.g. monkey_meadow")
+    p_solve.add_argument("--episodes", type=int, default=40,
+                         help="episode budget for this session "
+                              "(default: 40); progress persists either "
+                              "way")
+    p_solve.add_argument("--towers", type=int, default=5,
+                         help="towers per fresh layout (default: 5)")
+    p_solve.add_argument("--difficulty", default=None,
+                         choices=["easy", "medium", "hard",
+                                  "impoppable"],
+                         help="override the lives-based detection")
+    p_solve.add_argument("--mode", default=None,
+                         choices=["standard", "chimps"],
+                         help="override the mode detection (chimps = "
+                              "1 life starting at round 6)")
+    p_solve.add_argument("--final-round", type=int, default=None,
+                         dest="final_round",
+                         help="override the rung's final round")
+    p_solve.add_argument("--explore", type=float, default=0.20,
+                         help="base exploration rate (the campaign "
+                              "policy adjusts it per episode)")
+    p_solve.add_argument("--abort-lives", type=int, default=50,
+                         help="abort exploration episodes below this "
+                              "many lives (auto-disabled on one-life "
+                              "modes; 0 disables)")
+    p_solve.add_argument("--seed", type=int, default=None)
+    p_solve.add_argument("--no-hero", action="store_true",
+                         dest="no_hero",
+                         help="don't place the equipped hero")
+    p_solve.add_argument("--no-abilities", action="store_true",
+                         dest="no_abilities",
+                         help="don't press ability hotkeys on threat "
+                              "rounds")
+    p_solve.add_argument("--pool", choices=["classic", "full"],
+                         default="full")
+    p_solve.add_argument("-q", "--quiet", action="store_true",
+                         help="suppress per-decision debug output")
+    sub.add_parser(
+        "campaign", help="show the per-map ladder scoreboard "
+                         "(easy -> medium -> hard -> CHIMPS)")
     p_learn = sub.add_parser(
         "learn", help="STAGE 3: report what the meta brain has learned "
                       "from runs_log.jsonl (no game needed)")
     p_learn.add_argument("name", help="map name, e.g. monkey_meadow")
     p_learn.add_argument("--difficulty", default="easy")
+    p_learn.add_argument("--mode", default="standard",
+                         choices=["standard", "chimps"],
+                         help="which rung's beliefs to report")
     p_learn.add_argument("--final-round", type=int, default=None,
                          dest="final_round",
                          help="round that counts as survival (default: "
-                              "the difficulty's final round)")
+                              "the rung's final round)")
     args = parser.parse_args()
     print(f"btd6_bot build {BUILD}")
     global DEBUG
     DEBUG = not getattr(args, "quiet", False)
     {"locate": cmd_locate, "watch": cmd_watch,
      "play": cmd_play, "scan": cmd_scan, "farm": cmd_farm,
+     "solve": cmd_solve, "campaign": cmd_campaign,
      "learn": cmd_learn}[args.command](args)
 
 
