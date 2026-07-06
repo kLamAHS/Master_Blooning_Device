@@ -377,6 +377,8 @@ class MetaBrain:
         self.pos_post = {}
         self.g_post = {}
         self.gp_post = {}
+        self.d_post = {}     # evidence from episodes where the tower
+        #                      went DEEP (tier 4+): novelty's core metric
         self.history = []
         self.seed_rows = []      # near-winning rows from OTHER rungs of
         self.last_strategy = {"kind": "uniform"}   # this same map
@@ -478,6 +480,8 @@ class MetaBrain:
             if max(path) > 0:
                 self._fold(self.p_post, (ttype, path.index(max(path))), r,
                            init=[1.0, 1.0])
+            if max(path) >= 4:
+                self._fold(self.d_post, ttype, r)
             if t.get("at"):
                 self._fold(self.pos_post, _bucket(t["at"]), r,
                            init=[1.0, 1.0])
@@ -515,19 +519,27 @@ class MetaBrain:
         la, lb = self.t_post.get(ttype, (0.0, 0.0))
         return _beta(rng, pa + ga + la, pb + gb + lb)
 
-    def trials(self, ttype):
-        """How much LOCAL evidence this rung has about a tower."""
-        la, lb = self.t_post.get(ttype, (0.0, 0.0))
+    def trials(self, ttype, deep=False):
+        """How much LOCAL evidence this rung has about a tower --
+        overall, or only from episodes where it went deep (tier 4+).
+        The deep count is what novelty rotates on: a glue that shows up
+        shallow in every layout has still never been AUDITIONED as the
+        core."""
+        la, lb = (self.d_post if deep else self.t_post).get(
+            ttype, (0.0, 0.0))
         return la + lb
 
-    def _pick_tower(self, rng, candidates, chosen, novelty=False):
+    def _pick_tower(self, rng, candidates, chosen, novelty=False,
+                    deep_slot=False):
         """Thompson draw with a synergy nudge from already-chosen towers.
         With probability `explore` the draw is uniform instead — the
         never-starve guarantee. `novelty` flips the objective: when the
         campaign is PLATEAUED, the strategy family itself is what's
         wrong, so under-tried towers get a strong bonus — a coherent
         layout around something new, not more noise around the same
-        core."""
+        core. For the deep slot (the carry) the bonus counts only DEEP
+        trials, so families the meta keeps shallow still get their
+        audition as the core."""
         if not candidates:
             return None
         if not novelty and rng.random() < self.explore:
@@ -544,7 +556,7 @@ class MetaBrain:
             # is occasionally right, a third 000 glue never is.
             w *= 0.3 ** sum(1 for c in chosen if c == ttype)
             if novelty:
-                w *= 3.0 / (1.0 + self.trials(ttype))
+                w *= 3.0 / (1.0 + self.trials(ttype, deep=deep_slot))
             if w > best_w:
                 best, best_w = ttype, w
         return best
@@ -960,10 +972,17 @@ class MetaBrain:
         if hero:
             picks.append(("hero", "hero"))   # free scaling: always early
         for role in self._role_slots(n_towers, hero=hero):
-            cands = pool if role == "free" else \
-                [t for t in self.roles.get(role, []) if t in pool] or pool
+            # Novelty opens the CARRY slot to every family: the map may
+            # want a core the role template would never audition (the
+            # meta keeps glue shallow -- this map might not).
+            if role == "free" or (novelty and role == "carry"):
+                cands = pool
+            else:
+                cands = [t for t in self.roles.get(role, [])
+                         if t in pool] or pool
             ttype = self._pick_tower(rng, cands, [t for t, _ in picks],
-                                     novelty=novelty)
+                                     novelty=novelty,
+                                     deep_slot=role == "carry")
             if ttype:
                 picks.append((ttype, role))
         needs = self._coverage_fixes(rng, picks)
