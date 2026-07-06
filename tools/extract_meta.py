@@ -139,6 +139,9 @@ ROLES = {
 
 # Threat solutions among land towers the bot can actually buy.
 # tower -> null (base tower solves it) or [path_index, tier] required.
+# camo/lead/moab gate the early and mid game; ceramic/ddt/bad are the
+# late-game walls a full-length (hard/impoppable/CHIMPS) run must
+# answer -- rounds 63+, 90-99, and 100 respectively.
 SOLUTIONS = {
     "camo": {"ninja": None, "wizard": [2, 2], "village": [1, 2],
              "sniper": [1, 1], "dart": [2, 2], "mortar": [2, 3]},
@@ -150,6 +153,23 @@ SOLUTIONS = {
              "glue": [2, 3], "ninja": [1, 4], "ice": [2, 5],
              "wizard": [2, 5], "super": [0, 3], "tack": [2, 5],
              "druid": [2, 5], "spike": [1, 4]},
+    # Dense ceramic waves (r63, 75-78): grouped-damage / sustained
+    # cleanup lines the sheet's Round Threats rows name.
+    "ceramic": {"tack": [0, 4], "bomb": [2, 4], "wizard": [2, 4],
+                "druid": [2, 4], "glue": [1, 3], "ninja": [0, 4],
+                "boomerang": [1, 4], "super": [0, 3], "mortar": [1, 4],
+                "spike": [1, 4]},
+    # DDTs (r90-99) are camo+lead+MOAB at once: MIB makes the whole
+    # defense damage-type-proof, the rest are the sheet's named answers
+    # (Sabotage, Impale, Maim, PoD, Spike Storm).
+    "ddt": {"village": [1, 3], "ninja": [1, 4], "ice": [2, 5],
+            "sniper": [0, 4], "wizard": [2, 5], "spike": [1, 4]},
+    # The r100 BAD: raw sustained single-target damage -- a tier-5 carry
+    # line or Spike Storm stockpiles (sheet: First Strike, Spike Storm,
+    # Tack Zone buffs, Avatar shells).
+    "bad": {"tack": [2, 5], "super": [0, 4], "wizard": [2, 5],
+            "druid": [2, 5], "boomerang": [1, 5], "spike": [1, 4],
+            "dart": [1, 5], "sniper": [0, 5]},
 }
 
 # Towers the sheet doesn't rank but the bot can use; scores inferred from

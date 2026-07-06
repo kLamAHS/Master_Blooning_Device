@@ -1,11 +1,15 @@
-# BTD6 bot — Stage 1
+# BTD6 bot — it solves the game now
 
-The "hands" of the ML project: a Python bot that watches the screen, reads the
-round counter with OCR, and clicks towers into place from a gameplan file.
-There is deliberately **no machine learning in here yet** — the milestone is a
-script that beats Monkey Meadow on easy, unattended. Once that works, this same
-script becomes your data collector for Stage 2 (it already logs every round to
-`rounds_log.csv`).
+A Python bot that watches the screen, reads the HUD with OCR, clicks
+towers into place — and **plays to win**. Stage 1 executed hand-written
+plans; Stage 2 farmed labeled episodes; Stage 3 added the meta brain
+(research priors + Thompson sampling + evolution). Stage 4 is `solve`:
+a campaign layer that climbs each map's ladder — easy → medium → hard →
+**CHIMPS** — exploring until it finds a defense that works, then
+repairing and replaying its champion until the final round is actually
+survived. Machine learning is used only where it provably helps: every
+model must pass a cross-validation gate on the bot's own episodes
+before it gets a vote (details in "The ML layer" below).
 
 > **Heads up:** automation is against Ninja Kiwi's terms of service and can get
 > an account flagged or banned. Use this **offline, single player only**,
@@ -60,41 +64,66 @@ once; after that your daily loop is just steps 6–8.
    python mk.py play plans/monkey_meadow_easy.json
    ```
 
-7. **Farm learning episodes** — the main loop (Stage 2 + Stage 3
-   sections). Load the map fresh at round 1 and walk away:
+7. **Solve the game** — the main loop (Stage 4 section). Load the map
+   fresh on the rung you want beaten (the bot detects easy / medium /
+   hard / impoppable / **CHIMPS** from the HUD) and walk away:
+
+   ```
+   python mk.py solve monkey_meadow
+   ```
+
+   It explores until something works, repairs and replays its champion,
+   and stops when the final round is actually survived — recording the
+   win in `progress.json`. Equip a hero first (Sauda recommended).
+   Useful flags: `--episodes 60` (session budget), `--towers 6`,
+   `--mode chimps` / `--difficulty hard` (override detection),
+   `--no-hero`, `--no-abilities`, `--seed N`.
+
+8. **Check the ladder** anytime (no game needed):
+
+   ```
+   python mk.py campaign
+   ```
+
+   Then load the next rung it names and run `solve` again — everything
+   learned on the way up transfers.
+
+9. **Farm learning episodes** (optional — `solve` learns on its own,
+   but `farm` is the pure data collector, Stage 2 + 3 sections):
 
    ```
    python mk.py farm monkey_meadow --episodes 15 --towers 4
    ```
 
    Meta-guided layouts are the default, and the equipped hero is placed
-   as the early anchor — equip one (Sauda recommended) in the hero menu
-   first. Survival means the difficulty's **real final round** (easy 40,
-   medium 60, hard 80, impoppable 100 — auto-detected), so the bot
-   learns the endgame, not just the opening. Useful flags:
-   `--explore 0.5` (more randomness), `--no-meta` (pure random, the old
-   Stage 2), `--no-evolve` (no genetic layer), `--no-hero` (skip hero
-   placement), `--pool classic` (original 10 towers only),
-   `--final-round N` (override the auto target), `--abort-lives 50`,
-   `--seed N`.
+   as the early anchor. Survival means the rung's **real final round**
+   (easy 40, medium 60, hard 80, impoppable/CHIMPS 100 —
+   auto-detected), so the bot learns the endgame, not just the opening.
+   Useful flags: `--explore 0.5` (more randomness), `--no-meta` (pure
+   random, the old Stage 2), `--no-evolve` (no genetic layer),
+   `--no-hero`, `--no-abilities`, `--pool classic` (original 10 towers
+   only), `--final-round N`, `--abort-lives 50`, `--seed N`.
 
-8. **Review what it learned** (Stage 3 section, no game needed):
+10. **Review what it learned** (Stage 3 section, no game needed):
 
-   ```
-   python mk.py learn monkey_meadow
-   ```
+    ```
+    python mk.py learn monkey_meadow            # add --mode chimps for that rung
+    ```
 
-9. **When the research spreadsheet gets a new version**, regenerate the
-   knowledge base (needs `pip install openpyxl`):
+11. **When the research spreadsheet gets a new version**, regenerate the
+    knowledge base (needs `pip install openpyxl`):
 
-   ```
-   python tools/extract_meta.py
-   ```
+    ```
+    python tools/extract_meta.py
+    ```
 
-10. **After touching the code**, run the offline sanity checks:
+12. **After touching the code**, run the offline sanity checks:
 
     ```
     python meta.py selftest
+    python learner.py selftest
+    python campaign.py selftest
+    python tools/simulate_solve.py --seeds 5 --ablate   # end-to-end sim
     ```
 
 **Emergency stop, anytime:** slam the mouse into the top-left corner of
@@ -438,6 +467,105 @@ python mk.py learn monkey_meadow            # or: python meta.py report monkey_m
 python meta.py selftest                     # offline sanity checks, no game needed
 ```
 
+## Stage 4: `solve` — play to WIN
+
+`farm` collects data; `solve` beats the game with it. Load a map on any
+rung and run:
+
+```
+python mk.py solve monkey_meadow
+```
+
+- **It knows what's loaded.** Starting lives pin the difficulty
+  (200/150/100 = easy/medium/hard); a 1-life game starting at round 6
+  is **CHIMPS**, at round 3 impoppable. CHIMPS runs get CHIMPS
+  planning: a pops-only income curve paces the buy schedule, the
+  early-abort is off (any leak already ends the game), and prices share
+  the hard-difficulty book.
+- **Explore vs attempt.** A campaign policy (campaign.py) decides each
+  episode: *explore* (a fresh or evolved layout — information for the
+  learners) or *attempt* (the best layout found so far, replayed
+  faithfully with two surgical changes: full threat coverage for this
+  rung's target, and a repair for whatever killed it last time —
+  "died at 91: DDTs → buy the MIB/Sabotage answer by 88"). Attempts
+  only start once the champion is genuinely close, never run unbroken,
+  and a plateau triggers **novelty mode**: coherent layouts built
+  around the least-tried tower families, because when everything known
+  keeps dying the same way the problem is the core, not the details.
+- **Winning means winning.** `solve` plays *through* the final round —
+  survival is declared only when the victory screen covers the HUD (or
+  the final round has sat finished for minutes), so a round-100 BAD
+  that leaks still counts as the defeat it is.
+- **The whole game is scheduled.** Threat coverage now spans the full
+  ladder: camo (r24), lead (r28), MOAB prep (r40), ceramic cleanup
+  (r63+), DDT answers (r90-99, MIB/Sabotage/Impale class), and a BAD
+  answer (r100) — each with its own hard deadline in the buy schedule.
+  On threat rounds the bot also fires ability hotkeys (1/2/3 — a no-op
+  when nothing is trained).
+- **Victories persist.** `progress.json` tracks every (map, rung):
+  episodes, deepest round, beaten-or-not. `python mk.py campaign`
+  prints the scoreboard and names the next rung. The ladder is easy →
+  medium → hard → CHIMPS per map.
+
+Learning **transfers up the ladder**: every episode ever played feeds a
+capped global posterior (a new rung starts from everything the ladder
+below it learned), near-winning layouts from lower rungs seed the new
+rung's evolution pool, and the price book is shared. Beating easy makes
+medium faster; beating hard makes CHIMPS plausible.
+
+## The ML layer — models that must earn their vote
+
+Everything learned lives in three models (learner.py), and each one is
+**gated**: it influences decisions only while it demonstrably helps,
+measured on the bot's own episodes. No data, thin data, or pure noise
+all leave the gates closed — and the bot plays exactly as the meta
+brain would without ML. That gate is the difference between machine
+learning that is genuinely load-bearing and machine learning that is
+decoration.
+
+- **The outcome model** (logistic, pure stdlib) predicts an episode's
+  result from layout features — tower mix, threat coverage, track
+  geometry, cost pacing. Gate: out-of-fold AUC ≥ 0.62 on ≥ 12 episodes
+  of this rung. While open, every explore episode generates several
+  candidate layouts and plays the best-scoring one (model-guided
+  search); an explore fraction always bypasses the screen so the model
+  can never starve the exploration that trains it. Every episode logs
+  whether the model touched it, so `learn` can report the honest
+  scoreboard (screened vs unscreened average round).
+- **The income curve** learns cumulative cash-by-round per rung from
+  each episode's cash/spend telemetry, replacing the hardcoded income
+  guess that paces buy schedules. This matters most in CHIMPS, where
+  income is pops-only and a wrong curve means overspending into a leak.
+- **Hazard analysis** maps death rounds to known threats — it powers
+  both the `learn` report ("deaths cluster near r63 — ceramics") and
+  the attempt repairs.
+
+The end-to-end loop is regression-tested offline against a simulated
+game:
+
+```
+python tools/simulate_solve.py --seeds 10 --episodes 120 --ablate
+```
+
+The real brain/policy/repair stack must beat a hidden-quirk CHIMPS sim
+(each seed hides a different "only this carry works here" quirk no prior
+can know) on every seed, and the `--ablate` flag re-runs each seed with
+learning disabled to prove the learning pulls its weight. Two measured
+results, both reproducible with the command above:
+
+- **Robustness (the headline).** At the tighter default 60-episode
+  budget, learning solves all 10/10 seeds while prior-only search fails
+  the hidden-quirk seeds it can't stumble into (typically 2/10 unsolved
+  in budget). Learning's real value is finding the off-meta core the
+  map demands, not a faster easy win.
+- **Speed.** At a generous 120-episode budget where prior-only search
+  eventually solves every seed too, learning still gets there ~2.5×
+  faster — mean **8.1** episodes vs **20.1** without.
+
+(Beware the ablation's mean-episodes number at tight budgets: it
+averages only the seeds it *did* solve — the easy ones — so it can read
+deceptively low while quietly abandoning the hard maps.)
+
 ## Plan file format
 
 Each entry in `"actions"` fires as soon as the round counter reaches its
@@ -488,6 +616,21 @@ red things that pollute frame comparisons. The detector judges each point
 by the *median* per-pixel red-shift and resamples borderline readings, so
 transients can't flip a verdict; if a skin still causes trouble, check the
 game's settings for an option to disable seasonal decorations and rescan.
+
+**It used to restart a live game mid-round ("hud_lost").** If the
+round-counter OCR failed for a stretch — a MOAB drifting over the box,
+a heavy effect, a crop that shifted — the bot would conclude the HUD
+was gone and restart a game that was actually alive and winning, so it
+never got much past the round where the reads first faltered. Fixed:
+the bot now consults the *lives* counter before ever restarting. A
+readable, positive lives count means the game is up and only the
+round-OCR is struggling, so instead of restarting it clears any stray
+UI and re-locates the counter from the settings gear (healing a drifted
+crop), and keeps playing. It only gives up when the **whole** HUD is
+gone — lives unreadable too — which is the genuine lost-window case. If
+you still see it happen, run `python mk.py watch` to confirm the
+counter reads cleanly at the round it stalls on, and check the game
+window hasn't been moved since calibration.
 
 ## Bookkeeping the bot does for you
 

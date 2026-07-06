@@ -26,6 +26,11 @@ import random
 import sys
 from pathlib import Path
 
+try:
+    import learner as learner_mod       # the gated ML layer (optional)
+except ImportError:
+    learner_mod = None
+
 KNOWLEDGE_PATH = Path(__file__).parent / "meta_knowledge.json"
 RUNS_PATH = Path(__file__).parent / "runs_log.jsonl"
 
@@ -34,10 +39,33 @@ RUNS_PATH = Path(__file__).parent / "runs_log.jsonl"
 # experience outweighs the spreadsheet.
 PRIOR_STRENGTH = 6.0
 
+# Experience TRANSFERS: episodes from other maps/difficulties/modes feed
+# a global posterior worth at most this many pseudo-episodes, so a new
+# rung starts from everything already learned but local evidence takes
+# over quickly. (Local evidence is uncapped.)
+GLOBAL_CAP = 4.0
+GLOBAL_PATH_CAP = 3.0
+
 # Version handshake with mk.py. A stale meta.py sitting next to a newer
 # mk.py (mixed zip extractions, leftover __pycache__) once CRASHED every
 # episode with a TypeError; mk.py now checks this and degrades politely.
-META_API = 3
+META_API = 4
+
+# Late-game threat solutions, injected when meta_knowledge.json predates
+# them (regenerate with tools/extract_meta.py to keep the sheet as the
+# source of truth). Without these a full-length run schedules nothing
+# for ceramics (r63+), DDTs (r90-99) or the BAD (r100).
+FALLBACK_SOLUTIONS = {
+    "ceramic": {"tack": [0, 4], "bomb": [2, 4], "wizard": [2, 4],
+                "druid": [2, 4], "glue": [1, 3], "ninja": [0, 4],
+                "boomerang": [1, 4], "super": [0, 3], "mortar": [1, 4],
+                "spike": [1, 4]},
+    "ddt": {"village": [1, 3], "ninja": [1, 4], "ice": [2, 5],
+            "sniper": [0, 4], "wizard": [2, 5], "spike": [1, 4]},
+    "bad": {"tack": [2, 5], "super": [0, 4], "wizard": [2, 5],
+            "druid": [2, 5], "boomerang": [1, 5], "spike": [1, 4],
+            "dart": [1, 5], "sniper": [0, 5]},
+}
 
 # Rough base-cost rank (medium prices) used ONLY to order purchases when
 # the learned price book hasn't seen a tower yet. Being off by $100 just
@@ -61,10 +89,36 @@ HERO_PLACEMENT = {"range": 0.045, "style": "coverage"}
 TIER_EST = {1: 300, 2: 700, 3: 1800, 4: 4500, 5: 14000}
 
 
-def earned_by(r):
+# CHIMPS income is pops-only: no end-of-round bonus, no farms possible.
+# Rough cumulative-cash anchors (rounds 6-100, start cash included) --
+# a deliberately conservative PRIOR that the learned income curve
+# (learner.IncomeCurve, fed by each episode's cash/spend telemetry)
+# replaces as soon as real data exists. Off-by-some just shifts a buy a
+# round or two; the executor still waits for real cash.
+CHIMPS_INCOME_ANCHORS = [
+    (6, 650), (10, 1700), (15, 3300), (20, 5300), (25, 7700),
+    (30, 10600), (35, 14000), (40, 18500), (45, 23500), (50, 29500),
+    (55, 37000), (60, 46000), (65, 57000), (70, 71000), (75, 88000),
+    (80, 110000), (85, 140000), (90, 180000), (95, 240000),
+    (100, 330000),
+]
+
+
+def earned_by(r, mode="standard"):
     """Very rough cumulative cash available by round r (start cash plus
-    pop income and end-of-round bonuses, no farms). Only used to PACE
-    the buy plan -- the executor still waits for real cash."""
+    pop income and, outside CHIMPS, end-of-round bonuses; no farms).
+    Only used to PACE the buy plan -- the executor still waits for real
+    cash."""
+    if mode == "chimps":
+        pts = CHIMPS_INCOME_ANCHORS
+        if r <= pts[0][0]:
+            return pts[0][1]
+        for (r0, c0), (r1, c1) in zip(pts, pts[1:]):
+            if r <= r1:
+                return c0 + (c1 - c0) * (r - r0) / (r1 - r0)
+        r0, c0 = pts[-2]
+        r1, c1 = pts[-1]
+        return c1 + (c1 - c0) / (r1 - r0) * (r - r1)
     return 650 + 25 * r + 11 * r * r
 
 
@@ -294,24 +348,46 @@ class TrackModel:
 
 class MetaBrain:
     def __init__(self, map_name, difficulty, target_round=40,
-                 explore=0.20, evolve=True, knowledge=None, runs_path=None):
+                 explore=0.20, evolve=True, knowledge=None, runs_path=None,
+                 mode="standard", start_round=1):
         self.map_name = map_name
         self.difficulty = difficulty
+        self.mode = mode                  # "standard" | "chimps"
+        self.start_round = max(int(start_round), 1)
         self.target = max(int(target_round), 1)
         self.explore = min(max(float(explore), 0.0), 1.0)
         self.evolve = evolve
         self.k = knowledge or _load_json(KNOWLEDGE_PATH)
         self.towers = self.k["towers"]
         self.roles = self.k["roles"]
-        self.solutions = self.k["solutions"]
+        # A knowledge file from before the late-game kinds still gets
+        # ceramic/ddt/bad answers -- regenerating the file overrides.
+        self.solutions = dict(self.k["solutions"])
+        for kind, table in FALLBACK_SOLUTIONS.items():
+            self.solutions.setdefault(kind, table)
         self.threats = self.k["threats"]
-        # Posteriors: Beta(a, b) per tower, per (tower, main path), and
-        # per coarse map position bucket.
+        # Posteriors, kept as PURE EVIDENCE counts [sum(r), sum(1-r)]:
+        # local = this exact rung (map+difficulty+mode, uncapped);
+        # global = every other logged episode (capped at GLOBAL_CAP
+        # pseudo-episodes) -- how a new rung inherits what the ladder
+        # below it already learned. The meta prior is added at sampling
+        # time.
         self.t_post = {}
         self.p_post = {}
         self.pos_post = {}
+        self.g_post = {}
+        self.gp_post = {}
+        self.d_post = {}     # evidence from episodes where the tower
+        #                      went DEEP (tier 4+): novelty's core metric
         self.history = []
-        self.last_strategy = {"kind": "uniform"}
+        self.seed_rows = []      # near-winning rows from OTHER rungs of
+        self.last_strategy = {"kind": "uniform"}   # this same map
+        # The learned income curve paces buy schedules; until it has
+        # telemetry it repeats the mode prior exactly.
+        self._income_curve = (learner_mod.IncomeCurve(
+            lambda r: earned_by(r, self.mode)) if learner_mod else None)
+        self._ol = None          # OutcomeLearner, built lazily per track
+        self._ol_track = None
         runs = Path(runs_path) if runs_path else RUNS_PATH
         if runs.exists():
             for line in runs.read_text().splitlines():
@@ -328,71 +404,145 @@ class MetaBrain:
         q = (info["score"] / 100.0) if info else 0.55
         return [PRIOR_STRENGTH * q, PRIOR_STRENGTH * (1.0 - q)]
 
-    def _reward(self, row):
+    def _row_target(self, row):
+        """The round a row's episode was aiming for -- its own logged
+        target when present, else its rung's final round."""
+        t = row.get("target_round")
+        if isinstance(t, (int, float)) and t > 0:
+            return float(t)
+        if row.get("game_mode") == "chimps":
+            return 100.0
+        return float({"easy": 40, "medium": 60, "hard": 80,
+                      "impoppable": 100}.get(row.get("difficulty"), 40))
+
+    def _reward(self, row, target=None):
         """0..1 per episode: how far did the layout get toward the target
         round? Survival = 1. Unknown endings don't teach anything."""
-        if row.get("outcome") == "survived":
+        if row.get("outcome") in ("survived", "victory"):
             return 1.0
         if row.get("outcome") != "defeat":
             return None
         reached = row.get("final_round")
         if reached is None:
             return None
-        return min(max(reached / self.target, 0.0), 1.0) * 0.95
+        return min(max(reached / (target or self.target), 0.0), 1.0) * 0.95
+
+    def _is_episode(self, row):
+        return (row.get("mode") in ("farm", "solve")
+                and row.get("towers")
+                and self._reward(row, self._row_target(row)) is not None)
 
     def usable(self, row):
-        return (row.get("mode") == "farm"
+        """Rows of THIS rung: same map, difficulty and game mode. Only
+        these feed the local posteriors and the elite pool."""
+        return (self._is_episode(row)
                 and row.get("map") == self.map_name
-                and row.get("towers")
-                and self._reward(row) is not None)
+                and row.get("difficulty") == self.difficulty
+                and row.get("game_mode", "standard") == self.mode)
+
+    @staticmethod
+    def _fold(post, key, r, init=None):
+        a, b = post.setdefault(key, list(init) if init else [0.0, 0.0])
+        post[key] = [a + r, b + (1.0 - r)]
 
     def observe(self, row, quiet=False):
         """Fold one episode row (runs_log.jsonl format) into the
         posteriors. Called for every historical line at startup and after
-        each live episode."""
+        each live episode. Rung rows teach the local posteriors; every
+        other episode teaches the capped global ones (transfer)."""
+        if not self._is_episode(row):
+            return
         if not self.usable(row):
+            r = self._reward(row, self._row_target(row))
+            for t in row["towers"]:
+                ttype = t.get("tower", "").lower()
+                if not ttype:
+                    continue
+                self._fold(self.g_post, ttype, r)
+                path = t.get("path") or [0, 0, 0]
+                if max(path) > 0:
+                    self._fold(self.gp_post,
+                               (ttype, path.index(max(path))), r)
+            if row.get("map") == self.map_name and r >= 0.85:
+                # A layout that (nearly) beat another rung of this very
+                # map is a seed the evolution can adapt to this one.
+                self.seed_rows.append((r, row))
+                self.seed_rows.sort(key=lambda x: -x[0])
+                del self.seed_rows[5:]
             return
         r = self._reward(row)
         for t in row["towers"]:
             ttype = t.get("tower", "").lower()
             if not ttype:
                 continue
-            a, b = self.t_post.setdefault(ttype, self._prior(ttype))
-            self.t_post[ttype] = [a + r, b + (1.0 - r)]
+            self._fold(self.t_post, ttype, r)
             path = t.get("path") or [0, 0, 0]
             if max(path) > 0:
-                main = path.index(max(path))
-                pa, pb = self.p_post.setdefault((ttype, main), [1.0, 1.0])
-                self.p_post[(ttype, main)] = [pa + r, pb + (1.0 - r)]
+                self._fold(self.p_post, (ttype, path.index(max(path))), r,
+                           init=[1.0, 1.0])
+            if max(path) >= 4:
+                self._fold(self.d_post, ttype, r)
             if t.get("at"):
-                bk = _bucket(t["at"])
-                ba, bb = self.pos_post.setdefault(bk, [1.0, 1.0])
-                self.pos_post[bk] = [ba + r, bb + (1.0 - r)]
+                self._fold(self.pos_post, _bucket(t["at"]), r,
+                           init=[1.0, 1.0])
         self.history.append(row)
+        if self._income_curve is not None:
+            self._income_curve.fit(self.history)
+        self._ol = None                   # outcome model: refit next use
         if not quiet:
             n = len(self.history)
             print(f"   [brain] learned from episode "
-                  f"(reward {r:.2f}, {n} total on this map)")
+                  f"(reward {r:.2f}, {n} total on this rung)")
 
     def elites(self, top=8):
+        """Best layouts of this rung, best-then-recent first. While the
+        rung has fewer than three of its own, near-winning layouts from
+        the map's other rungs seed the pool (discounted -- they beat an
+        easier game)."""
         rows = [(self._reward(r), i, r) for i, r in enumerate(self.history)
                 if self.usable(r)]
         rows.sort(key=lambda x: (-x[0], -x[1]))   # best first, recent first
-        return [(rw, r) for rw, _, r in rows[:top]]
+        out = [(rw, r) for rw, _, r in rows[:top]]
+        if len(out) < 3 and self.seed_rows:
+            out += [(rw * 0.8, r) for rw, r in
+                    self.seed_rows[:top - len(out)]]
+        return out
 
     # ---------------------------------------------------------- sampling
 
     def _theta(self, rng, ttype):
-        a, b = self.t_post.get(ttype) or self._prior(ttype)
-        return _beta(rng, a, b)
+        pa, pb = self._prior(ttype)
+        ga, gb = self.g_post.get(ttype, (0.0, 0.0))
+        tot = ga + gb
+        if tot > GLOBAL_CAP:
+            ga, gb = ga * GLOBAL_CAP / tot, gb * GLOBAL_CAP / tot
+        la, lb = self.t_post.get(ttype, (0.0, 0.0))
+        return _beta(rng, pa + ga + la, pb + gb + lb)
 
-    def _pick_tower(self, rng, candidates, chosen):
+    def trials(self, ttype, deep=False):
+        """How much LOCAL evidence this rung has about a tower --
+        overall, or only from episodes where it went deep (tier 4+).
+        The deep count is what novelty rotates on: a glue that shows up
+        shallow in every layout has still never been AUDITIONED as the
+        core."""
+        la, lb = (self.d_post if deep else self.t_post).get(
+            ttype, (0.0, 0.0))
+        return la + lb
+
+    def _pick_tower(self, rng, candidates, chosen, novelty=False,
+                    deep_slot=False):
         """Thompson draw with a synergy nudge from already-chosen towers.
         With probability `explore` the draw is uniform instead — the
-        never-starve guarantee."""
+        never-starve guarantee. `novelty` flips the objective: when the
+        campaign is PLATEAUED, the strategy family itself is what's
+        wrong, so under-tried towers get a strong bonus — a coherent
+        layout around something new, not more noise around the same
+        core. For the deep slot (the carry) the bonus counts only DEEP
+        trials, so families the meta keeps shallow still get their
+        audition as the core."""
         if not candidates:
             return None
-        if rng.random() < self.explore:
+        if not novelty and rng.random() < self.explore:
             return rng.choice(candidates)
         best, best_w = None, -1.0
         for ttype in candidates:
@@ -405,6 +555,8 @@ class MetaBrain:
             # Sharply diminishing returns on duplicates: a second glue
             # is occasionally right, a third 000 glue never is.
             w *= 0.3 ** sum(1 for c in chosen if c == ttype)
+            if novelty:
+                w *= 3.0 / (1.0 + self.trials(ttype, deep=deep_slot))
             if w > best_w:
                 best, best_w = ttype, w
         return best
@@ -573,22 +725,58 @@ class MetaBrain:
         best, best_w = None, -1.0
         for b in builds:
             pa, pb = self.p_post.get((ttype, b["main"]), [1.0, 1.0])
-            w = b.get("weight", 0.5) * (0.5 + _beta(rng, pa, pb))
+            ga, gb = self.gp_post.get((ttype, b["main"]), (0.0, 0.0))
+            tot = ga + gb
+            if tot > GLOBAL_PATH_CAP:
+                ga = ga * GLOBAL_PATH_CAP / tot
+                gb = gb * GLOBAL_PATH_CAP / tot
+            w = b.get("weight", 0.5) * (0.5 + _beta(rng, pa + ga, pb + gb))
             if w > best_w:
                 best, best_w = b, w
         return best["main"], best["cross"], best.get("label", "meta")
 
     # ------------------------------------------------- threat coverage
 
-    def _coverage_fixes(self, rng, picks):
+    # Per-kind coverage policy. cap: highest solver tier worth forcing
+    # (a tier-5 by round 38 would stall the whole economy -- but by
+    # round 98 it's exactly the plan). swap: whether an unanswerable
+    # threat may replace a support tower with a solver. prefer_carry:
+    # BAD answers are tier-5 carry lines, so the nudge lands on the
+    # carry instead of avoiding it.
+    KIND_POLICY = {
+        "camo": {"cap": None, "swap": True, "prefer_carry": False},
+        "lead": {"cap": None, "swap": True, "prefer_carry": False},
+        "moab": {"cap": 4, "swap": False, "prefer_carry": False},
+        "ceramic": {"cap": 4, "swap": False, "prefer_carry": False},
+        "ddt": {"cap": 5, "swap": True, "prefer_carry": False},
+        "bad": {"cap": 5, "swap": False, "prefer_carry": True},
+    }
+
+    @staticmethod
+    def _need_tier(need, p_i):
+        """Highest tier any threat requires on this path."""
+        reqs = (need or {}).get(p_i)
+        return max((t for t, _by in reqs), default=0) if reqs else 0
+
+    def _coverage_fixes(self, rng, picks, tower_pool=None):
         """Make sure the layout answers the threats it will actually meet
         before target_round (Meta thesis #2: solve every property) --
-        camo, lead, and (for targets past round 40) MOAB prep. Returns
-        {tower_index: {path_i: min_tier}} requirements and possibly swaps
-        a tower type in `picks` to cover a hole."""
+        camo and lead early, MOAB prep past round 40, and for full-length
+        games the late walls: ceramics (63+), DDTs (90+), the BAD (100).
+        Returns {tower_index: {path_i: [(tier, threat_round), ...]}}
+        requirements -- each threat keeps its OWN deadline, so a village
+        that owes camo tier 2 by round 24 and MIB tier 3 by round 90
+        schedules the first tiers early and only the third late -- and
+        possibly swaps a tower type in `picks` to cover a hole."""
         needs = {}
         carries = set(self.roles.get("carry", []))
-        for kind in ("camo", "lead", "moab"):
+
+        def add_need(i, path_i, tier, first):
+            needs.setdefault(i, {}).setdefault(path_i, []) \
+                .append((tier, first))
+
+        for kind in ("camo", "lead", "moab", "ceramic", "ddt", "bad"):
+            policy = self.KIND_POLICY[kind]
             first = min((r for t in self.threats if t["kind"] == kind
                          for r in t["rounds"]), default=None)
             if first is None or first > self.target:
@@ -598,78 +786,119 @@ class MetaBrain:
                           for t, _ in picks)
             if covered:
                 continue
+
+            def conflicts(i, p_i, tier):
+                """A tower can push only ONE path past tier 2 -- a deep
+                need stacked on a tower that already owes another path
+                a deep need would silently cannibalize one of them at
+                assembly time (that exact bug once trimmed MOAB Glue to
+                tier 2 whenever ceramics also picked the glue)."""
+                return tier > 2 and any(q != p_i
+                                        and self._need_tier(
+                                            needs.get(i), q) > 2
+                                        for q in needs.get(i, {}))
             upgradable = [(i, solvers[t]) for i, (t, _) in enumerate(picks)
-                          if t in solvers and solvers[t] is not None]
-            if kind == "moab":
-                # MOAB prep is a nudge, never surgery: only tier<=4
-                # answers (saving for a tier 5 by r38 would stall the
-                # whole economy), prefer a tower whose answer lies on
-                # its own main build path, then a non-carry -- and if
-                # nobody fits, the carry's raw DPS is the answer.
-                upgradable = [(i, s) for i, s in upgradable if s[1] <= 4]
-                if upgradable:
-                    def moab_fit(item):
-                        i, (p_i, _tier) = item
-                        t = picks[i][0]
-                        builds = self.towers.get(t, {}).get("builds") or []
-                        main0 = builds[0]["main"] if builds else None
-                        return (0 if main0 == p_i else 1,
-                                0 if t not in carries else 1)
-                    i, (path_i, tier) = min(upgradable, key=moab_fit)
-                    needs.setdefault(i, {})[path_i] = max(
-                        needs.get(i, {}).get(path_i, 0), tier)
+                          if t in solvers and solvers[t] is not None
+                          and not conflicts(i, *solvers[t])]
+            if policy["cap"] is not None:
+                upgradable = [(i, s) for i, s in upgradable
+                              if s[1] <= policy["cap"]]
+            if policy["cap"] is not None and upgradable:
+                # A capped kind is a NUDGE: prefer a tower whose answer
+                # lies on its own main build path, then respect the
+                # carry preference -- and if nobody fits, the carry's
+                # raw DPS is the answer.
+                def fit(item):
+                    i, (p_i, _tier) = item
+                    t = picks[i][0]
+                    builds = self.towers.get(t, {}).get("builds") or []
+                    main0 = builds[0]["main"] if builds else None
+                    on_carry_pref = ((t in carries)
+                                     != policy["prefer_carry"])
+                    return (0 if main0 == p_i else 1,
+                            1 if on_carry_pref else 0)
+                i, (path_i, tier) = min(upgradable, key=fit)
+                add_need(i, path_i, tier, first)
                 continue
             if upgradable:
                 i, (path_i, tier) = rng.choice(upgradable)
-                needs.setdefault(i, {})[path_i] = max(
-                    needs.get(i, {}).get(path_i, 0), tier)
+                add_need(i, path_i, tier, first)
                 continue
             # Nobody can solve it: swap the last non-carry pick for the
             # strongest solver (skip in explore-heavy runs half the time
             # so pure exploration still exists).
-            if rng.random() < self.explore:
+            if not policy["swap"] or rng.random() < self.explore:
                 continue
             solver_types = [t for t, req in solvers.items()
-                            if t in self.towers]
+                            if t in self.towers
+                            and (tower_pool is None or t in tower_pool)]
             if not solver_types:
                 continue
             best = max(solver_types, key=lambda t: self._theta(rng, t))
             for i in range(len(picks) - 1, -1, -1):
-                if picks[i][0] not in carries and picks[i][0] != "hero":
+                if picks[i][0] not in carries and picks[i][0] != "hero" \
+                        and i not in needs:
+                    # Only a tower NO earlier threat depends on may be
+                    # replaced -- swapping out an answerer would orphan
+                    # its needs onto the new species (dead buys) and
+                    # could reopen the very hole an earlier kind just
+                    # closed. If every support already answers
+                    # something, this threat stays on the carry's raw
+                    # DPS rather than trading one hole for another.
                     picks[i] = (best, picks[i][1])
                     req = solvers[best]
                     if req is not None:
-                        needs.setdefault(i, {})[req[0]] = req[1]
+                        add_need(i, req[0], req[1], first)
                     break
         return needs
 
     def _deadline(self, ttype, main, path_i, tier, needs_for_tower):
         """Approximate round by which an upgrade step should be owned;
-        used only to ORDER the buy queue (the executor stays greedy)."""
-        for p_i, min_tier in (needs_for_tower or {}).items():
-            if path_i == p_i and tier <= min_tier:
-                kinds = [k for k, sol in self.solutions.items()
-                         if sol.get(ttype) == [p_i, min_tier]]
-                first = min((r for t in self.threats
-                             if t["kind"] in kinds for r in t["rounds"]),
-                            default=24)
-                return first - 2
+        used only to ORDER the buy queue (the executor stays greedy).
+        A tier that serves several stacked threats takes the EARLIEST
+        deadline among the ones it satisfies -- a village owing camo t2
+        (r24) and MIB t3 (r90) buys its first tiers early and only the
+        third late."""
+        reqs = (needs_for_tower or {}).get(path_i) or []
+        cands = [first - 2 for req_tier, first in reqs if tier <= req_tier]
+        if cands:
+            return min(cands)
         if path_i == main:
             return 8 + 7 * tier          # carry path: t4 by ~r36
         return 14 + 8 * tier             # crosspath: trails the main
 
     # ------------------------------------------------------ genome build
 
-    def next_genome(self, rng, n_towers, pools, is_locked=None,
-                    large_towers=frozenset(), tower_pool=None,
-                    price_of=None, track=None, hero=False):
-        """Produce a buy list in run_episode's format. Rolls between a
-        fresh meta-templated layout and an evolution of an elite one.
-        `track` (a TrackModel) turns on geometry-aware placement; `hero`
-        adds the equipped hero as an early anchor placement."""
-        is_locked = is_locked or (lambda *a: False)
-        elites = self.elites() if self.evolve else []
+    # How many candidate layouts the outcome model screens per episode
+    # when its gate is open. Playing an episode costs ~20 minutes;
+    # generating and scoring a candidate costs milliseconds.
+    SCREEN_CANDIDATES = 6
+
+    def _outcome_learner(self, track):
+        """The gated outcome model for this rung, rebuilt lazily after
+        new episodes. None when learner.py is absent."""
+        if learner_mod is None:
+            return None
+        if self._ol is None or self._ol_track is not track:
+            ol = learner_mod.OutcomeLearner(
+                self.k, track=track, rough_cost=ROUGH_COST,
+                tier_est=TIER_EST, income_of=self.income)
+            ol.prepare(self.history, self._reward,
+                       target_round=self.target)
+            self._ol = ol
+            self._ol_track = track
+        return self._ol
+
+    def _one_genome(self, rng, n_towers, pools, is_locked, large_towers,
+                    tower_pool, price_of, track, hero, novelty=False):
+        elites = self.elites() if self.evolve and not novelty else []
         p_evolve = min(0.5, len(elites) / 10.0) if len(elites) >= 3 else 0.0
+        if p_evolve and elites[0][0] < 0.8:
+            # The best layout known still dies young: breeding from it
+            # is churn that crowds out the fresh sampling which finds
+            # new cores. Evolution earns its share of episodes only
+            # once an elite has real substance.
+            p_evolve *= 0.25
         if rng.random() < p_evolve:
             genome = self._evolved_genome(rng, n_towers, pools, is_locked,
                                           large_towers, tower_pool, elites,
@@ -678,7 +907,56 @@ class MetaBrain:
                 return genome
         return self._fresh_genome(rng, n_towers, pools, is_locked,
                                   large_towers, tower_pool, price_of,
-                                  track, hero)
+                                  track, hero, novelty=novelty)
+
+    def next_genome(self, rng, n_towers, pools, is_locked=None,
+                    large_towers=frozenset(), tower_pool=None,
+                    price_of=None, track=None, hero=False,
+                    novelty=False):
+        """Produce a buy list in run_episode's format. Rolls between a
+        fresh meta-templated layout and an evolution of an elite one.
+        `track` (a TrackModel) turns on geometry-aware placement; `hero`
+        adds the equipped hero as an early anchor placement. `novelty`
+        (the campaign's plateau signal) forces a FRESH layout built
+        around the least-tried tower families -- when everything known
+        keeps dying the same way, the answer is a different core, not
+        more noise around the old one.
+
+        When the outcome model's cross-validation gate is OPEN (it has
+        proven it can rank layouts on this rung's own data), several
+        candidates are generated and the best-scoring one plays --
+        model-guided search. An `explore` fraction of episodes bypasses
+        the screen entirely so the model can never starve the very
+        exploration that trains it (novelty episodes bypass it too --
+        the model can only endorse what looks like the past), and every
+        genome records whether the model touched it, so `learn` can
+        show whether screening is actually winning more."""
+        is_locked = is_locked or (lambda *a: False)
+        args = (rng, n_towers, pools, is_locked, large_towers,
+                tower_pool, price_of, track, hero)
+        ol = self._outcome_learner(track)
+        gate = ol.gate() if ol is not None else {"open": False}
+        if novelty or not gate.get("open") \
+                or rng.random() < self.explore:
+            genome = self._one_genome(*args, novelty=novelty)
+            if gate.get("open"):
+                self.last_strategy["model"] = {
+                    "used": False, "auc": round(gate["auc"], 3),
+                    "why": "novelty" if novelty else "exploration bypass"}
+            return genome
+        cands = []
+        for _ in range(self.SCREEN_CANDIDATES):
+            g = self._one_genome(*args)
+            cands.append((ol.score_genome(g), g,
+                          dict(self.last_strategy)))
+        cands.sort(key=lambda c: -c[0])
+        score, genome, strat = cands[0]
+        strat["model"] = {"used": True, "auc": round(gate["auc"], 3),
+                          "picked": round(score, 3),
+                          "n_cands": len(cands),
+                          "spread": round(score - cands[-1][0], 3)}
+        self.last_strategy = strat
+        return genome
 
     def _role_slots(self, n, hero=False):
         """Roles for n tower slots. With a hero anchoring, the hero IS
@@ -696,36 +974,54 @@ class MetaBrain:
 
     def _fresh_genome(self, rng, n_towers, pools, is_locked,
                       large_towers, tower_pool, price_of, track=None,
-                      hero=False):
+                      hero=False, novelty=False):
         pool = list(tower_pool or
                     [t for t in self.towers if t in ROUGH_COST])
         picks = []       # [(ttype, role), ...]
         if hero:
             picks.append(("hero", "hero"))   # free scaling: always early
         for role in self._role_slots(n_towers, hero=hero):
-            cands = pool if role == "free" else \
-                [t for t in self.roles.get(role, []) if t in pool] or pool
-            ttype = self._pick_tower(rng, cands, [t for t, _ in picks])
+            # Novelty opens the CARRY slot to every family: the map may
+            # want a core the role template would never audition (the
+            # meta keeps glue shallow -- this map might not).
+            if role == "free" or (novelty and role == "carry"):
+                cands = pool
+            else:
+                cands = [t for t in self.roles.get(role, [])
+                         if t in pool] or pool
+            ttype = self._pick_tower(rng, cands, [t for t, _ in picks],
+                                     novelty=novelty,
+                                     deep_slot=role == "carry")
             if ttype:
                 picks.append((ttype, role))
-        needs = self._coverage_fixes(rng, picks)
+        needs = self._coverage_fixes(rng, picks, tower_pool=pool)
         genome, meta = self._assemble(rng, picks, needs, pools, is_locked,
                                       large_towers, price_of, track)
         self.last_strategy = {
-            "kind": "meta", "explore": self.explore,
+            "kind": "novelty" if novelty else "meta",
+            "explore": self.explore,
             "placement": ("track" + ("+flow" if track.oriented else "")
                           if track and track.ok else "pools"),
             "roles": [f"{r}:{t}" for t, r in picks], **meta}
         return genome
 
+    def income(self, r):
+        """Cumulative cash expected by round r: the learned curve once
+        telemetry exists, the mode prior until then."""
+        if self._income_curve is not None:
+            return self._income_curve.cumulative(r)
+        return earned_by(r, self.mode)
+
     def _schedule(self, entries):
         """Assign every buy the round it should HAPPEN. Entries are
-        walked most-important-first along a rough income curve, so the
-        plan never wants more money than the game can have produced --
-        that is what stops the old buy-everything-at-once behavior.
-        Threat answers are pinned to land before their threat round even
-        if the curve says later (the executor's reserve makes the cash
-        appear in time). An upgrade never schedules before its tower."""
+        walked most-important-first along the income curve (learned from
+        telemetry when possible -- crucial in CHIMPS, where income is
+        pops-only), so the plan never wants more money than the game can
+        have produced -- that is what stops the old
+        buy-everything-at-once behavior. Threat answers are pinned to
+        land before their threat round even if the curve says later (the
+        executor's reserve makes the cash appear in time). An upgrade
+        never schedules before its tower."""
         order = sorted(range(len(entries)),
                        key=lambda i: (entries[i]["prio"],
                                       entries[i]["deadline"]))
@@ -734,8 +1030,8 @@ class MetaBrain:
         for i in order:
             e = entries[i]
             cum += e.get("est") or 500
-            r = 1
-            while r < 100 and earned_by(r) * 0.85 < cum:
+            r = self.start_round
+            while r < 100 and self.income(r) * 0.85 < cum:
                 r += 1
             if e.get("by"):                 # threat answers keep their
                 r = min(r, max(1, e["by"]))  # date whatever income says
@@ -875,14 +1171,16 @@ class MetaBrain:
             main_target = 5 if rng.random() < 0.10 else rng.randint(3, 4)
             cross_target = rng.randint(1, 2)
             want = {main: main_target, cross: cross_target}
-            for p_i, min_tier in need.items():
-                want[p_i] = max(want.get(p_i, 0), min_tier)
+            for p_i in need:
+                want[p_i] = max(want.get(p_i, 0),
+                                self._need_tier(need, p_i))
             # Two-path rule: only one path past tier 2. A threat answer
             # that itself needs tier 3+ (e.g. Signal Flare) outranks the
             # carry main; tier-2 needs survive being capped anyway.
             deep = [p for p, t in want.items() if t > 2]
             if len(deep) > 1:
-                deep_need = [p for p in deep if need.get(p, 0) > 2]
+                deep_need = [p for p in deep
+                             if self._need_tier(need, p) > 2]
                 keep = deep_need[0] if deep_need else \
                     (main if main in deep else deep[0])
                 for p in deep:
@@ -900,7 +1198,7 @@ class MetaBrain:
                         break
                     vec = [0, 0, 0]
                     vec[p_i] = 1
-                    is_need = tier <= need.get(p_i, 0)
+                    is_need = tier <= self._need_tier(need, p_i)
                     early_carry = (role == "carry" and p_i == main
                                    and tier <= 3)
                     dl = self._deadline(ttype, main, p_i, tier, need)
@@ -1058,6 +1356,215 @@ class MetaBrain:
                               "mutations": mutations}
         return genome
 
+    # ----------------------------------------------------- attempt mode
+
+    @staticmethod
+    def _merge_need(path, p_i, tier):
+        """Fold a threat requirement into a path vector without breaking
+        BTD6's build rules: only one path past tier 2, at most two paths
+        open. The need always survives; whatever conflicts gets capped
+        or closed instead."""
+        path = list(path)
+        path[p_i] = max(path[p_i], tier)
+        if path[p_i] > 2:
+            for q in range(3):
+                if q != p_i and path[q] > 2:
+                    path[q] = 2
+        open_paths = [q for q in range(3) if path[q] > 0]
+        if len(open_paths) > 2:
+            drop = min((q for q in open_paths if q != p_i),
+                       key=lambda q: path[q])
+            path[drop] = 0
+        return path
+
+    def attempt_genome(self, rng, pools, is_locked=None,
+                       large_towers=frozenset(), tower_pool=None,
+                       price_of=None, track=None, hero=False):
+        """Play to WIN: the best known layout replayed faithfully, plus
+        two surgical changes -- full threat coverage for this rung's
+        target, and a repair for whatever killed it last time (deepen
+        the answer to the threat nearest its death round; reinforce the
+        carry when the death matches no known threat). No exploration,
+        no mutation roulette: this is the champion's serious run.
+        Returns None when the rung has no elite to attempt yet."""
+        is_locked = is_locked or (lambda *a: False)
+        elites = self.elites(top=3)
+        if not elites:
+            return None
+        reward, row = elites[0]
+        towers = [dict(t) for t in row.get("towers", []) if t.get("at")]
+        pruned = []
+        for t in towers:
+            if all(_dist(t["at"], u["at"]) >= SEP for u in pruned):
+                pruned.append(t)
+        towers = pruned
+        if not towers:
+            return None
+        if hero and not any(t["tower"] == "hero" for t in towers):
+            others = [(x["tower"], x["at"]) for x in towers]
+            spot = self._spot_for(rng, "hero", pools,
+                                  [s for _, s in others], others, track)
+            if spot:
+                towers.insert(0, {"tower": "hero", "at": spot,
+                                  "path": [0, 0, 0]})
+        for t in towers:
+            t["path"] = list(t.get("path") or [0, 0, 0])
+        originals = [(t["tower"], list(t["path"])) for t in towers]
+        fixes = []
+
+        # 1. Full threat coverage for THIS rung's target (a champion
+        # seeded from an easier rung has never met a DDT).
+        carries = set(self.roles.get("carry", []))
+        picks = [(t["tower"],
+                  "carry" if t["tower"] in carries else "free")
+                 for t in towers]
+        pool = list(tower_pool or
+                    [t for t in self.towers if t in ROUGH_COST])
+        needs = self._coverage_fixes(rng, picks, tower_pool=pool)
+        for i, (ttype, _role) in enumerate(picks):
+            if towers[i]["tower"] != ttype:   # coverage swapped a species
+                fixes.append(f"swap:{towers[i]['tower']}->{ttype}")
+                towers[i]["tower"] = ttype
+                towers[i]["path"] = [0, 0, 0]
+        for i, want in needs.items():
+            for p_i in want:
+                tier = self._need_tier(want, p_i)
+                if towers[i]["path"][p_i] < tier:
+                    fixes.append(f"cover:{towers[i]['tower']}"
+                                 f" path{p_i + 1}->t{tier}")
+                towers[i]["path"] = self._merge_need(
+                    towers[i]["path"], p_i, tier)
+
+        # 2. Hazard repair: what killed this layout last time?
+        death = row.get("final_round") \
+            if row.get("outcome") == "defeat" else None
+        kind = None
+        if death is not None:
+            near, best_d = None, 5
+            for t in self.threats:
+                for r_ in t.get("rounds", []):
+                    if abs(r_ - death) < best_d:
+                        near, best_d = t, abs(r_ - death)
+            kind = near["kind"] if near else None
+        def covers(kind_, layout):
+            solvers_ = self.solutions.get(kind_, {})
+            for tt, path in layout:
+                req = solvers_.get(tt, "absent")
+                if req is None or (req != "absent"
+                                   and path[req[0]] >= req[1]):
+                    return True
+            return False
+        boosted = False
+        if death is not None and kind and kind in self.solutions:
+            solvers = self.solutions[kind]
+            now = [(t["tower"], t["path"]) for t in towers]
+            if covers(kind, originals):
+                # It HAD the answer and still died: deepen it -- but
+                # never at the cost of the champion's own deep path.
+                # Pushing a tier-2 crosspath answer to tier 3 makes it
+                # the tower's ONLY deep path and _merge_need would cap
+                # the tier-4/5 main down to 2: the "repair" would gut
+                # the very build being attempted. Such towers are
+                # skipped; the carry reinforcement below covers them.
+                for t in towers:
+                    req = solvers.get(t["tower"], "absent")
+                    if req is None or req == "absent":
+                        continue
+                    cur = t["path"][req[0]]
+                    if not (cur >= req[1] and cur < 5) \
+                            or is_locked(t["tower"], req[0], cur + 1):
+                        continue
+                    if cur + 1 > 2 and any(q != req[0] and t["path"][q] > 2
+                                           for q in range(3)):
+                        continue      # would cannibalize the main path
+                    t["path"] = self._merge_need(t["path"], req[0],
+                                                 cur + 1)
+                    fixes.append(f"deepen:{t['tower']} vs {kind}")
+                    boosted = True
+                    break
+            elif covers(kind, now):
+                # It died BECAUSE the answer was missing, and the
+                # coverage pass above just added it -- that IS the
+                # repair; piling a deeper tier on top would only starve
+                # the rest of the build.
+                boosted = True
+        if death is not None and not boosted:
+            # No named threat (or a base-solved one): more raw DPS.
+            carry = next((t for t in towers if t["tower"] in carries),
+                         None)
+            carry = carry or max(
+                (t for t in towers if t["tower"] != "hero"),
+                key=lambda t: max(t["path"]), default=None)
+            if carry is not None and max(carry["path"]) < 5:
+                main = carry["path"].index(max(carry["path"])) \
+                    if max(carry["path"]) else \
+                    self._pick_build(rng, carry["tower"])[0]
+                if not is_locked(carry["tower"], main,
+                                 carry["path"][main] + 1):
+                    carry["path"] = self._merge_need(
+                        carry["path"], main, carry["path"][main] + 1)
+                    fixes.append(f"reinforce:{carry['tower']}")
+
+        def base_cost(ttype):
+            if price_of:
+                known = price_of(ttype)
+                if known:
+                    return known
+            return ROUGH_COST.get(ttype, 600)
+
+        def tier_cost(ttype, p_i, tier):
+            if price_of:
+                try:
+                    known = price_of(ttype, p_i, tier)
+                except TypeError:
+                    known = None
+                if known:
+                    return known
+            return TIER_EST.get(tier, 800)
+
+        entries = []
+        for i, t in enumerate(towers):    # pin needs BEFORE re-sorting
+            t["_need"] = needs.get(i, {})
+        towers.sort(key=lambda t: (0 if t["tower"] == "hero" else 1,
+                                   base_cost(t["tower"])))
+        for order, t in enumerate(towers):
+            entries.append({"do": "place", "tower": t["tower"],
+                            "at": list(t["at"]), "ref": order,
+                            "name": f"{t['tower']}#{order}(attempt)",
+                            "prio": 0, "deadline": 1.0 + order,
+                            "est": base_cost(t["tower"])})
+            if t["tower"] == "hero":
+                continue          # heroes level up on their own: no buys
+            path = t["path"]
+            main = path.index(max(path)) if max(path) else 0
+            need_here = t["_need"]
+            for p_i, target_tier in enumerate(path):
+                for tier in range(1, min(target_tier, 5) + 1):
+                    if is_locked(t["tower"], p_i, tier):
+                        break
+                    vec = [0, 0, 0]
+                    vec[p_i] = 1
+                    dl = self._deadline(t["tower"], main, p_i, tier,
+                                        need_here)
+                    is_need = tier <= self._need_tier(need_here, p_i)
+                    entry = {"do": "upgrade", "ref": order, "path": vec,
+                             "prio": 0 if is_need
+                             else (1 if p_i == main else 2),
+                             "deadline": dl,
+                             "est": tier_cost(t["tower"], p_i, tier)}
+                    if is_need:
+                        entry["by"] = int(dl)
+                    entries.append(entry)
+        genome = self._schedule(entries)
+        self.last_strategy = {
+            "kind": f"attempt(r{row.get('final_round')},"
+                    f"{row.get('outcome')})",
+            "explore": 0.0,
+            "placement": ("track" + ("+flow" if track.oriented else "")
+                          if track and track.ok else "pools"),
+            "mutations": fixes}
+        return genome
+
     # ---------------------------------------------------------- describe
 
     def describe_genome(self, genome):
@@ -1079,9 +1586,15 @@ class MetaBrain:
         return out
 
     def report(self, track=None, mask_points=None):
+        rung = self.difficulty if self.mode == "standard" else self.mode
+        n_global = sum(a + b for a, b in self.g_post.values())
         lines = [f"MetaBrain report -- map '{self.map_name}', "
-                 f"difficulty {self.difficulty}, target r{self.target}",
-                 f"episodes learned from: {len(self.history)}", ""]
+                 f"rung {rung}, target r{self.target}",
+                 f"episodes learned from: {len(self.history)} on this "
+                 f"rung"
+                 + (f" (+{n_global:.0f} transferred from other "
+                    f"maps/rungs, capped at {GLOBAL_CAP:.0f})"
+                    if n_global else ""), ""]
         if track and track.ok and mask_points:
             ranked = sorted(mask_points,
                             key=lambda p: -track.exposure(p, 0.06))[:5]
@@ -1107,10 +1620,14 @@ class MetaBrain:
             if post is None:
                 prior_only.append(ttype)
                 continue
-            a, b = post
-            p0 = self._prior(ttype)
-            seen = (a + b) - (p0[0] + p0[1])
-            mean = a / (a + b)
+            la, lb = post
+            pa, pb = self._prior(ttype)
+            ga, gb = self.g_post.get(ttype, (0.0, 0.0))
+            tot = ga + gb
+            if tot > GLOBAL_CAP:
+                ga, gb = ga * GLOBAL_CAP / tot, gb * GLOBAL_CAP / tot
+            seen = la + lb
+            mean = (pa + ga + la) / (pa + pb + ga + gb + la + lb)
             delta = mean - score / 100.0
             verdict = ("meta confirmed" if abs(delta) < 0.08 else
                        "outperforming meta" if delta > 0 else
@@ -1148,6 +1665,22 @@ class MetaBrain:
                 lines.append(f"deaths cluster near r{worst} -- likely "
                              f"threat: {near[0]['threat']} "
                              f"(answers: {near[0]['answers']})")
+        lines.append("")
+        if learner_mod is not None:
+            lines += self._outcome_learner(track).report_lines()
+            if self._income_curve is not None:
+                lines.append(self._income_curve.describe())
+            benefit = learner_mod.model_benefit(self.history)
+            if benefit:
+                lines.append(
+                    f"model benefit: screened episodes average "
+                    f"r{benefit['screened_mean_round']:.1f} "
+                    f"(n={benefit['screened_n']}) vs "
+                    f"r{benefit['unscreened_mean_round']:.1f} "
+                    f"unscreened (n={benefit['unscreened_n']})")
+        else:
+            lines.append("learner.py missing -- ML screening disabled, "
+                         "playing on priors + evolution only")
         return "\n".join(lines)
 
 
@@ -1473,6 +2006,25 @@ def _selftest():
         # MOAB prep must land before round 40.
         b5 = MetaBrain("selftest_map", "hard", target_round=80,
                        explore=0.0, knowledge=k, runs_path="/nonexistent")
+        moab_sol = b5.solutions["moab"]
+
+        def moab_prepped(g, by_round=38):
+            """A tier<=4 MOAB answer actually scheduled by `by_round`
+            (whether its 'by' cap says 38 or the carry's own early
+            deadline got there first)."""
+            types = {x["ref"]: x["tower"] for x in g if x["do"] == "place"}
+            tiers = {}
+            for x in g:
+                if x["do"] != "upgrade" or x["round"] > by_round:
+                    continue
+                key2 = (x["ref"], x["path"].index(1))
+                tiers[key2] = tiers.get(key2, 0) + 1
+            for (ref, p_i), t in tiers.items():
+                req = moab_sol.get(types[ref], "absent")
+                if req not in (None, "absent") and req[1] <= 4 \
+                        and p_i == req[0] and t >= req[1]:
+                    return True
+            return False
         endgame = moab_prep = 0
         for i in range(20):
             g = b5.next_genome(rng, 4, tpools, tower_pool=pool,
@@ -1480,7 +2032,7 @@ def _selftest():
             rounds = [x["round"] for x in g]
             assert max(rounds) <= 78, "buy scheduled past a hard game"
             endgame += any(r > 40 for r in rounds)
-            moab_prep += any(x.get("by") == 38 for x in g)
+            moab_prep += moab_prepped(g)
         assert endgame >= 16, \
             f"target 80 but no endgame buys scheduled ({endgame}/20)"
         assert moab_prep >= 16, \
@@ -1491,6 +2043,220 @@ def _selftest():
               f"{hero_ok}/30, upgrade-first {early_ok}/30, endgame "
               f"scheduling at target 80 in {endgame}/20 with MOAB prep "
               f"by r38 in {moab_prep}/20")
+
+    # ----- build-rule merging for threat requirements
+    assert MetaBrain._merge_need([3, 0, 2], 1, 3) == [0, 3, 2]
+    assert MetaBrain._merge_need([0, 0, 0], 2, 4) == [0, 0, 4]
+    assert MetaBrain._merge_need([4, 2, 0], 0, 5) == [5, 2, 0]
+    assert MetaBrain._merge_need([2, 0, 2], 1, 2) in ([2, 2, 0],
+                                                      [0, 2, 2])
+
+    # ----- income priors: CHIMPS pays less through the early/mid game
+    # (no end-of-round bonuses) and grows monotonically. Late-game
+    # absolute levels legitimately exceed the standard quadratic, which
+    # is a pacing heuristic, not a pop-income model.
+    assert all(earned_by(r, "chimps") <= earned_by(r)
+               for r in range(6, 46)), \
+        "chimps income prior must undercut the standard curve early"
+    assert all(earned_by(r, "chimps") < earned_by(r + 1, "chimps")
+               for r in range(6, 110)), \
+        "chimps income prior must be strictly increasing"
+
+    # ----- transfer: foreign episodes shift priors, capped, not history
+    bt = MetaBrain("fresh_map", "easy", target_round=40, explore=0.0,
+                   knowledge=k, runs_path="/nonexistent")
+    for i in range(25):
+        bt.observe({"mode": "farm", "map": "elsewhere",
+                    "difficulty": "easy", "outcome": "survived",
+                    "final_round": 40,
+                    "towers": [{"tower": "mortar", "at": [0.5, 0.5],
+                                "path": [0, 4, 0]}]}, quiet=True)
+        bt.observe({"mode": "farm", "map": "elsewhere",
+                    "difficulty": "easy", "outcome": "defeat",
+                    "final_round": 5,
+                    "towers": [{"tower": "engineer", "at": [0.5, 0.5],
+                                "path": [0, 4, 0]}]}, quiet=True)
+    assert not bt.history, "foreign rows must not enter local history"
+    rng2 = random.Random(5)
+
+    def mean_theta(tt, n=400):
+        return sum(bt._theta(rng2, tt) for _ in range(n)) / n
+    pm, pe = bt._prior("mortar"), bt._prior("engineer")
+    assert mean_theta("mortar") > pm[0] / sum(pm) + 0.03, \
+        "25 foreign wins should lift the mortar prior"
+    assert mean_theta("engineer") < pe[0] / sum(pe) - 0.03, \
+        "25 foreign deaths should sink the engineer prior"
+    lift = mean_theta("mortar") - pm[0] / sum(pm)
+    assert lift < 0.35, f"transfer must stay capped (lift {lift:.2f})"
+
+    # Same-map near-wins from other rungs seed the elite pool, discounted.
+    bt2 = MetaBrain("fresh_map", "hard", target_round=100, explore=0.0,
+                    knowledge=k, runs_path="/nonexistent", mode="chimps",
+                    start_round=6)
+    bt2.observe({"mode": "farm", "map": "fresh_map",
+                 "difficulty": "easy", "outcome": "survived",
+                 "final_round": 40,
+                 "towers": [{"tower": "tack", "at": [0.3, 0.3],
+                             "path": [0, 0, 4]}]}, quiet=True)
+    el = bt2.elites()
+    assert el and el[0][1]["towers"][0]["tower"] == "tack" \
+        and abs(el[0][0] - 0.8) < 1e-6, \
+        f"seed elites must appear discounted: {el}"
+
+    # ----- model screening: engages only through the gate, and the
+    # explore fraction still bypasses it (brain has 60 separable rows)
+    used = bypass = 0
+    for i in range(30):
+        brain.next_genome(rng, 4, pools, tower_pool=pool)
+        m = brain.last_strategy.get("model")
+        if m and m.get("used"):
+            used += 1
+            assert m["n_cands"] == MetaBrain.SCREEN_CANDIDATES
+            assert m["auc"] >= 0.62
+        elif m:
+            bypass += 1
+    assert used >= 10, f"model screening never engaged (used {used}/30)"
+    assert bypass >= 1, "exploration must still bypass the screen"
+    closed = MetaBrain("selftest_map", "easy", target_round=40,
+                       explore=0.0, knowledge=k,
+                       runs_path="/nonexistent")
+    closed.next_genome(rng, 4, pools, tower_pool=pool)
+    assert not (closed.last_strategy.get("model") or {}).get("used"), \
+        "no data means the gate is closed and the model has no vote"
+
+    if mask_path.exists():
+        # ----- CHIMPS: full-length threat coverage under pops-only pace
+        bc = MetaBrain("selftest_map", "hard", target_round=100,
+                       explore=0.0, knowledge=k, runs_path="/nonexistent",
+                       mode="chimps", start_round=6)
+        assert bc.income(50) == earned_by(50, "chimps")
+
+        def covered_by(g, kind, by_round, cap=5):
+            sol = bc.solutions[kind]
+            types = {x["ref"]: x["tower"] for x in g
+                     if x["do"] == "place"}
+            for x in g:
+                if x["do"] == "place" and sol.get(x["tower"], "x") is None \
+                        and x["round"] <= by_round:
+                    return True
+            tiers = {}
+            for x in g:
+                if x["do"] != "upgrade" or x["round"] > by_round:
+                    continue
+                key2 = (x["ref"], x["path"].index(1))
+                tiers[key2] = tiers.get(key2, 0) + 1
+            for (ref, p), t in tiers.items():
+                req = sol.get(types[ref], "absent")
+                if req not in (None, "absent") and req[1] <= cap \
+                        and p == req[0] and t >= req[1]:
+                    return True
+            return False
+        cstats = {"camo": 0, "lead": 0, "ceramic": 0, "ddt": 0,
+                  "bad": 0, "endgame": 0}
+        for i in range(20):
+            g = bc.next_genome(rng, 5, tpools, tower_pool=pool,
+                               track=track, hero=True)
+            assert max(x["round"] for x in g) <= 98, \
+                "buy scheduled past a chimps game"
+            cstats["endgame"] += any(x["round"] > 60 for x in g)
+            cstats["camo"] += covered_by(g, "camo", 22)
+            cstats["lead"] += covered_by(g, "lead", 27)
+            cstats["ceramic"] += covered_by(g, "ceramic", 61, cap=4)
+            cstats["ddt"] += covered_by(g, "ddt", 88)
+            cstats["bad"] += covered_by(g, "bad", 98)
+        for kind in ("camo", "lead", "ceramic", "ddt", "bad"):
+            assert cstats[kind] >= 19, \
+                f"chimps genomes missing {kind} coverage: {cstats}"
+        assert cstats["endgame"] >= 12, \
+            f"chimps plans must schedule into the endgame: {cstats}"
+
+        # ----- attempt mode: champion replayed, repaired, no roulette
+        bA = MetaBrain("selftest_map", "hard", target_round=100,
+                       explore=0.0, knowledge=k, runs_path="/nonexistent",
+                       mode="chimps", start_round=6)
+        assert bA.attempt_genome(rng, tpools, track=track, hero=True) \
+            is None, "no elite yet -> no attempt"
+        row = {"mode": "solve", "map": "selftest_map",
+               "difficulty": "hard", "game_mode": "chimps",
+               "outcome": "defeat", "final_round": 91,
+               "towers": [
+                   {"tower": "boomerang", "at": list(pts[10]),
+                    "path": [0, 2, 4]},
+                   {"tower": "alchemist", "at": list(pts[40]),
+                    "path": [4, 2, 0]},
+                   {"tower": "ninja", "at": list(pts[80]),
+                    "path": [4, 0, 2]},
+                   {"tower": "hero", "at": list(pts[120]),
+                    "path": [0, 0, 0]}]}
+        bA.observe(row, quiet=True)
+        g = bA.attempt_genome(rng, tpools, track=track, hero=True)
+        assert g is not None
+        assert bA.last_strategy["kind"].startswith("attempt(r91")
+        fixes = bA.last_strategy["mutations"]
+        assert fixes, "a dead champion must get repaired"
+        assert not any(f.startswith("deepen:") for f in fixes), \
+            "missing answer newly covered -- deepening on top overspends"
+        orig_spots = {tuple(t["at"]) for t in row["towers"]}
+        for x in g:
+            if x["do"] == "place":
+                assert tuple(x["at"]) in orig_spots, \
+                    "attempt must keep the champion's spots"
+        assert covered_by(g, "ddt", 88), \
+            "died at r91 (DDTs) -- the attempt must answer them"
+        hero_refs = {x["ref"] for x in g if x["do"] == "place"
+                     and x["tower"] == "hero"}
+        assert hero_refs and not any(
+            x["do"] == "upgrade" and x["ref"] in hero_refs for x in g)
+        # A champion that HAD the answer and still died gets it deepened.
+        row2 = dict(row)
+        row2["towers"] = [
+            {"tower": "ninja", "at": list(pts[10]), "path": [0, 4, 0]},
+            {"tower": "super", "at": list(pts[40]), "path": [3, 0, 2]},
+            {"tower": "hero", "at": list(pts[120]), "path": [0, 0, 0]}]
+        row2["final_round"] = 95
+        bA2 = MetaBrain("selftest_map", "hard", target_round=100,
+                        explore=0.0, knowledge=k,
+                        runs_path="/nonexistent", mode="chimps",
+                        start_round=6)
+        bA2.observe(row2, quiet=True)
+        g2 = bA2.attempt_genome(rng, tpools, track=track, hero=True)
+        assert any(f.startswith("deepen:ninja") for f in
+                   bA2.last_strategy["mutations"]), \
+            f"owned answer that failed must deepen: " \
+            f"{bA2.last_strategy['mutations']}"
+
+        # Deepen must NEVER gut the champion's own deep path: a tier-2
+        # CROSSPATH threat answer (boomerang's lead = bottom [2,2]) on a
+        # tower whose main is tier 4 must not be pushed to tier 3, which
+        # would cap the tier-4 main down to tier 2. The repair falls
+        # through to reinforcing the carry instead.
+        bA3 = MetaBrain("selftest_map", "easy", target_round=40,
+                        explore=0.0, knowledge=k,
+                        runs_path="/nonexistent")
+        bA3.observe({"mode": "solve", "map": "selftest_map",
+                     "difficulty": "easy", "game_mode": "standard",
+                     "outcome": "defeat", "final_round": 29,
+                     "towers": [
+                         {"tower": "boomerang", "at": list(pts[10]),
+                          "path": [0, 4, 2]},
+                         {"tower": "ninja", "at": list(pts[60]),
+                          "path": [0, 2, 0]}]}, quiet=True)
+        g3 = bA3.attempt_genome(rng, tpools, track=track)
+        boom = {}
+        for x in g3:
+            if x["do"] == "place" and x["tower"] == "boomerang":
+                boom["ref"] = x["ref"]; boom["path"] = [0, 0, 0]
+        for x in g3:
+            if x["do"] == "upgrade" and x["ref"] == boom.get("ref"):
+                boom["path"][x["path"].index(1)] += 1
+        assert boom["path"][1] >= 4, \
+            f"deepen gutted the champion main: boomerang {boom['path']}"
+        assert not any(f.startswith("deepen:boomerang") for f in
+                       bA3.last_strategy["mutations"]), \
+            f"crosspath deepen should have been skipped: " \
+            f"{bA3.last_strategy['mutations']}"
+        print(f"chimps/attempt OK: coverage {cstats}, attempt fixes "
+              f"{fixes}")
 
     print("selftest OK: genome format, two-path rule, exploration floor,")
     print("posterior learning, evolution engagement, spot learning, and")
