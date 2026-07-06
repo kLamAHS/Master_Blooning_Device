@@ -758,7 +758,7 @@ class MetaBrain:
         reqs = (need or {}).get(p_i)
         return max((t for t, _by in reqs), default=0) if reqs else 0
 
-    def _coverage_fixes(self, rng, picks):
+    def _coverage_fixes(self, rng, picks, tower_pool=None):
         """Make sure the layout answers the threats it will actually meet
         before target_round (Meta thesis #2: solve every property) --
         camo and lead early, MOAB prep past round 40, and for full-length
@@ -830,12 +830,21 @@ class MetaBrain:
             if not policy["swap"] or rng.random() < self.explore:
                 continue
             solver_types = [t for t, req in solvers.items()
-                            if t in self.towers]
+                            if t in self.towers
+                            and (tower_pool is None or t in tower_pool)]
             if not solver_types:
                 continue
             best = max(solver_types, key=lambda t: self._theta(rng, t))
             for i in range(len(picks) - 1, -1, -1):
-                if picks[i][0] not in carries and picks[i][0] != "hero":
+                if picks[i][0] not in carries and picks[i][0] != "hero" \
+                        and i not in needs:
+                    # Only a tower NO earlier threat depends on may be
+                    # replaced -- swapping out an answerer would orphan
+                    # its needs onto the new species (dead buys) and
+                    # could reopen the very hole an earlier kind just
+                    # closed. If every support already answers
+                    # something, this threat stays on the carry's raw
+                    # DPS rather than trading one hole for another.
                     picks[i] = (best, picks[i][1])
                     req = solvers[best]
                     if req is not None:
@@ -985,7 +994,7 @@ class MetaBrain:
                                      deep_slot=role == "carry")
             if ttype:
                 picks.append((ttype, role))
-        needs = self._coverage_fixes(rng, picks)
+        needs = self._coverage_fixes(rng, picks, tower_pool=pool)
         genome, meta = self._assemble(rng, picks, needs, pools, is_locked,
                                       large_towers, price_of, track)
         self.last_strategy = {
@@ -1409,7 +1418,9 @@ class MetaBrain:
         picks = [(t["tower"],
                   "carry" if t["tower"] in carries else "free")
                  for t in towers]
-        needs = self._coverage_fixes(rng, picks)
+        pool = list(tower_pool or
+                    [t for t in self.towers if t in ROUGH_COST])
+        needs = self._coverage_fixes(rng, picks, tower_pool=pool)
         for i, (ttype, _role) in enumerate(picks):
             if towers[i]["tower"] != ttype:   # coverage swapped a species
                 fixes.append(f"swap:{towers[i]['tower']}->{ttype}")

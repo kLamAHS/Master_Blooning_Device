@@ -2848,7 +2848,12 @@ def run_episode(screen, cfg, genome, final_round, abort_lives=50,
 
         endgame_watch = (play_out and last_round is not None
                          and last_round >= final_round)
-        if misreads == 12 and not endgame_watch:  # stuck panel? clear it
+        # During the endgame watch, a dark counter with READABLE lives
+        # is a stuck ghost/panel (the victory screen covers the whole
+        # HUD, lives included) -- those still get cleared. Only the
+        # everything-dark state is left alone: poking at a victory
+        # screen navigates menus blindly.
+        if misreads == 12 and not (endgame_watch and lives is None):
             if looks_defeated(screen):
                 dbg("DEFEAT screen recognized (via dark counter)")
                 outcome = "defeat"
@@ -2860,16 +2865,17 @@ def run_episode(screen, cfg, genome, final_round, abort_lives=50,
                 outcome = "survived"
                 break
             # Play THROUGH the final round: the victory screen covers
-            # the round counter (misreads climb while no defeat screen
-            # shows), or the counter just sits on the final number for
-            # minutes after the last buy. Both mean the game is WON --
-            # a leak on the final round still hits the defeat/lives
-            # checks above first. No UI-clearing in this state: poking
-            # at a victory screen navigates menus blindly.
+            # the WHOLE HUD -- round counter unreadable AND lives
+            # unreadable, with no defeat screen (the defeat screen
+            # keeps the round counter visible, and a mere stuck ghost
+            # keeps lives visible). As a last resort, a final round
+            # that sat finished for minutes counts too -- a leak on
+            # the final round still hits the defeat/lives checks
+            # above first.
             final_seen = final_seen or time.time()
-            if misreads >= 8:
-                dbg("HUD covered after the final round with no defeat "
-                    "screen -- that's the victory screen")
+            if misreads >= 8 and lives is None and prev_lives is None:
+                dbg("whole HUD covered after the final round with no "
+                    "defeat screen -- that's the victory screen")
                 outcome = "survived"
                 break
             if time.time() - final_seen > 240:
