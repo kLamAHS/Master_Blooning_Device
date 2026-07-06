@@ -617,6 +617,21 @@ by the *median* per-pixel red-shift and resamples borderline readings, so
 transients can't flip a verdict; if a skin still causes trouble, check the
 game's settings for an option to disable seasonal decorations and rescan.
 
+**It used to restart a live game mid-round ("hud_lost").** If the
+round-counter OCR failed for a stretch — a MOAB drifting over the box,
+a heavy effect, a crop that shifted — the bot would conclude the HUD
+was gone and restart a game that was actually alive and winning, so it
+never got much past the round where the reads first faltered. Fixed:
+the bot now consults the *lives* counter before ever restarting. A
+readable, positive lives count means the game is up and only the
+round-OCR is struggling, so instead of restarting it clears any stray
+UI and re-locates the counter from the settings gear (healing a drifted
+crop), and keeps playing. It only gives up when the **whole** HUD is
+gone — lives unreadable too — which is the genuine lost-window case. If
+you still see it happen, run `python mk.py watch` to confirm the
+counter reads cleanly at the round it stalls on, and check the game
+window hasn't been moved since calibration.
+
 ## Bookkeeping the bot does for you
 
 - **`prices.json` — a self-learned price book.** Every purchase records

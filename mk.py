@@ -57,7 +57,7 @@ import numpy as np
 import mss
 import pyautogui
 
-BUILD = "2026-07-06.r10"  # printed at startup: ties every log to a build
+BUILD = "2026-07-06.r11"  # printed at startup: ties every log to a build
 
 DEBUG = True     # verbose decision logging; pass --quiet to farm/play
 
@@ -2502,6 +2502,8 @@ def run_episode(screen, cfg, genome, final_round, abort_lives=50,
     zero_streak = 0
     dumped_defeat_check = False
     misreads = 0
+    blind_since = None            # when the counter went continuously dark
+    last_blind_recovery = 0.0     # throttle for clear/recalibrate attempts
     outcome = "hud_lost"
     while True:
         unpause_if_needed(screen, cfg)        # cheap; a paused game shows
@@ -2524,6 +2526,7 @@ def run_episode(screen, cfg, genome, final_round, abort_lives=50,
                 misreads += 1
         else:
             misreads = 0
+            blind_since = None                # counter is readable again
             if accepted != last_round:
                 last_round = accepted
                 if lives is not None:
@@ -2898,8 +2901,59 @@ def run_episode(screen, cfg, genome, final_round, abort_lives=50,
                 final_seen = None
         else:
             final_seen = None
-        if misreads >= 25:                    # HUD truly gone: unknown state
-            break
+        if misreads >= 25:
+            # The round counter has been unreadable for a long stretch.
+            # Before doing anything drastic, ask the OTHER half of the
+            # HUD: readable, positive LIVES mean the game is ALIVE and
+            # almost certainly winning -- only the round-counter OCR is
+            # struggling (a MOAB or effect over the box, a drifted
+            # crop). Restarting here throws away a live game, and that
+            # false mid-round restart is exactly the "it randomly thinks
+            # it lost the HUD and restarts" failure. So DON'T give up
+            # while lives are alive: try to HEAL the counter (clear
+            # stray UI, re-locate the box from the gear), and keep
+            # playing. Only conclude the episode when a build-complete
+            # defense has held blind for minutes (it effectively won) --
+            # or when lives go unreadable too (the whole HUD is gone).
+            alive = (lives is not None and lives > 0
+                     and not looks_defeated(screen))
+            if alive:
+                blind_since = blind_since or time.time()
+                now = time.time()
+                blind_for = now - blind_since
+                if now - last_blind_recovery > 12:
+                    last_blind_recovery = now
+                    dbg(f"round counter unreadable ({misreads}x) but "
+                        f"lives={lives}: game is alive -- NOT "
+                        f"restarting. Clearing UI and re-locating the "
+                        f"counter.")
+                    clear_ui(screen, cfg)
+                    try:
+                        preflight_round_box(screen, cfg, recalibrate=True)
+                    except Exception:
+                        pass          # recalibration is best-effort
+                # A defense holding blind with lives still up has
+                # effectively survived. End a build-complete run after
+                # 3 min, ANY run after 6 min, so a permanently dead
+                # counter can't hang the episode. (A blind run whose
+                # lives FALL is ended as a defeat by the frozen-round
+                # net above, which triggers on lives < 40.)
+                if (not queue and blind_for > 180) or blind_for > 360:
+                    dbg("counter dark for minutes but lives held -- the "
+                        "defense survived")
+                    outcome = "survived"
+                    break
+            else:
+                # Whole HUD gone (lives unreadable too), or lives at 0.
+                # In a play-out at/after the final round that is the
+                # victory screen covering everything (the defeat screen
+                # keeps the counter visible), not a lost window.
+                if play_out and last_round is not None \
+                        and last_round >= final_round \
+                        and lives is None and not looks_defeated(screen):
+                    dbg("whole HUD covered at the final round -- victory")
+                    outcome = "survived"
+                break                 # else: genuinely unknown/dead state
         if not queue and not observing:
             observing = True
             print("   build complete -- observing until survive/abort")
