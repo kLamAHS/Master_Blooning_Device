@@ -79,6 +79,14 @@ once; after that your daily loop is just steps 6–8.
    `--mode chimps` / `--difficulty hard` (override detection),
    `--no-hero`, `--no-abilities`, `--seed N`.
 
+   Once the model has beaten a rung, **run the finished bot on demand**
+   with `deploy` (see the "Deploy" section) — it replays the trained
+   champion straight, no exploration:
+
+   ```
+   python mk.py deploy monkey_meadow
+   ```
+
 8. **Check the ladder** anytime (no game needed):
 
    ```
@@ -124,6 +132,7 @@ once; after that your daily loop is just steps 6–8.
     python learner.py selftest
     python campaign.py selftest
     python tools/simulate_solve.py --seeds 5 --ablate   # end-to-end sim
+    python tools/simulate_solve.py --deploy --seeds 5   # deploy path
     ```
 
 **Emergency stop, anytime:** slam the mouse into the top-left corner of
@@ -512,6 +521,55 @@ capped global posterior (a new rung starts from everything the ladder
 below it learned), near-winning layouts from lower rungs seed the new
 rung's evolution pool, and the price book is shared. Beating easy makes
 medium faster; beating hard makes CHIMPS plausible.
+
+## Deploy: run the finished model as a bot
+
+`solve` is a *training* loop — it explores, throwing fresh and evolved
+layouts to gather data even after it's found something that works.
+`deploy` is what you run **once the model is trained**: it loads
+everything `farm`/`solve` learned (tower posteriors, the elite layouts,
+the income curve, the price book — all reconstructed from
+`runs_log.jsonl` at startup) and plays the **champion** straight. No
+exploration, no mutation roulette, no learning — just the single best
+layout found for the loaded rung, repaired for this rung's full threat
+coverage, played through to an actual win. Load the map on the rung you
+want cleared and run:
+
+```
+python mk.py deploy monkey_meadow
+```
+
+- **It refuses to guess.** If no layout has ever survived this rung (and
+  none transferred up from an easier one), there is nothing to deploy —
+  the bot says so and points you at `solve`/`farm` instead of improvising
+  a random layout. "Run the *finished* model" means the model has to be
+  finished first.
+- **It exploits the ladder too.** A champion that beat an easier rung of
+  the same map seeds the deploy (discounted), and the threat-coverage
+  repair adds whatever this harder rung needs (a champion from easy has
+  never met a DDT) — so a solved easy map can often deploy straight onto
+  medium.
+- **Deployment leaves the training set alone.** By default nothing is
+  written to `runs_log.jsonl`, so replaying the same winner a hundred
+  times can't skew the posteriors `solve` relies on. It *does* record
+  each result in `progress.json` (the honest scoreboard of what the bot
+  can actually clear), and the self-learned price book still fills in as
+  normal. Pass `--log` to instead treat deploy games as fresh evidence
+  and let the champion adapt in-session.
+
+Useful flags: `--games N` (play N games back to back — auto-restarts
+between them, so it needs the same restart calibration as `farm`),
+`--difficulty` / `--mode chimps` / `--final-round N` (override
+detection), `--log`, `--no-hero`, `--no-abilities`, `--pool classic`,
+`--seed N`. Equip a hero first, same as `solve`.
+
+The deploy path is regression-tested offline against the same simulated
+game the solving stack uses — train a champion, then play it straight and
+confirm the finished model wins on its own:
+
+```
+python tools/simulate_solve.py --deploy --seeds 5
+```
 
 ## The ML layer — models that must earn their vote
 

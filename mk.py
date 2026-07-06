@@ -25,6 +25,10 @@ Subcommands
                        and mode auto-detected, CHIMPS included) --
                        explore/attempt episodes until the final round is
                        actually beaten, then record it in progress.json.
+  deploy <map_name>    Run the FINISHED trained model as a bot: replay
+                       the champion layout straight to win the loaded
+                       rung -- no exploration, no learning. Needs a
+                       champion (train one with farm/solve first).
   campaign             Show the per-map ladder scoreboard (easy ->
                        medium -> hard -> CHIMPS) from progress.json.
 
@@ -57,7 +61,7 @@ import numpy as np
 import mss
 import pyautogui
 
-BUILD = "2026-07-06.r11"  # printed at startup: ties every log to a build
+BUILD = "2026-07-06.r12"  # printed at startup: ties every log to a build
 
 DEBUG = True     # verbose decision logging; pass --quiet to farm/play
 
@@ -3602,6 +3606,232 @@ def cmd_solve(args):
         print(line)
 
 
+def cmd_deploy(args):
+    """Run the FINISHED, trained model as a bot. Where `solve` keeps
+    exploring -- throwing fresh and evolved layouts to gather data --
+    `deploy` does none of that: it loads everything `farm`/`solve`
+    already learned (tower posteriors, elite layouts, income curve, the
+    price book -- all reconstructed from runs_log.jsonl) and plays the
+    CHAMPION straight. The single best layout found for the loaded rung,
+    repaired for full threat coverage, played through to an actual win.
+    Pure exploitation: no roulette, no mutation, and -- unless --log is
+    passed -- nothing written back to the training set, so re-running the
+    same winner never skews the posteriors that `solve` depends on. If no
+    champion has been trained for this rung yet, it says so plainly
+    instead of improvising a random layout."""
+    import campaign
+    try:
+        import meta as meta_mod
+    except ImportError:
+        sys.exit("deploy needs meta.py next to mk.py.")
+    api = getattr(meta_mod, "META_API", 0)
+    if api != 4:
+        sys.exit(f"meta.py reports API {api}, this mk.py needs 4 -- "
+                 "re-download the whole branch and delete __pycache__.")
+    if args.games < 1:
+        sys.exit("--games must be at least 1.")
+
+    cfg = load_config()
+    setup_tesseract(cfg)
+    screen, hwnd = make_screen(cfg)
+    if args.games > 1:
+        missing = [k for k in ("defeat_restart", "pause_restart",
+                               "restart_confirm") if not cfg.get(k)]
+        if missing:
+            sys.exit("deploy --games >1 restarts between games, which "
+                     "needs the same one-time calibration as farm. "
+                     f"Missing in config.json: {', '.join(missing)}.\n"
+                     "See the README's farm section (three `locate` "
+                     "points), or play a single game with --games 1.")
+    mask_path = find_mask_path({"map": args.name}, Path.cwd() / "_")
+    if mask_path is None:
+        sys.exit(f"No mask found for '{args.name}' -- run `scan "
+                 f"{args.name}` first.")
+    load_mask(mask_path)
+
+    global PRICE_DIFFICULTY
+    rng = random.Random(args.seed)
+    runs_path = Path(__file__).parent / "runs_log.jsonl"
+
+    print(f"Deploying the trained bot on '{args.name}': the champion "
+          f"strategy, played to win ({args.games} "
+          + ("game" if args.games == 1 else "games") + " this session).")
+    print("Load the map fresh (round not started) and walk away. "
+          "Starting in 5 seconds...")
+    focus_game_window(hwnd)
+    time.sleep(5)
+    if not preflight_round_box(screen, cfg):
+        sys.exit("Round counter unreadable -- fix with `watch` first.")
+    if not preflight_cash_box(screen, cfg):
+        print("Cash not readable yet -- will recalibrate at each "
+              "game start.")
+    if not preflight_lives_box(screen, cfg):
+        print("Lives not readable yet -- will recalibrate at each "
+              "game start. Rung detection needs it, so pass "
+              "--difficulty/--mode if detection fails.")
+
+    lv, start_round, difficulty, game_mode = detect_loaded_rung(
+        screen, cfg, flag_difficulty=args.difficulty,
+        flag_mode=args.mode)
+    if difficulty is None:
+        sys.exit(f"Couldn't detect the loaded difficulty (lives read "
+                 f"{lv}, start round {start_round}) -- pass "
+                 f"--difficulty (and --mode chimps if applicable).")
+    PRICE_DIFFICULTY = difficulty
+    target = args.final_round or campaign.rung_target(difficulty,
+                                                      game_mode)
+    # One-life is a property of the RUNG (see the note in cmd_solve): a
+    # flaky startup lives read must not leave abort armed on CHIMPS.
+    rung_lives = campaign.RUNG_INFO.get((difficulty, game_mode), {}) \
+        .get("lives")
+    one_life = (game_mode == "chimps" or difficulty == "impoppable"
+                or (rung_lives is not None and rung_lives <= 3)
+                or (lv is not None and lv <= 3))
+    # Deploy plays every game to its real conclusion -- no early abort by
+    # default (default 0), so a champion that starts to leak still
+    # finishes the round it dies on and reports an honest final_round.
+    abort_lives = 0 if one_life else args.abort_lives
+    rung_name = difficulty if game_mode == "standard" else game_mode
+    print(f"Rung: {args.name} / {rung_name} -- survive round {target} "
+          f"(start r{start_round}, {lv} lives).")
+
+    # explore=0.0 is the whole point: the finished model, exploited, not
+    # explored. attempt_genome carries no exploration roulette anyway.
+    brain = meta_mod.MetaBrain(args.name, difficulty,
+                               target_round=target, explore=0.0,
+                               evolve=True, mode=game_mode,
+                               start_round=start_round)
+    tower_pool = FARM_TOWERS + (meta_mod.META_EXTRA_TOWERS
+                                if args.pool == "full" else [])
+    mask_data = json.loads(mask_path.read_text())
+    track = meta_mod.TrackModel(mask_data)
+    if track.ok:
+        if mask_data.get("flow_entry"):
+            track.orient(mask_data["flow_entry"])
+    else:
+        track = None
+
+    champion = brain.elites(top=1)
+    if not champion:
+        sys.exit(
+            f"No trained champion for {args.name} / {rung_name} yet -- "
+            f"the model has nothing to deploy.\n"
+            f"Train one first: `python mk.py solve {args.name}` (or "
+            f"`farm`) until a layout survives, then deploy it. "
+            f"`python mk.py learn {args.name}` shows what the brain "
+            f"currently believes.")
+    ch_reward, ch_row = champion[0]
+    ch_from = ("this rung" if brain.usable(ch_row)
+               else f"transferred from {ch_row.get('difficulty')}/"
+                    f"{ch_row.get('game_mode', 'standard')}")
+    ch_layout = ", ".join(
+        f"{t.get('tower')}{t.get('path') or [0, 0, 0]}"
+        for t in ch_row.get("towers", []) if t.get("tower"))
+    print(f"Champion (reward {ch_reward:.2f}, {ch_from}): {ch_layout}")
+    if ch_reward < 0.999:
+        # The best layout on record has never actually SURVIVED the
+        # target -- deploy will play its best, but be honest that the
+        # model isn't proven on this rung yet.
+        print(f"   NOTE: this champion has not yet won {args.name} / "
+              f"{rung_name} (its best reached round "
+              f"{ch_row.get('final_round')}/{target}). It plays the "
+              f"strongest layout learned so far; run `solve "
+              f"{args.name}` if it can't quite close the game.")
+
+    progress = campaign.Progress()
+    pools = {"near": MASK_NEAR, "mid": MASK_MID,
+             "all": MASK_POINTS, "roomy": MASK_ROOMY}
+    danger = {r for t in brain.threats for r in t.get("rounds", [])}
+
+    def price_of(t, p=None, tr=None):
+        return PRICES.get(price_key(t) if p is None
+                          else price_key(t, p, tr))
+
+    wins = 0
+    for g in range(1, args.games + 1):
+        genome = brain.attempt_genome(
+            rng, pools, is_locked=is_locked,
+            large_towers=LARGE_TOWERS, tower_pool=tower_pool,
+            price_of=price_of, track=track, hero=not args.no_hero)
+        if genome is None:
+            # elites() said there is a champion, so this only fires if the
+            # champion row has no placeable towers -- a corrupt record.
+            sys.exit("The champion layout has no placeable towers -- the "
+                     f"runs_log.jsonl record for {args.name} is corrupt.")
+        sensor = make_flow_sensor(screen, track, mask_path)
+        print(f"\n=== Game {g}/{args.games} [deploy champion]")
+        print(brain.describe_genome(genome))
+        try:
+            (outcome, reached, towers, lives_by_round, cash_by_round,
+             spent_by_round) = run_episode(
+                screen, cfg, genome, target, abort_lives=abort_lives,
+                flow_sensor=sensor, play_out=True,
+                danger_rounds=danger,
+                abilities=not args.no_abilities)
+        except KeyboardInterrupt:
+            raise
+        except Exception:
+            _log_crash(f"deploy game {g}")
+            print("Attempting to recover and continue.")
+            (outcome, reached, towers, lives_by_round, cash_by_round,
+             spent_by_round) = ("crashed", None, [], {}, {}, {})
+            try:
+                clear_ui(screen, cfg)
+            except Exception:
+                _log_crash(f"deploy game {g} (recovery clear_ui)")
+        if outcome == "survived":
+            outcome = "victory"   # play_out=True means the final round ENDED
+        won = outcome == "victory"
+        wins += 1 if won else 0
+        print(f"=== Game {g}: {outcome} at round {reached}"
+              + (" -- WIN" if won else ""))
+        if args.log:
+            # Opt-in: treat this deploy game as fresh evidence and let the
+            # champion adapt in-session. Off by default so deployment
+            # leaves the training distribution untouched.
+            row = {"time": datetime.now().isoformat(timespec="seconds"),
+                   "mode": "solve", "map": args.name,
+                   "difficulty": difficulty, "game_mode": game_mode,
+                   "target_round": target, "start_round": start_round,
+                   "final_round": reached, "outcome": outcome,
+                   "strategy": brain.last_strategy,
+                   "lives_by_round": lives_by_round,
+                   "cash_by_round": cash_by_round,
+                   "spent_by_round": spent_by_round,
+                   "towers": towers}
+            try:
+                with open(runs_path, "a") as f:
+                    f.write(json.dumps(row) + "\n")
+                brain.observe(row)
+            except Exception:
+                _log_crash(f"deploy game {g} (dataset write)")
+        try:
+            progress.record_episode(
+                args.name, difficulty, game_mode, outcome, reached,
+                was_attempt=True)
+        except Exception:
+            _log_crash(f"deploy game {g} (progress write)")
+        if g < args.games:
+            try:
+                focus_game_window(hwnd)
+                ok = restart_game(screen, cfg, outcome,
+                                  start_round=start_round)
+            except Exception:
+                _log_crash(f"deploy game {g} (restart)")
+                ok = False
+            if not ok:
+                sys.exit("Couldn't restart into a fresh game -- all "
+                         "progress is saved; check the restart "
+                         "calibration points in config.json.")
+
+    print()
+    print(f"Deploy session done: {wins}/{args.games} "
+          + ("game" if args.games == 1 else "games")
+          + f" won on {args.name} / {rung_name}.")
+    for line in progress.board([args.name]):
+        print(line)
+
+
 def cmd_campaign(args):
     """Offline: the ladder scoreboard. Maps come from masks/ (one scan
     per map = the bot can play it) plus anything already recorded in
@@ -3966,6 +4196,48 @@ def main():
                          default="full")
     p_solve.add_argument("-q", "--quiet", action="store_true",
                          help="suppress per-decision debug output")
+    p_deploy = sub.add_parser(
+        "deploy", help="run the FINISHED trained model as a bot: play "
+                       "the champion straight to win the loaded rung "
+                       "(no exploration, no learning)")
+    p_deploy.add_argument("name", help="map name matching your mask, "
+                                       "e.g. monkey_meadow")
+    p_deploy.add_argument("--games", type=int, default=1,
+                          help="how many games to play this session; "
+                               ">1 auto-restarts between them (needs the "
+                               "farm restart calibration) (default: 1)")
+    p_deploy.add_argument("--difficulty", default=None,
+                          choices=["easy", "medium", "hard",
+                                   "impoppable"],
+                          help="override the lives-based detection")
+    p_deploy.add_argument("--mode", default=None,
+                          choices=["standard", "chimps"],
+                          help="override the mode detection (chimps = "
+                               "1 life starting at round 6)")
+    p_deploy.add_argument("--final-round", type=int, default=None,
+                          dest="final_round",
+                          help="override the rung's final round")
+    p_deploy.add_argument("--abort-lives", type=int, default=0,
+                          help="abort a game once lives drop below this "
+                               "(default 0 = play every game to its "
+                               "real end; one-life modes force it off)")
+    p_deploy.add_argument("--log", action="store_true",
+                          help="append deploy games to runs_log.jsonl as "
+                               "evidence and let the champion adapt "
+                               "in-session (default: off -- deployment "
+                               "leaves the training set untouched)")
+    p_deploy.add_argument("--seed", type=int, default=None)
+    p_deploy.add_argument("--no-hero", action="store_true",
+                          dest="no_hero",
+                          help="don't place the equipped hero")
+    p_deploy.add_argument("--no-abilities", action="store_true",
+                          dest="no_abilities",
+                          help="don't press ability hotkeys on threat "
+                               "rounds")
+    p_deploy.add_argument("--pool", choices=["classic", "full"],
+                          default="full")
+    p_deploy.add_argument("-q", "--quiet", action="store_true",
+                          help="suppress per-decision debug output")
     sub.add_parser(
         "campaign", help="show the per-map ladder scoreboard "
                          "(easy -> medium -> hard -> CHIMPS)")
@@ -3987,7 +4259,7 @@ def main():
     DEBUG = not getattr(args, "quiet", False)
     {"locate": cmd_locate, "watch": cmd_watch,
      "play": cmd_play, "scan": cmd_scan, "farm": cmd_farm,
-     "solve": cmd_solve, "campaign": cmd_campaign,
+     "solve": cmd_solve, "deploy": cmd_deploy, "campaign": cmd_campaign,
      "learn": cmd_learn}[args.command](args)
 
 
