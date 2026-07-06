@@ -69,10 +69,14 @@ once; after that your daily loop is just steps 6–8.
 
    Meta-guided layouts are the default, and the equipped hero is placed
    as the early anchor — equip one (Sauda recommended) in the hero menu
-   first. Useful flags: `--explore 0.5` (more randomness), `--no-meta`
-   (pure random, the old Stage 2), `--no-evolve` (no genetic layer),
-   `--no-hero` (skip hero placement), `--pool classic` (original 10
-   towers only), `--final-round 40`, `--abort-lives 50`, `--seed N`.
+   first. Survival means the difficulty's **real final round** (easy 40,
+   medium 60, hard 80, impoppable 100 — auto-detected), so the bot
+   learns the endgame, not just the opening. Useful flags:
+   `--explore 0.5` (more randomness), `--no-meta` (pure random, the old
+   Stage 2), `--no-evolve` (no genetic layer), `--no-hero` (skip hero
+   placement), `--pool classic` (original 10 towers only),
+   `--final-round N` (override the auto target), `--abort-lives 50`,
+   `--seed N`.
 
 8. **Review what it learned** (Stage 3 section, no game needed):
 
@@ -384,6 +388,14 @@ happen), a **priority**, and a **cost estimate**:
   placement, whatever the curve says. When cash runs ahead of the
   model, the next scheduled buy unlocks early — estimates pace,
   reality decides.
+- **The target is the whole game.** Survival used to mean round 40
+  everywhere — on hard (rounds 3–80) that scored half-finished runs as
+  perfect wins and never scheduled a single endgame buy. The target now
+  defaults to the detected difficulty's real final round, tier-5s and
+  late support get planned into rounds 40+, and MOAB prep (a tier ≤ 4
+  answer like Maim MOAB, MOAB Assassin, or Bloon Sabotage, preferably
+  on a tower's own main path) is required before round 40 whenever the
+  game runs past it.
 - **Support is conditional, not on a timer.** Amplifier/control/extra
   bases are *gated on the carry being stable* (main path at tier 3):
   glue and buffs arrive when the core can use them, not because a

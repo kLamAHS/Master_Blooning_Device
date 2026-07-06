@@ -2969,7 +2969,8 @@ def cmd_farm(args):
     runs_path = Path(__file__).parent / "runs_log.jsonl"
 
     print(f"Farming {args.episodes} episodes on '{args.name}' "
-          f"({args.towers} towers, to round {args.final_round}, "
+          f"({args.towers} towers, to round "
+          f"{args.final_round or 'auto (difficulty final round)'}, "
           f"difficulty {args.difficulty or 'auto-detect'}).")
     print("Load the map fresh (round 1, no towers). Starting in 5 "
           "seconds...")
@@ -3001,6 +3002,16 @@ def cmd_farm(args):
     elif detected and detected != args.difficulty:
         print(f"NOTE: {lv} starting lives suggests '{detected}' but "
               f"--difficulty {args.difficulty} was given -- using the flag.")
+
+    if args.final_round is None:
+        # Learn the WHOLE game, not the easy half: survival means the
+        # difficulty's real final round. Stopping at 40 on hard scored
+        # half-finished runs as perfect wins and never scheduled a
+        # single end-game buy.
+        args.final_round = {"easy": 40, "medium": 60, "hard": 80,
+                            "impoppable": 100}.get(args.difficulty, 40)
+        print(f"Target round auto-set to {args.final_round} for "
+              f"{args.difficulty} (--final-round overrides).")
 
     r1 = read_round(screen, cfg)[0]
     time.sleep(0.3)
@@ -3148,8 +3159,11 @@ def cmd_learn(args):
     the elite layouts evolution draws from, where defenses die, and the
     map's prime real estate if a scan mask exists."""
     import meta as meta_mod
+    target = args.final_round or {"easy": 40, "medium": 60, "hard": 80,
+                                  "impoppable": 100}.get(args.difficulty,
+                                                         40)
     brain = meta_mod.MetaBrain(args.name, args.difficulty,
-                               target_round=args.final_round)
+                               target_round=target)
     track = mask_pts = None
     mask_path = find_mask_path({"map": args.name}, Path.cwd() / "_")
     if mask_path:
@@ -3394,9 +3408,12 @@ def main():
     p_farm.add_argument("--episodes", type=int, default=10)
     p_farm.add_argument("--towers", type=int, default=4,
                         help="towers per random layout (default: 4)")
-    p_farm.add_argument("--final-round", type=int, default=40,
+    p_farm.add_argument("--final-round", type=int, default=None,
                         dest="final_round",
-                        help="round that counts as survival (default: 40)")
+                        help="round that counts as survival; default: the "
+                             "detected difficulty's real final round "
+                             "(easy 40, medium 60, hard 80, impoppable "
+                             "100), so the bot learns the END game too")
     p_farm.add_argument("--difficulty", default=None,
                         choices=["easy", "medium", "hard", "impoppable"],
                         help="price-book key; auto-detected from starting "
@@ -3433,9 +3450,10 @@ def main():
                       "from runs_log.jsonl (no game needed)")
     p_learn.add_argument("name", help="map name, e.g. monkey_meadow")
     p_learn.add_argument("--difficulty", default="easy")
-    p_learn.add_argument("--final-round", type=int, default=40,
+    p_learn.add_argument("--final-round", type=int, default=None,
                          dest="final_round",
-                         help="round that counts as survival (default: 40)")
+                         help="round that counts as survival (default: "
+                              "the difficulty's final round)")
     args = parser.parse_args()
     print(f"btd6_bot build {BUILD}")
     global DEBUG

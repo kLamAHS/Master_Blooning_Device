@@ -582,11 +582,13 @@ class MetaBrain:
 
     def _coverage_fixes(self, rng, picks):
         """Make sure the layout answers the threats it will actually meet
-        before target_round (Meta thesis #2: solve every property). Returns
+        before target_round (Meta thesis #2: solve every property) --
+        camo, lead, and (for targets past round 40) MOAB prep. Returns
         {tower_index: {path_i: min_tier}} requirements and possibly swaps
         a tower type in `picks` to cover a hole."""
         needs = {}
-        for kind in ("camo", "lead"):
+        carries = set(self.roles.get("carry", []))
+        for kind in ("camo", "lead", "moab"):
             first = min((r for t in self.threats if t["kind"] == kind
                          for r in t["rounds"]), default=None)
             if first is None or first > self.target:
@@ -598,6 +600,25 @@ class MetaBrain:
                 continue
             upgradable = [(i, solvers[t]) for i, (t, _) in enumerate(picks)
                           if t in solvers and solvers[t] is not None]
+            if kind == "moab":
+                # MOAB prep is a nudge, never surgery: only tier<=4
+                # answers (saving for a tier 5 by r38 would stall the
+                # whole economy), prefer a tower whose answer lies on
+                # its own main build path, then a non-carry -- and if
+                # nobody fits, the carry's raw DPS is the answer.
+                upgradable = [(i, s) for i, s in upgradable if s[1] <= 4]
+                if upgradable:
+                    def moab_fit(item):
+                        i, (p_i, _tier) = item
+                        t = picks[i][0]
+                        builds = self.towers.get(t, {}).get("builds") or []
+                        main0 = builds[0]["main"] if builds else None
+                        return (0 if main0 == p_i else 1,
+                                0 if t not in carries else 1)
+                    i, (path_i, tier) = min(upgradable, key=moab_fit)
+                    needs.setdefault(i, {})[path_i] = max(
+                        needs.get(i, {}).get(path_i, 0), tier)
+                continue
             if upgradable:
                 i, (path_i, tier) = rng.choice(upgradable)
                 needs.setdefault(i, {})[path_i] = max(
@@ -613,7 +634,6 @@ class MetaBrain:
             if not solver_types:
                 continue
             best = max(solver_types, key=lambda t: self._theta(rng, t))
-            carries = set(self.roles.get("carry", []))
             for i in range(len(picks) - 1, -1, -1):
                 if picks[i][0] not in carries and picks[i][0] != "hero":
                     picks[i] = (best, picks[i][1])
@@ -1449,10 +1469,28 @@ def _selftest():
         assert hero_ok == 30, f"hero placement broken ({hero_ok}/30)"
         assert early_ok >= 27, \
             f"support bases jump ahead of carry tiers ({early_ok}/30)"
+        # Full-length games: buys must be scheduled INTO the endgame and
+        # MOAB prep must land before round 40.
+        b5 = MetaBrain("selftest_map", "hard", target_round=80,
+                       explore=0.0, knowledge=k, runs_path="/nonexistent")
+        endgame = moab_prep = 0
+        for i in range(20):
+            g = b5.next_genome(rng, 4, tpools, tower_pool=pool,
+                               track=track, hero=True)
+            rounds = [x["round"] for x in g]
+            assert max(rounds) <= 78, "buy scheduled past a hard game"
+            endgame += any(r > 40 for r in rounds)
+            moab_prep += any(x.get("by") == 38 for x in g)
+        assert endgame >= 16, \
+            f"target 80 but no endgame buys scheduled ({endgame}/20)"
+        assert moab_prep >= 16, \
+            f"MOAB answer missing before r40 ({moab_prep}/20)"
         print(f"economy OK: reservation policy verified, schedules paced "
               f"({late_place}/30 layouts hold a big buy past r6), camo "
               f"answered by r22 in {camo_checked}/30, hero anchored "
-              f"{hero_ok}/30, upgrade-first {early_ok}/30")
+              f"{hero_ok}/30, upgrade-first {early_ok}/30, endgame "
+              f"scheduling at target 80 in {endgame}/20 with MOAB prep "
+              f"by r38 in {moab_prep}/20")
 
     print("selftest OK: genome format, two-path rule, exploration floor,")
     print("posterior learning, evolution engagement, spot learning, and")
