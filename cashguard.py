@@ -27,6 +27,16 @@ floor, so the guard never fires on it.
 # lowered the floor by the price paid.
 CASH_FLOOR_MARGIN = 50
 
+# How much of the income-curve estimate (cumulative earned by the previous
+# round, minus everything spent) counts as a PROVABLE lower bound on current
+# cash. In CHIMPS this estimate is near-exact -- every bloon is popped or the
+# run is over -- so the only reasons it could overstate real cash are (a) a
+# spend the bot didn't record or (b) mid-round rounding. Halving it swallows
+# both with margin, so a read below it is "severely off" (a clipped/garbled
+# number), never a real balance. It is deliberately below 1.0 so it can only
+# ever RESCUE an implausibly-low read, never inflate a merely-modest one.
+INCOME_DISCOUNT = 0.5
+
 
 class CashFloor:
     """Tracks a provable lower bound on current cash across a run.
@@ -44,9 +54,13 @@ class CashFloor:
         self._floor = None          # provable lower bound, or None until seeded
         self._spent = 0             # cumulative spend this run
         self.margin = margin
-        # income_model(round) -> rough cumulative cash available by that round.
-        # Used only as a hard-discounted soft floor BEFORE the first confirmed
-        # read, to reject absurd lows (e.g. '$4' at round 20).
+        # income_model(round) -> cumulative cash available by that round. In
+        # CHIMPS this is the exact pops-only curve, so income(r-1) - spent is
+        # a hard (discounted) lower bound on current cash -- used BOTH before
+        # the first confirmed read (reject absurd lows like '$4' at round 20)
+        # AND after, to lift a provable floor that has gone stale-low because
+        # the box rarely corroborates (the field failure: OCR keeps reading
+        # low while the wallet has clearly climbed).
         self._income = income_model
         self._sub_streak = 0        # consecutive substituted (low-misread) reads
 
@@ -74,23 +88,35 @@ class CashFloor:
         if level is not None:
             self._floor = max(self._floor or 0, level)
 
+    def _income_floor(self, round_hint):
+        """An OCR-INDEPENDENT lower bound on current cash from the income
+        curve: entering round `round_hint` we have provably earned at least
+        the cumulative cash through the PREVIOUS round, minus everything
+        spent, discounted (INCOME_DISCOUNT) so unrecorded spend / mid-round
+        rounding keep it a true under-estimate. None when no curve or round."""
+        if round_hint is None or self._income is None:
+            return None
+        try:
+            est = self._income(round_hint - 1) - self._spent
+        except Exception:
+            return None
+        return INCOME_DISCOUNT * est if est > 0 else None
+
     def lower_bound(self, round_hint=None):
         """Best available lower bound on current cash, or None if nothing is
-        known yet. The provable floor GOVERNS once it is seeded -- it never
-        gets overridden by the income model, which is far too rough and would
-        otherwise inflate perfectly good reads (a $443 read pushed up to $542
-        was real churn). The discounted income estimate stands in ONLY before
-        the first confirmed read (floor still None, very early), just to
-        reject an absurd opening misread like '$4' at round 20."""
+        known yet. Two independent bounds, both provable, so the higher wins:
+        the spend-tracked floor (last confirmed read minus spend since) and
+        the income-curve estimate (cumulative earned by last round minus
+        spend, discounted). The income bound MATTERS most when the floor has
+        gone stale-low -- the box rarely corroborates, so the floor sits near
+        its seed while the wallet has clearly climbed. The discount is what
+        keeps it from ever inflating a merely-modest real read (the old
+        $443->$542 churn): it only ever rescues a read that is *severely*
+        below what we have provably earned."""
+        inc = self._income_floor(round_hint)
         if self._floor is not None:
-            return self._floor
-        if round_hint is not None and self._income is not None:
-            try:
-                est = self._income(round_hint) - self._spent
-            except Exception:
-                return None
-            return 0.5 * est if est > 0 else None
-        return None
+            return max(self._floor, inc) if inc is not None else self._floor
+        return inc
 
     def sane(self, read, confirm_fn=None, round_hint=None):
         """Return a cash value safe to act on. If `read` is implausibly far

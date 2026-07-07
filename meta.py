@@ -118,28 +118,51 @@ HERO_PLACEMENT = {"range": 0.045, "style": "coverage"}
 TIER_EST = {1: 300, 2: 700, 3: 1800, 4: 4500, 5: 14000}
 
 
-# CHIMPS income is pops-only: no end-of-round bonus, no farms possible.
-# Rough cumulative-cash anchors (rounds 6-100, start cash included) --
-# a deliberately conservative PRIOR that the learned income curve
-# (learner.IncomeCurve, fed by each episode's cash/spend telemetry)
-# replaces as soon as real data exists. Off-by-some just shifts a buy a
-# round or two; the executor still waits for real cash.
-CHIMPS_INCOME_ANCHORS = [
-    (6, 650), (10, 1700), (15, 3300), (20, 5300), (25, 7700),
-    (30, 10600), (35, 14000), (40, 18500), (45, 23500), (50, 29500),
-    (55, 37000), (60, 46000), (65, 57000), (70, 71000), (75, 88000),
-    (80, 110000), (85, 140000), (90, 180000), (95, 240000),
-    (100, 330000),
+# CHIMPS income is pops-only: no end-of-round bonus, no farms possible, and
+# every bloon MUST be popped (one leak ends the run) -- so if you are still
+# alive at round r you have earned EXACTLY the cumulative pop cash for that
+# round. That makes the cash-by-round curve a near-exact predictor, not a
+# rough prior: cumulative(r-1) - (everything spent) is a hard lower bound on
+# current cash, which the cash guard uses to reject "severely off" low OCR
+# reads (see cashguard.CashFloor). Values are the standard CHIMPS round set's
+# cumulative cash (start cash 650 included), per-round for 6..100, from
+# topper64.co.uk/nk/btd6/income/chimps. The (5, 650) base is the wallet
+# entering round 6. The learned IncomeCurve still overrides this once real
+# telemetry exists (a map/hero can pop a little faster or slower).
+CHIMPS_CUM_CASH = [
+    (5, 650), (6, 813), (7, 995), (8, 1195), (9, 1394), (10, 1708),
+    (11, 1897), (12, 2089), (13, 2371), (14, 2630), (15, 2896),
+    (16, 3164), (17, 3329), (18, 3687), (19, 3947), (20, 4133),
+    (21, 4484), (22, 4782), (23, 5059), (24, 5226), (25, 5561),
+    (26, 5894), (27, 6556), (28, 6822), (29, 7211), (30, 7548),
+    (31, 8085), (32, 8712), (33, 8917), (34, 9829), (35, 10979),
+    (36, 11875), (37, 13214), (38, 14491), (39, 16250), (40, 16771),
+    (41, 18952), (42, 19611), (43, 20889), (44, 22183), (45, 24605),
+    (46, 25321), (47, 26958), (48, 29801), (49, 34559), (50, 37575),
+    (51, 38673.5), (52, 40269), (53, 41193.5), (54, 43391), (55, 45874),
+    (56, 47160.5), (57, 49019.5), (58, 51317.5), (59, 53476.5),
+    (60, 54399), (61, 55631), (62, 57017.4), (63, 59843.4),
+    (64, 60693.2), (65, 63764.8), (66, 64769), (67, 65792.6),
+    (68, 66570.4), (69, 67961.4), (70, 70580.2), (71, 72083.2),
+    (72, 73587.2), (73, 74979.8), (74, 78023.8), (75, 80691.2),
+    (76, 82007.2), (77, 84547.4), (78, 89409.4), (79, 96118.4),
+    (80, 97518.6), (81, 102884.6), (82, 107641.6), (83, 112390.6),
+    (84, 119434.6), (85, 122060), (86, 123008.5), (87, 125635.9),
+    (88, 128949.9), (89, 131120.9), (90, 131460.2), (91, 135651.2),
+    (92, 140188.6), (93, 142135.2), (94, 149802.3), (95, 153520.3),
+    (96, 163475.9), (97, 164893.1), (98, 174546.9), (99, 177374.8),
+    (100, 178909.4),
 ]
 
 
 def earned_by(r, mode="standard"):
-    """Very rough cumulative cash available by round r (start cash plus
-    pop income and, outside CHIMPS, end-of-round bonuses; no farms).
-    Only used to PACE the buy plan -- the executor still waits for real
-    cash."""
+    """Cumulative cash available by round r (start cash plus pop income and,
+    outside CHIMPS, end-of-round bonuses; no farms). In CHIMPS this is the
+    exact standard-round-set curve -- accurate enough to catch OCR misreads,
+    not just pace the plan. Interpolates within the table and extrapolates
+    past round 100 with the final slope (still strictly increasing)."""
     if mode == "chimps":
-        pts = CHIMPS_INCOME_ANCHORS
+        pts = CHIMPS_CUM_CASH
         if r <= pts[0][0]:
             return pts[0][1]
         for (r0, c0), (r1, c1) in zip(pts, pts[1:]):
@@ -2484,8 +2507,12 @@ def _selftest():
     # absolute levels legitimately exceed the standard quadratic, which
     # is a pacing heuristic, not a pop-income model.
     assert all(earned_by(r, "chimps") <= earned_by(r)
-               for r in range(6, 46)), \
+               for r in range(6, 45)), \
         "chimps income prior must undercut the standard curve early"
+    # r45+ the real CHIMPS pop income (BFB/ceramic waves) overtakes the
+    # standard quadratic, which is a pacing heuristic, not a pop model.
+    assert earned_by(45, "chimps") > earned_by(45), \
+        "chimps overtakes the standard curve once the big waves start"
     assert all(earned_by(r, "chimps") < earned_by(r + 1, "chimps")
                for r in range(6, 110)), \
         "chimps income prior must be strictly increasing"

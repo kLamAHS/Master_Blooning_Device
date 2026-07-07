@@ -3001,9 +3001,12 @@ def run_episode(screen, cfg, genome, final_round, abort_lives=50,
             v, confirm_fn=lambda: read_cash_confirmed(screen, cfg),
             round_hint=last_round)
         if v is not None and out is not None and out != v:
-            dbg(f"sane_cash: read ${v} << floor "
-                f"${int(cash_floor.value) if cash_floor.value is not None else out}"
-                f", using ${out}")
+            # `out` is the higher of the spend-tracked floor and the CHIMPS
+            # earned-minus-spent estimate; either way it's cash we can PROVE
+            # we have, so a read below it is a clipped/garbled OCR misread.
+            dbg(f"sane_cash: read ${v} is below the ${out} we can prove we "
+                f"have by round {last_round} (earned minus spend) -- "
+                f"using ${out}, not reading it as broke")
         return out
 
     def recalibrate_cash_if_stuck():

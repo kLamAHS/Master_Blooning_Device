@@ -99,17 +99,38 @@ def main():
     check("unseeded with no round hint passes any read through",
           f.sane(4) == 4)
 
-    # --- The SEEDED floor governs; the rough income model never overrides a
-    # real read (a good $443 getting pushed up to $542 was field churn). ------
-    f = CashFloor(income_model=income_model)   # income_model(20) = 5300
+    # --- The discount keeps a MODEST real read from being inflated: a good
+    # $443 read, when the curve says we've only earned ~$650 by last round, is
+    # above the discounted income floor (0.5*650=325), so it passes untouched
+    # (the old $443->$542 churn is gone). ------------------------------------
+    f = CashFloor(income_model=income_model)   # income_model(19) = 650 (default)
     f.confirm(435)                             # the field scenario: floor 435
-    check("a good read just above the floor passes through untouched, NOT "
-          "inflated by the income model to $542",
+    check("a modest real read is NOT inflated by the income model",
           f.sane(443, round_hint=20) == 443)
     # The provable floor still catches a genuine low misread, as before.
     f.confirm(3000)
     check("the seeded floor still catches a real $1 misread",
           f.sane(1, round_hint=20) == 3000)
+
+    # --- NEW: the accurate income curve rescues a STALE-LOW provable floor. --
+    # The field failure: OCR seldom corroborates, so the floor sits near its
+    # seed while the wallet (by the pops-only CHIMPS curve) has climbed into
+    # the thousands. A clipped '$4xx' read must NOT read as broke when we have
+    # provably earned far more. income(round-1)=income(24)=5226 earned, $300
+    # spent -> ~4926 available, discounted 0.5 -> ~2463.
+    curve = CashFloor(income_model=lambda r: {24: 5226, 25: 5561}.get(r, 0))
+    curve.confirm(650)          # only ever got the one good read (at the start)
+    curve.spend(300)            # provable floor now 350 -- but we're at round 25
+    out = curve.sane(432, round_hint=25)
+    check("accurate income rescues a stale-low floor (not read as broke)",
+          out > 2000)
+    check("...but a plausible read for the round still passes untouched",
+          curve.sane(4800, round_hint=25) == 4800)
+    # And the income floor NEVER exceeds what we've provably earned minus
+    # spend: a real broke moment (we really did spend down to ~$120) is still
+    # believed once corroborated, not overridden into a phantom balance.
+    check("a corroborated low read at/above the income floor is trusted",
+          curve.sane(2600, confirm_fn=lambda: 2600, round_hint=25) == 2600)
 
     # --- stuck(): a BROKEN box (constant low read) is distinguished from the
     # odd intermittent misread, so the caller can recalibrate not freeze. -----
