@@ -639,6 +639,28 @@ class MetaBrain:
             out.append((min(max(r_i, 0.0), 1.0), w_i))
         return out
 
+    def coverage_gaps(self, towers):
+        """Per-kind coverage report for a layout: which threats it answers
+        and the round each must be answered by. The inspectable form of the
+        role reasoning the plan is built on -- 'have MOAB damage, NO camo
+        answer by r24' rather than a pile of upgrades -- surfaced by the
+        `learn` report and mirrored in the outcome model's features.
+        `towers` is a list of {tower, path} (a plan or a logged layout)."""
+        layout = [((t.get("tower") or "").lower(),
+                   t.get("path") or [0, 0, 0]) for t in towers]
+        gaps = {}
+        for kind in ("camo", "lead", "moab", "ceramic", "ddt", "bad"):
+            first = min((r for t in self.threats if t["kind"] == kind
+                         for r in t["rounds"]), default=None)
+            if first is None or first > self.target:
+                continue
+            gaps[kind] = {
+                "first_round": first,
+                "deadline": max(1, first - 2),
+                "covered": any(_covers(tt, p, kind, self.solutions)
+                               for tt, p in layout)}
+        return gaps
+
     def elites(self, top=8):
         """Best layouts of this rung, best-then-recent first. While the
         rung has fewer than three of its own, near-winning layouts from
@@ -862,17 +884,23 @@ class MetaBrain:
     def _placement_order(self, picks):
         """Spot-assignment order: the carry anchors first, coverage DPS
         next, then debuffers/cleanup that position relative to it, and
-        buffers last (they need to see where everyone sits)."""
+        buffers last (they need to see where everyone sits) -- but FILLER
+        dead last of all. Prime, high-coverage real estate is scarce; a
+        free-slot dart must never claim a spot the carry or a support tower
+        still needs, which the old 'coverage style ranks 1' let it do."""
         rank = {"coverage": 1, "upstream": 2, "downstream": 3,
                 "offside": 4, "buddy": 5}
         carries = set(self.roles.get("carry", []))
 
         def key(i):
             ttype, role = picks[i]
+            if role == "carry" or ttype in carries:
+                return (0, i)
+            if role == "free":
+                return (9, i)          # filler after every claimed role
             style = (self.towers.get(ttype, {}).get("placement")
                      or {}).get("style", "coverage")
-            return (0 if (role == "carry" or ttype in carries)
-                    else rank.get(style, 1), i)
+            return (rank.get(style, 1), i)
         return sorted(range(len(picks)), key=key)
 
     def _pick_build(self, rng, ttype):
@@ -1819,6 +1847,19 @@ class MetaBrain:
                 lines.append(f"  r{row.get('final_round')} "
                              f"({row.get('outcome')}, reward {rw:.2f}): "
                              f"{kinds}")
+            # The champion's role reasoning: which threats it answers and
+            # which it still leaves open before each deadline -- the "have
+            # MOAB damage, no camo answer by r24" view of the plan.
+            gaps = self.coverage_gaps(el[0][1].get("towers", []))
+            if gaps:
+                have = [k for k, g in gaps.items() if g["covered"]]
+                miss = [f"{k}(by r{g['deadline']})"
+                        for k, g in gaps.items() if not g["covered"]]
+                lines.append(
+                    "  champion role coverage: "
+                    + ("have " + ", ".join(have) if have else "nothing yet")
+                    + ("; MISSING " + ", ".join(miss) if miss
+                       else "; all threats answered"))
         deaths = [r.get("final_round") for r in self.history
                   if r.get("outcome") == "defeat"
                   and r.get("final_round")]

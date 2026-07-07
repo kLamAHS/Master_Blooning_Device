@@ -617,18 +617,21 @@ opener leaked from — learns its way around them. Two measured results,
 both reproducible with the command above:
 
 - **Robustness (the headline).** At the tighter default 60-episode
-  budget, learning solves all 10/10 seeds while prior-only search fails
-  the seed whose off-meta core it can't stumble into in budget (1–2/10
-  unsolved). Learning's value is finding the core and the safe opener the
-  map demands, not a faster easy win.
-- **Speed.** At the 120-episode budget where prior-only search eventually
-  solves every seed too, learning still gets there ~30% faster on
-  average — mean **14.6** episodes vs **20.9** — and on the hardest seed
-  it wins by episode 17 where prior-only search grinds to episode 106.
+  budget, learning solves all **10/10** seeds while prior-only search
+  fails the seed whose off-meta core and safe opener it can't stumble
+  into in budget (typically **9/10**). Learning's value is finding the
+  core and the leak-free opening the map demands, not a faster easy win.
+- **Convergence.** At the generous 120-episode budget prior-only search
+  eventually clears every seed too — but only by blundering through the
+  leaky opener spot and the wrong cores until luck lands a clean run. The
+  learning stack converges without those wasted runs, and the trained
+  champion then wins the sim ~2/3 of the time replayed straight
+  (`--deploy`), its opener having been learned *off* the leaky pocket.
 
-(Beware the ablation's mean-episodes number at tight budgets: it
-averages only the seeds it *did* solve — the easy ones — so it can read
-deceptively low while quietly abandoning the hard maps.)
+(Beware the ablation's mean-episodes number: at tight budgets it averages
+only the seeds it *did* solve — the easy ones — so it reads deceptively
+low while quietly abandoning the hard maps; the honest scoreboard is
+seeds-solved, not mean episodes.)
 
 ## Plan file format
 
