@@ -273,16 +273,19 @@ SEP = 0.028
 SEP_LARGE = 0.045
 
 
-def _spread(cands, taken, sep):
-    """Candidates at least sep away from every taken spot; if none
-    qualify, the single candidate FARTHEST from the layout (never an
-    overlapping one at random)."""
+def _spread(cands, taken, sep, pull=None):
+    """Candidates at least sep away from every taken spot. If none qualify,
+    fall back to a single candidate: the one NEAREST `pull` when given (a
+    buffer must stay next to its carry even in a tight cluster), otherwise
+    the one FARTHEST from the layout (never an overlapping one at random)."""
     free = [c for c in cands
             if all(_dist(c, t) >= sep for t in taken)]
     if free:
         return free
     if not taken or not cands:
         return cands
+    if pull is not None:
+        return [min(cands, key=lambda c: _dist(c, pull))]
     return [max(cands, key=lambda c: min(_dist(c, t) for t in taken))]
 
 
@@ -782,13 +785,33 @@ class MetaBrain:
             or (HERO_PLACEMENT if ttype == "hero" else {})
         style = prof.get("style", "coverage")
         r = prof.get("range") or 0.06
-        if large:
+        if style == "buddy":
+            # A buffer exists to stand next to the carry, which sits on a
+            # near/mid TRACK spot -- but a LARGE buffer (village) drawing
+            # only from the `roomy` interior can never reach it (on a real
+            # mask near-track spots are never roomy). Draw buddies from the
+            # track rings: the large ones from (near|mid) that are ALSO
+            # roomy (so the executor's roomy-snap is a no-op and they stay
+            # near the carry), the small ones from near|mid|roomy (so an
+            # alchemist can also reach a carry that itself sits in roomy).
+            near = pools.get("near") or []
+            mid = pools.get("mid") or []
+            roomy = pools.get("roomy") or []
+            seen, base = set(), []
+            for p in near + mid + roomy:
+                if tuple(p) not in seen:
+                    seen.add(tuple(p))
+                    base.append(p)
+            base = base or pools.get("all") or []
+        elif large:
             base = pools.get("roomy") or pools.get("all") or []
         else:
             base = ((pools.get("near") or []) + (pools.get("mid") or [])) \
                 or pools.get("all") or []
         if not base:
             return None
+        carries = set(self.roles.get("carry", []))
+        carry_spot = next((s for t, s in placed if t in carries and s), None)
         cands = [rng.choice(base) for _ in range(min(70, len(base)))]
         if style == "buddy" and placed:
             # A random sample can easily miss the small disc around the
@@ -800,7 +823,8 @@ class MetaBrain:
             if nearby:
                 cands = [rng.choice(nearby)
                          for _ in range(min(30, len(nearby)))] + cands[:20]
-        cands = _spread(cands, taken, SEP_LARGE if large else SEP)
+        cands = _spread(cands, taken, SEP_LARGE if large else SEP,
+                        pull=carry_spot if style == "buddy" else None)
         # Keep towers that shoot bloons ON the track: drop candidates that
         # see essentially NONE of it (the same near-zero-exposure test the
         # learner uses), so neither the scorer NOR exploration ever parks a
@@ -814,23 +838,38 @@ class MetaBrain:
             on_track = [c for c in cands if track.exposure(c, r) >= 0.005]
             if len(on_track) >= 2:
                 cands = on_track
+        roomy_near = None
         if anchor and len(cands) > 2:
             # Exposure floor: keep only the top ~40% by track coverage, so
             # an opener can never be parked somewhere it sees little track.
             ranked = sorted(cands, key=lambda c: -track.exposure(c, r))
             cands = ranked[:max(2, int(len(ranked) * 0.4))]
+            # Among those top-exposure spots (all already good coverage),
+            # prefer ones a support tower can actually cluster on -- a roomy,
+            # village-placeable spot within buff range. This costs the carry
+            # ~no exposure (the survivors are all high) but lets the whole
+            # alch+village core form on it instead of scattering.
+            roomy = pools.get("roomy") or []
+            if roomy:
+                def roomy_near(c, _r=roomy):
+                    return any(_dist(c, rp) <= 0.066 for rp in _r)
         if cands and rng.random() < self.explore:
             # Explore, but only AMONG the on-track candidates above. The old
             # branch sampled raw buildable spots here and frequently placed
             # towers with no track in range; exploration should vary WHICH
-            # good spot, not whether the tower can see the track at all.
+            # good spot, not whether the tower can see the track at all. A
+            # buffer explores only among spots that still cover the carry, so
+            # exploration never breaks the link it exists to make.
             self._last_spot_src = "explore"
+            if style == "buddy" and carry_spot is not None:
+                in_range = [c for c in cands
+                            if _dist(c, carry_spot) <= r * 0.9]
+                return list(rng.choice(in_range or cands))
             return list(rng.choice(cands))
 
-        # The carry anchors the geometry for debuffers and buffers.
-        carries = set(self.roles.get("carry", []))
-        carry_spot = next((s for t, s in placed if t in carries and s),
-                          None)
+        # The carry (found above) anchors the geometry for debuffers and
+        # buffers -- its covered track span orients upstream/downstream and
+        # the buddy overlap term.
         carry_span = None
         if carry_spot is not None:
             carry_r = (self.towers.get(
@@ -861,7 +900,26 @@ class MetaBrain:
                 mates = sum((2.0 if t in carries else 1.0)
                             for t, spot in placed
                             if spot and _dist(c, spot) <= r * 0.9)
-                s = mates + 0.15 * exp
+                if carry_spot is not None:
+                    # A buffer's whole job is to reach the carry. Every spot
+                    # whose buff disc covers the carry outranks every spot
+                    # that doesn't (2.0*covers dominates the 0.05*exp tie-
+                    # break), then proximity + how much of the carry's kill
+                    # zone the disc overlaps decide -- so it never degenerates
+                    # to "wherever it sees the most track", the old bug.
+                    d = _dist(c, carry_spot)
+                    covers = 1.0 if d <= r * 0.9 else 0.0
+                    prox = max(0.0, 1.0 - d / (r * 0.9))
+                    ov = 0.0
+                    if carry_span and track.oriented:
+                        sp = track.span(c, r)
+                        if sp:
+                            ov = max(0.0, min(sp[2], carry_span[2])
+                                     - max(sp[0], carry_span[0]))
+                    s = 2.0 * covers + prox + 0.6 * ov + 0.3 * mates \
+                        + 0.05 * exp
+                else:
+                    s = mates + 0.15 * exp
             elif style == "downstream":
                 sp = track.span(c, r)
                 late = sp[1] if (sp and track.oriented) else 0.5
@@ -888,6 +946,8 @@ class MetaBrain:
             # opener). So there the posterior can nearly veto a spot.
             if anchor:
                 s *= 0.15 + 0.85 * self._pos_theta(rng, c)
+                if roomy_near is not None and roomy_near(c):
+                    s *= 1.25          # cluster-able: support can reach here
             else:
                 s *= 0.8 + 0.4 * self._pos_theta(rng, c)
             if s > best_s:
