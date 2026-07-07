@@ -1410,6 +1410,53 @@ def looks_defeated(screen):
     return float((orange > 0).mean()) > 0.08
 
 
+# The defeat screen comes in two layouts -- Home/Restart and, more often,
+# Home/Restart/Review Map -- which put the RESTART button in different
+# places, so a single calibrated point misses one of them (and on the
+# 3-button layout the old point can land on HOME and bounce us to the main
+# menu). This band spans just the low button row: clear of the orange
+# DEFEAT lettering above and the fast-forward control off to the side, and
+# the two neighbouring buttons are cyan, so the golden-yellow RESTART
+# button is the only warm blob in it.
+DEFEAT_BUTTON_BAND = (0.30, 0.70, 0.42, 0.20)   # x, y, w, h (normalized)
+
+
+def find_defeat_restart(screen, cfg):
+    """Normalized centre of the defeat-screen RESTART button, found by its
+    yellow colour so both button layouts work regardless of where it lands.
+    Falls back to the calibrated cfg['defeat_restart'] point when the button
+    can't be seen (wrong screen, odd theme)."""
+    fallback = cfg.get("defeat_restart")
+    try:
+        bx, by, bw, bh = DEFEAT_BUTTON_BAND
+        strip = screen.grab([bx, by, bw, bh])
+        hsv = cv2.cvtColor(strip, cv2.COLOR_BGR2HSV)
+        mask = cv2.inRange(hsv, (14, 110, 140), (38, 255, 255))
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL,
+                                       cv2.CHAIN_APPROX_SIMPLE)
+        best = None
+        for c in contours:
+            area = cv2.contourArea(c)
+            x, y, w, h = cv2.boundingRect(c)
+            if area < 0.0006 * screen.w * screen.h:   # skip text/specks
+                continue
+            if w > 0.20 * screen.w or h > 0.22 * screen.h:
+                continue
+            if not (0.6 <= w / max(h, 1) <= 2.4):      # a button-ish block
+                continue
+            if best is None or area > best[0]:
+                best = (area, x, y, w, h)
+        if best is None:
+            dbg("defeat RESTART not found by colour -- using calibrated point")
+            return fallback
+        _, x, y, w, h = best
+        nx = bx + (x + w / 2) / screen.w
+        ny = by + (y + h / 2) / screen.h
+        return [round(nx, 4), round(ny, 4)]
+    except Exception:
+        return fallback
+
+
 def looks_restart_confirm(screen):
     """Is the 'RESTART?' confirmation dialog up? Green header ribbon
     carrying white text, with the dialog's light-blue body below it.
@@ -3232,8 +3279,9 @@ def restart_game(screen, cfg, outcome, start_round=1):
         if looks_restart_confirm(screen):
             how = "leftover RESTART? dialog"
         elif looks_defeated(screen):
-            how = "defeat screen"
-            click_norm(screen, cfg["defeat_restart"])
+            spot = find_defeat_restart(screen, cfg)
+            how = f"defeat screen (RESTART at {spot[0]:.3f},{spot[1]:.3f})"
+            click_norm(screen, spot)
         elif looks_paused(screen):
             how = "pause menu"
             click_norm(screen, cfg["pause_restart"])
@@ -3251,7 +3299,7 @@ def restart_game(screen, cfg, outcome, start_round=1):
                 # the dialog gate below (on a live game it just clicks
                 # map and the missing dialog sends us around again).
                 how = "unrecognized screen -- trying the defeat button"
-                click_norm(screen, cfg["defeat_restart"])
+                click_norm(screen, find_defeat_restart(screen, cfg))
         dbg(f"restart attempt {attempt + 1}: {how}")
         if not _wait_until(lambda: looks_restart_confirm(screen), 4.0):
             dbg("restart: RESTART? dialog did not appear -- re-evaluating")
