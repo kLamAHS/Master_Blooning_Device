@@ -99,6 +99,25 @@ def main():
     check("unseeded with no round hint passes any read through",
           f.sane(4) == 4)
 
+    # --- Stale-LOW provable floor + income: the income bound still catches a
+    # misread the spent-down floor would miss (the '$1' case the user hit). ---
+    f = CashFloor(income_model=income_model)   # income_model(20) = 5300
+    f.confirm(5000)                            # floor high...
+    f.spend(4980)                              # ...then spent down to 20
+    check("floor is stale-low after heavy spending", f.value == 20)
+    # A '$1' misread: the spent-down floor alone (20) wouldn't reject it, but
+    # the income bound 0.5*(5300-4980)=160 does.
+    check("income bound catches a $1 misread past a stale-low floor",
+          f.sane(1, round_hint=20) == 160)
+    # A genuine low read consistent with the income bound still passes.
+    check("read at the income bound passes through",
+          f.sane(200, round_hint=20) == 200)
+    # Without the round hint only the (stale-low) provable floor is in play, so
+    # it CAN'T catch the $1 -- which is exactly why the real sane_cash always
+    # passes round_hint=last_round.
+    check("no round hint: stale-low floor alone lets the $1 through",
+          f.sane(1) == 1)
+
     print()
     if _fails:
         print(f"FAILED {len(_fails)} case(s): {', '.join(_fails)}")

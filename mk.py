@@ -889,8 +889,17 @@ def recheck_cash_box(screen, cfg, round_hint=None, mode="standard"):
         _adopt(repaired, "clipped digit")
         return
 
-    # Pass 2: landmark re-anchor -- recovers drift / right-clip / unclean clip.
+    # Pass 2: landmark re-anchor -- recovers drift / right-clip / unclean clip,
+    # AND heals a box that has started reading a truncated low value (e.g. a
+    # single '$1'): a landmark that reads a strictly LARGER, corroborated value
+    # is the real number. Only ever adopts a recovery over the CURRENT reading,
+    # so it can never adopt a stray low-digit box. If the current box reads
+    # nothing at all, leave it -- a dark box is handled safely upstream
+    # (sane_cash returns None -> "buy anyway"), and adopting a landmark we
+    # can't compare against risks locking onto a stray glyph.
     cur = _read_cash_box(screen, box)
+    if cur is None:
+        return
     candidates = []
     coin = _cash_box_from_coin(screen)
     if coin:
@@ -903,12 +912,11 @@ def recheck_cash_box(screen, cfg, round_hint=None, mode="standard"):
         if not _plausible_cash_shape(cand) or _overlaps_lives(cand, cfg):
             continue
         quick = _read_cash_box(screen, cand)              # cheap pre-filter
-        if quick is None or (ceiling is not None and quick > ceiling):
-            continue
-        if cur is not None and quick <= cur:
+        if quick is None or quick <= cur \
+                or (ceiling is not None and quick > ceiling):
             continue          # not a recovery -- only ever adopt MORE digits
         val = _read_cash_box_confirmed(screen, cand, ceiling)   # corroborate
-        if val is None or (cur is not None and val <= cur):
+        if val is None or val <= cur:
             continue
         _adopt(cand, "landmark re-anchor")
         return
@@ -2134,9 +2142,16 @@ def act_upgrade(screen, cfg, action, tower=None, timeout=8):
                     status = "unread"          # can't be sure: don't press
                     break
             known = PRICES.get(pkey) if pkey else None
-            cash = read_cash(screen, cfg)
-            if known is not None and cash is not None and cash < known:
-                status = broke_status(cash, known)  # caller waits, menu closed
+            cash = read_cash(screen, cfg)           # raw: for the buy delta
+            # Affordability is decided on the FLOOR-protected value, not the
+            # raw read: a clipped '$1' misread would otherwise fake a "broke"
+            # and, retried, get the whole upgrade dropped. When the read is
+            # implausibly low the gate falls back to "unreadable" (proceed and
+            # let the row-based verification below judge), never a false broke.
+            sc = action.get("sane_cash")
+            gate_cash = sc() if sc is not None else cash
+            if known is not None and gate_cash is not None and gate_cash < known:
+                status = broke_status(gate_cash, known)  # caller waits, closed
                 break
             press_key(UPGRADE_KEYS[i])
             time.sleep(0.5)
@@ -3240,8 +3255,10 @@ def run_episode(screen, cfg, genome, final_round, abort_lives=50,
                             item["_recheck_at"] = time.time() + 60
                             dbg(f"{tname} path{pi + 1}: re-checking "
                                 f"unverified ${known}")
-                            st = act_upgrade(screen, cfg,
-                                             {**item, "at": landed}, entry)
+                            st = act_upgrade(
+                                screen, cfg,
+                                {**item, "at": landed,
+                                 "sane_cash": sane_cash}, entry)
                             dbg(f"{tname} path{pi + 1} t{tier}: {st}")
                             if st == "bought":
                                 queue.pop(idx)
@@ -3270,8 +3287,10 @@ def run_episode(screen, cfg, genome, final_round, abort_lives=50,
                             dbg(msg)
                         item["_wake"] = time.time() + 5
                     else:
-                        st = act_upgrade(screen, cfg,
-                                         {**item, "at": landed}, entry)
+                        st = act_upgrade(
+                            screen, cfg,
+                            {**item, "at": landed,
+                             "sane_cash": sane_cash}, entry)
                         dbg(f"{tname} path{pi + 1} t{tier}: {st}")
                         if st == "bought":
                             queue.pop(idx)

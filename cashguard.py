@@ -75,19 +75,30 @@ class CashFloor:
 
     def lower_bound(self, round_hint=None):
         """Best available lower bound on current cash, or None if nothing is
-        known yet. The provable floor when seeded; otherwise a hard-discounted
-        income estimate good only for rejecting absurd lows."""
+        known yet. The MAX of two independent bounds:
+
+        - the provable floor (`last confirmed read - spent since`), and
+        - a hard-discounted income estimate (`0.5 * (income_by(round) -
+          spent)`).
+
+        Taking the max matters when the provable floor has gone stale-LOW --
+        e.g. after spending most of the wallet down early in a round, before
+        the next round re-anchors it -- while cash has since climbed on pop
+        income. In that window the income estimate is the tighter bound, so a
+        clipped '$1' misread is still caught. The 0.5 discount keeps the
+        estimate below real cash on a clean run, so it rejects misreads
+        without over-stating what the bot can spend."""
+        bounds = []
         if self._floor is not None:
-            return self._floor
+            bounds.append(self._floor)
         if round_hint is not None and self._income is not None:
             try:
                 est = self._income(round_hint) - self._spent
             except Exception:
-                return None
-            # The income model assumes full pops; a struggling run has far
-            # less, so discount hard and use it only as an absurd-low reject.
-            return 0.5 * est if est > 0 else None
-        return None
+                est = None
+            if est is not None and est > 0:
+                bounds.append(0.5 * est)
+        return max(bounds) if bounds else None
 
     def sane(self, read, confirm_fn=None, round_hint=None):
         """Return a cash value safe to act on. If `read` is implausibly far
