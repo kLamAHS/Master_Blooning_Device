@@ -388,12 +388,18 @@ def read_round(screen, cfg):
     return parse_round(text), text, crop, processed
 
 
+# Freeplay pushes past a beaten mode, so its round counter is a bare number
+# (no "/total") that keeps climbing past 100. `solve --freeplay` sets this so
+# the first-read sanity bound stops rejecting rounds above 100.
+FREEPLAY = False
+
+
 def plausible(new, last):
     """Rounds only move forward, and only a little at a time."""
     if new is None:
         return False
     if last is None:
-        return 1 <= new <= 100
+        return 1 <= new <= (200 if FREEPLAY else 100)
     return last <= new <= last + 3
 
 
@@ -2618,7 +2624,7 @@ def random_genome(rng, n_towers, hero=False):
 
 def run_episode(screen, cfg, genome, final_round, abort_lives=50,
                 flow_sensor=None, play_out=False, danger_rounds=None,
-                abilities=False, one_life=False):
+                abilities=False, one_life=False, freeplay=False):
     """Play one layout to survival or defeat. Returns (outcome,
     final_round_reached, towers, lives_by_round, cash_by_round,
     spent_by_round).
@@ -3167,7 +3173,11 @@ def run_episode(screen, cfg, genome, final_round, abort_lives=50,
                 outcome = "survived"
                 break
         if last_round is not None and last_round >= final_round:
-            if not play_out:
+            if not play_out or freeplay:
+                # Freeplay is endless: there is NO victory screen at the
+                # target, so REACHING it IS the win -- don't wait for a
+                # screen that will never come. (Non-play_out farm runs also
+                # stop here, as before.)
                 outcome = "survived"
                 break
             # Safety net for a win the covered-HUD path above missed:
@@ -3692,7 +3702,8 @@ def cmd_solve(args):
                  f"{args.name}` first.")
     load_mask(mask_path)
 
-    global PRICE_DIFFICULTY
+    global PRICE_DIFFICULTY, FREEPLAY
+    FREEPLAY = args.freeplay          # relax the round cap before preflight
     rng = random.Random(args.seed)
     runs_path = Path(__file__).parent / "runs_log.jsonl"
 
@@ -3712,16 +3723,32 @@ def cmd_solve(args):
               "episode start. Rung detection needs it, so pass "
               "--difficulty/--mode if detection fails.")
 
-    lv, start_round, difficulty, game_mode = detect_loaded_rung(
-        screen, cfg, flag_difficulty=args.difficulty,
-        flag_mode=args.mode)
-    if difficulty is None:
-        sys.exit(f"Couldn't detect the loaded difficulty (lives read "
-                 f"{lv}, start round {start_round}) -- pass "
-                 f"--difficulty (and --mode chimps if applicable).")
+    if args.freeplay:
+        # Freeplay: the game continued past a beaten mode, so lives/round
+        # match no rung and the counter is a bare number that climbs past
+        # 100. Skip detection -- the user names the difficulty (for the
+        # right price book / income; freeplay keeps that mode's economy)
+        # and the target round to push to.
+        difficulty = args.difficulty or "hard"
+        game_mode = "standard"
+        lv = read_lives(screen, cfg)
+        start_round = _stable_round(screen, cfg) or 1
+        target = args.final_round or 100
+        print(f"Freeplay: '{difficulty}' economy, currently ~round "
+              f"{start_round} (lives {lv}); reading the bare round counter "
+              f"and pushing to round {target}.")
+    else:
+        lv, start_round, difficulty, game_mode = detect_loaded_rung(
+            screen, cfg, flag_difficulty=args.difficulty,
+            flag_mode=args.mode)
+        if difficulty is None:
+            sys.exit(f"Couldn't detect the loaded difficulty (lives read "
+                     f"{lv}, start round {start_round}) -- pass "
+                     f"--difficulty (and --mode chimps if applicable, or "
+                     f"--freeplay for a freeplay game).")
+        target = args.final_round or campaign.rung_target(difficulty,
+                                                          game_mode)
     PRICE_DIFFICULTY = difficulty
-    target = args.final_round or campaign.rung_target(difficulty,
-                                                      game_mode)
     # One-life is a property of the RUNG, not of one startup lives read.
     # Deriving it from `lv` alone meant an unreadable-lives launch (the
     # very case the preflight tells the user to fix with --mode chimps)
@@ -3807,7 +3834,8 @@ def cmd_solve(args):
                 screen, cfg, genome, target, abort_lives=abort_lives,
                 flow_sensor=sensor, play_out=True,
                 danger_rounds=danger,
-                abilities=not args.no_abilities, one_life=one_life)
+                abilities=not args.no_abilities, one_life=one_life,
+                freeplay=getattr(args, "freeplay", False))
         except KeyboardInterrupt:
             raise
         except Exception:
@@ -4051,7 +4079,8 @@ def cmd_deploy(args):
                 screen, cfg, genome, target, abort_lives=abort_lives,
                 flow_sensor=sensor, play_out=True,
                 danger_rounds=danger,
-                abilities=not args.no_abilities, one_life=one_life)
+                abilities=not args.no_abilities, one_life=one_life,
+                freeplay=getattr(args, "freeplay", False))
         except KeyboardInterrupt:
             raise
         except Exception:
@@ -4461,6 +4490,14 @@ def main():
     p_solve.add_argument("--final-round", type=int, default=None,
                          dest="final_round",
                          help="override the rung's final round")
+    p_solve.add_argument("--freeplay", action="store_true",
+                         help="the loaded game is in FREEPLAY (past a "
+                              "beaten mode): skip lives-based rung "
+                              "detection, read the bare round counter, and "
+                              "push to --final-round. Pass --difficulty for "
+                              "the right price book (defaults to hard); "
+                              "set --final-round for the target (default "
+                              "100)")
     p_solve.add_argument("--explore", type=float, default=0.20,
                          help="base exploration rate (the campaign "
                               "policy adjusts it per episode)")
