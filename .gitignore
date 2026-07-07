@@ -1,2 +1,13 @@
 __pycache__/
 *.pyc
+
+# Runtime-generated per-user state -- everyone trains their OWN model, so
+# none of this ships in the repo. The code recreates each file on first run
+# (missing runs_log/prices/locked default to empty; debug/ is auto-made).
+runs_log.jsonl
+rounds_log.csv
+prices.json
+locked.json
+progress.json
+crash_log.txt
+debug/
