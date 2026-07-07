@@ -431,9 +431,12 @@ class MetaBrain:
             except (OSError, ValueError):
                 measured = {}
             for t, r in (measured or {}).items():
-                if t in self.towers and isinstance(r, (int, float)) \
-                        and 0.005 < r < 0.30:
+                if not (isinstance(r, (int, float)) and 0.005 < r < 0.30):
+                    continue
+                if t in self.towers:
                     self.towers[t].setdefault("placement", {})["range"] = r
+                elif t == "hero":     # the equipped hero's real reach, used by
+                    HERO_PLACEMENT["range"] = r    # every hero placement
         self.roles = self.k["roles"]
         # A knowledge file from before the late-game kinds still gets
         # ceramic/ddt/bad answers -- regenerating the file overrides.

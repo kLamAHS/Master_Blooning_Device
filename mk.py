@@ -2585,10 +2585,13 @@ def cmd_measure_ranges(args):
     if args.tower:
         towers = [args.tower.lower()]
     else:
+        # "hero" measures whichever hero is EQUIPPED (its range circle is the
+        # same red overlay) -- so a Sauda opener is sized from her real reach,
+        # not the default guess. It's placed via its own hotkey like any tower.
         towers = [t for t in ("dart", "tack", "boomerang", "sniper", "ninja",
                               "bomb", "glue", "ice", "wizard", "druid",
                               "alchemist", "engineer", "mortar", "super",
-                              "village") if t in TOWER_HOTKEYS]
+                              "village", "hero") if t in TOWER_HOTKEYS]
     print("Measuring tower ranges from the in-game range circle. Load the map "
           "(round NOT started) and don't touch the mouse.")
     print("Starting in 4 seconds...")
