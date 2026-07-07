@@ -759,12 +759,22 @@ class MetaBrain:
                 best, best_w = c, w
         return list(best)
 
+    def _pos_mean(self, pt):
+        """The learned value of a spot's region as a DETERMINISTIC mean, not
+        a Thompson draw. Used to weight anchor placement: an unseen spot
+        (mean 0.5) must not randomly swing the choice off the highest-coverage
+        candidate, while a spot the posterior has learned is bad still scores
+        low. Exploration of anchor spots is the explore branch's job, not
+        this scorer's."""
+        ba, bb = self.pos_post.get(_bucket(pt), [1.0, 1.0])
+        return ba / (ba + bb)
+
     def _pos_theta(self, rng, pt):
         ba, bb = self.pos_post.get(_bucket(pt), [1.0, 1.0])
         return _beta(rng, ba, bb)
 
     def _spot_for(self, rng, ttype, pools, taken, placed, track,
-                  large=False, anchor=False):
+                  large=False, anchor=False, cluster=False):
         """Style-aware placement. `placed` is [(ttype, spot), ...] already
         assigned in this layout. Scores candidates by what the tower
         actually wants -- track coverage for DPS, just-upstream coverage
@@ -840,15 +850,16 @@ class MetaBrain:
                 cands = on_track
         roomy_near = None
         if anchor and len(cands) > 2:
-            # Exposure floor: keep only the top ~40% by track coverage, so
-            # an opener can never be parked somewhere it sees little track.
+            # Exposure floor: keep only the top ~40% by track coverage, so an
+            # anchor (hero/opener/carry) always sees a lot of track.
             ranked = sorted(cands, key=lambda c: -track.exposure(c, r))
             cands = ranked[:max(2, int(len(ranked) * 0.4))]
-            # Among those top-exposure spots (all already good coverage),
-            # prefer ones a support tower can actually cluster on -- a roomy,
-            # village-placeable spot within buff range. This costs the carry
-            # ~no exposure (the survivors are all high) but lets the whole
-            # alch+village core form on it instead of scattering.
+        if cluster:
+            # ONLY the carry gets nudged toward a spot a support tower can
+            # cluster on -- a roomy, village-placeable spot within buff range.
+            # The hero and opener are PURE coverage: never pull them off the
+            # best lane spot toward open ground (that once parked the hero in
+            # a low-coverage corner).
             roomy = pools.get("roomy") or []
             if roomy:
                 def roomy_near(c, _r=roomy):
@@ -935,19 +946,20 @@ class MetaBrain:
                         # the entry leaves room for error; a defense
                         # camped at the exit pops with zero margin.
                         s *= 1.25 - 0.50 * sp[1]
-            # Learned-region posterior nudges the score. For most towers
-            # it only swings +/-20% (a wider swing once drowned out the
-            # small absolute exposure differences of short-range towers --
-            # heroes landed on 1%-coverage spots on pure noise). The ANCHOR
-            # is different: its candidates are already exposure-gated to the
-            # top band, so a strong posterior weight can't send it anywhere
-            # bad -- and it MUST be strong enough to actually vacate a spot
-            # a prior opener leaked from (the whole point of learning the
-            # opener). So there the posterior can nearly veto a spot.
+            # Learned-region posterior nudges the score. For most towers it
+            # only swings +/-20% via a Thompson draw (a wider swing once
+            # drowned out short-range towers' small exposure differences). The
+            # ANCHOR uses the deterministic posterior MEAN, not a draw: among
+            # the exposure-gated candidates the HIGHEST-coverage spot must win
+            # on a fresh run (random draws once parked the hero on a mediocre
+            # corner), while a spot the posterior has LEARNED is bad (a leaked
+            # opener) still scores near zero and gets vacated.
             if anchor:
-                s *= 0.15 + 0.85 * self._pos_theta(rng, c)
+                s *= 0.15 + 0.85 * self._pos_mean(c)
                 if roomy_near is not None and roomy_near(c):
-                    s *= 1.25          # cluster-able: support can reach here
+                    s *= 1.25          # carry nudge toward cluster-able (it's
+                    #                    already exposure-gated, so coverage
+                    #                    barely moves; the hero never gets this)
             else:
                 s *= 0.8 + 0.4 * self._pos_theta(rng, c)
             if s > best_s:
@@ -1361,7 +1373,8 @@ class MetaBrain:
             ttype, role = picks[i]
             spot = self._spot_for(rng, ttype, pools, taken, placed_ctx,
                                   track, large=ttype in large_towers,
-                                  anchor=role in ("hero", "opener", "carry"))
+                                  anchor=role in ("hero", "opener", "carry"),
+                                  cluster=role == "carry")
             if spot is None:
                 continue
             spots[i] = spot
