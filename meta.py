@@ -96,6 +96,12 @@ ROUGH_COST = {
     "spike": 1000, "village": 1200, "super": 2500,
 }
 
+# Pure crowd-control towers: they SLOW/freeze bloons but barely pop them.
+# Fine for the "control" role, but a one-life opener built on them lets the
+# round walk past a single life un-killed (observed: glue-only CHIMPS openers
+# dying at round 6), so they're filtered out of the one-life opener slot.
+_SLOW_ONLY = {"glue", "ice"}
+
 # The hero isn't in the knowledge base's tower table (which hero is
 # equipped is chosen in the menu, invisible to the bot), so placement
 # uses this profile: short-range coverage suits Sauda -- the sheet's
@@ -1283,6 +1289,12 @@ class MetaBrain:
             else:
                 cands = [t for t in self.roles.get(role, [])
                          if t in pool] or pool
+                if role == "opener" and self._one_life():
+                    # A one-life opener must KILL, not just slow: pure crowd
+                    # control (glue/ice) lets round 6 walk past the single
+                    # life. Keep only towers that actually pop.
+                    killers = [t for t in cands if t not in _SLOW_ONLY]
+                    cands = killers or cands
             ttype = self._pick_tower(rng, cands, [t for t, _ in picks],
                                      novelty=novelty,
                                      deep_slot=role == "carry")
@@ -1549,17 +1561,26 @@ class MetaBrain:
                     is_need = tier <= self._need_tier(need, p_i)
                     early_carry = (role == "carry" and p_i == main
                                    and tier <= 3)
+                    # One-life opener teeth: a base tower can't pop round 6,
+                    # so the opener's first two main-path tiers come even
+                    # BEFORE the carry's -- an upgraded popper is what holds
+                    # the single life while the carry saves up.
+                    early_opener = (role == "opener" and self._one_life()
+                                    and p_i == main and tier <= 2)
+                    early_anchor = early_carry or early_opener
                     dl = self._deadline(ttype, main, p_i, tier, need)
-                    if early_carry:
+                    if early_opener:
+                        dl = 1.0 + 3.0 * tier
+                    elif early_carry:
                         # The carry's first tiers outrank every support
                         # BASE: upgrade the tower you have before buying
                         # three more. Tight noise -- these must not
                         # leapfrog the opener/carry bases themselves.
                         dl = 2.0 + 3.0 * tier
-                    noise = 1.0 if early_carry else 4.0
+                    noise = 1.0 if early_anchor else 4.0
                     entry = {
                         "do": "upgrade", "ref": order, "path": vec,
-                        "prio": 0 if (is_need or early_carry)
+                        "prio": 0 if (is_need or early_anchor)
                         else (1 if p_i == main else 2),
                         "deadline": dl + rng.uniform(-noise, noise),
                         "est": tier_cost(ttype, p_i, tier)}

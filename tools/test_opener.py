@@ -129,7 +129,7 @@ def main():
     pools = {"near": [[0.5, 0.5]], "mid": [[0.5, 0.5]],
              "all": [[0.5, 0.5]], "roomy": [[0.5, 0.5]]}
     g = brain(mode="chimps", start=6)
-    early_defender = 0
+    early_defender = killer_opener = early_teeth = opener_seen = 0
     trials = 30
     for _ in range(trials):
         genome = g.next_genome(rng, 5, pools, tower_pool=pool, hero=True,
@@ -139,8 +139,26 @@ def main():
         # at least one round-6 placement that is NOT the hero
         if any((it.get("tower") or "").lower() != "hero" for it in r6):
             early_defender += 1
+        opener = next((it for it in genome if it.get("do") == "place"
+                       and _role(it) == "opener"), None)
+        if opener:
+            opener_seen += 1
+            # the one-life opener must be a killer, never pure slow (glue/ice)
+            if (opener.get("tower") or "").lower() not in ("glue", "ice"):
+                killer_opener += 1
+            # and it must get early teeth: a prio-0 upgrade by ~round 8
+            ups = [it for it in genome if it.get("do") == "upgrade"
+                   and it.get("ref") == opener["ref"]]
+            if any(u.get("round", 99) <= 9 and u.get("prio") == 0
+                   for u in ups):
+                early_teeth += 1
     check(f"CHIMPS genomes place a non-hero defender by round 6 "
           f"({early_defender}/{trials})", early_defender >= trials - 2)
+    check(f"the one-life opener is a KILLER, not glue/ice "
+          f"({killer_opener}/{opener_seen})",
+          opener_seen >= trials - 2 and killer_opener == opener_seen)
+    check(f"the one-life opener gets early teeth (prio-0 upgrade by r9) "
+          f"({early_teeth}/{opener_seen})", early_teeth >= 0.8 * opener_seen)
 
     print()
     if _fails:
