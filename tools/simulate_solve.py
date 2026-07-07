@@ -178,6 +178,96 @@ def run_campaign(seed, episodes=60, verbose=True, learning=True):
     return None, screened
 
 
+def run_deploy(seed, train_episodes=60, games=25, verbose=True):
+    """Offline proof of the `deploy` path (mk.py deploy). Train a
+    champion the normal way, then play it STRAIGHT -- pure attempt,
+    explore=0, nothing observed -- and confirm the finished model wins
+    the sim on its own. Returns (wins, games), or None if no champion was
+    trained within budget (nothing to deploy, exactly the case deploy
+    refuses to guess through).
+
+    This is what running the trained bot looks like once solving is done:
+    no exploration, no learning, just the champion replayed."""
+    rng = random.Random(seed)
+    k = json.loads((REPO / "meta_knowledge.json").read_text())
+    mask = json.loads(
+        (REPO / "masks" / "monkey_meadow_dart.json").read_text())
+    track = TrackModel(mask)
+    entry = min(track.cells, key=lambda c: track.progress[c])
+    track.orient([entry[0], entry[1]])
+    pts = mask.get("valid_strict") or mask["valid"]
+    pools = {"near": pts, "mid": [], "all": pts, "roomy": pts}
+    pool = ["dart", "tack", "bomb", "sniper", "ninja", "wizard", "druid",
+            "alchemist", "glue", "ice"] + meta.META_EXTRA_TOWERS
+    quirk = ["tack", "super", "wizard", "bomb", "glue"][seed % 5]
+
+    # An untrained model has no champion -- the gate `deploy` enforces
+    # before ever starting a game.
+    fresh = MetaBrain("sim_map", "hard", target_round=100, explore=0.0,
+                      knowledge=k, runs_path="/nonexistent",
+                      mode="chimps", start_round=6)
+    assert fresh.attempt_genome(rng, pools, tower_pool=pool, track=track,
+                                hero=True) is None, \
+        "an untrained model must have no champion to deploy"
+
+    # Train (the solve loop) just until a champion first survives.
+    import learner
+    brain = MetaBrain("sim_map", "hard", target_round=100, explore=0.20,
+                      knowledge=k, runs_path="/nonexistent",
+                      mode="chimps", start_round=6)
+    policy = campaign.EpisodePolicy()
+    trained = False
+    for ep in range(1, train_episodes + 1):
+        decision = policy.decide(rng)
+        brain.explore = decision["explore"]
+        genome = None
+        if decision["kind"] == "attempt":
+            genome = brain.attempt_genome(rng, pools, track=track,
+                                          tower_pool=pool, hero=True)
+        if genome is None:
+            brain.explore = decision["explore"]
+            genome = brain.next_genome(rng, 5, pools, tower_pool=pool,
+                                       track=track, hero=True,
+                                       novelty=decision.get("novelty",
+                                                            False))
+        sim_rng = random.Random(seed * 100003 + ep)
+        death = simulate(genome, brain.solutions, sim_rng,
+                         quirk_carry=quirk)
+        row = {"mode": "solve", "map": "sim_map", "difficulty": "hard",
+               "game_mode": "chimps", "target_round": 100,
+               "start_round": 6,
+               "outcome": "defeat" if death else "victory",
+               "final_round": death if death else 100,
+               "strategy": brain.last_strategy,
+               "towers": learner.towers_from_genome(genome)}
+        brain.observe(row, quiet=True)
+        policy.update(brain._reward(row),
+                      was_attempt=decision["kind"] == "attempt")
+        if death is None:
+            trained = True
+            break
+    if not trained:
+        return None                 # never found a champion in budget
+
+    # DEPLOY: champion only, explore=0, nothing observed back. Each game
+    # gets its own decoupled noise stream so we measure the champion, not
+    # one lucky roll.
+    brain.explore = 0.0
+    wins = 0
+    for g in range(1, games + 1):
+        genome = brain.attempt_genome(rng, pools, track=track,
+                                      tower_pool=pool, hero=True)
+        assert genome is not None, "trained model lost its champion"
+        sim_rng = random.Random(seed * 7919 + g * 101 + 1)
+        death = simulate(genome, brain.solutions, sim_rng,
+                         quirk_carry=quirk)
+        wins += 1 if death is None else 0
+        if verbose:
+            print(f"  deploy game {g:>2}: "
+                  + ("WON" if death is None else f"died r{death}"))
+    return wins, games
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--seeds", type=int, default=1)
@@ -186,8 +276,40 @@ def main():
                     help="also run each seed with learning DISABLED "
                          "and compare -- the 'is the ML genuinely "
                          "beneficial' scoreboard")
+    ap.add_argument("--deploy", action="store_true",
+                    help="instead of the convergence sweep, prove the "
+                         "`deploy` path: train a champion, then play it "
+                         "straight (no exploration, no learning) and "
+                         "confirm the finished model wins on its own")
     ap.add_argument("-q", "--quiet", action="store_true")
     args = ap.parse_args()
+    if args.deploy:
+        total_w = total_g = solved = 0
+        for seed in range(args.seeds):
+            res = run_deploy(seed, train_episodes=args.episodes,
+                             verbose=not args.quiet)
+            if res is None:
+                print(f"deploy seed {seed}: no champion trained in "
+                      f"{args.episodes} episodes -- nothing to deploy")
+                continue
+            w, gm = res
+            solved += 1
+            total_w += w
+            total_g += gm
+            print(f"deploy seed {seed}: champion won {w}/{gm} straight "
+                  f"games")
+        if not total_g:
+            sys.exit("no champion trained on any seed -- raise "
+                     "--episodes")
+        rate = total_w / total_g
+        print(f"\ndeploy: champion win rate {rate:.0%} over {total_g} "
+              f"straight games ({solved}/{args.seeds} seed(s) had a "
+              f"champion to deploy)")
+        if rate < 0.5:
+            sys.exit("deploy regression: a trained champion, replayed "
+                     "straight, should win the sim on its own")
+        print("deploy OK: the finished model wins without exploring.")
+        return
     wins, ablated = [], []
     for seed in range(args.seeds):
         won_at, screened = run_campaign(seed, episodes=args.episodes,
