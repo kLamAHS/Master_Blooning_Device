@@ -778,9 +778,6 @@ class MetaBrain:
         if track is None or not track.ok:
             self._last_spot_src = "no-track"
             return self._pick_spot(rng, pools, taken, large=large)
-        if rng.random() < self.explore:
-            self._last_spot_src = "explore"
-            return self._pick_spot(rng, pools, taken, large=large)
         prof = self.towers.get(ttype, {}).get("placement") \
             or (HERO_PLACEMENT if ttype == "hero" else {})
         style = prof.get("style", "coverage")
@@ -804,11 +801,31 @@ class MetaBrain:
                 cands = [rng.choice(nearby)
                          for _ in range(min(30, len(nearby)))] + cands[:20]
         cands = _spread(cands, taken, SEP_LARGE if large else SEP)
+        # Keep towers that shoot bloons ON the track: drop candidates that
+        # see essentially NONE of it (the same near-zero-exposure test the
+        # learner uses), so neither the scorer NOR exploration ever parks a
+        # DPS tower or debuffer in a dead corner with no track in range.
+        # Buffers (buddy) and global towers (offside) belong OFF the line,
+        # so they skip this. It's a floor, not a ranking -- a well-placed
+        # upstream debuffer on a modest-exposure spot still qualifies; only
+        # the genuinely off-track spots are removed.
+        if style in ("coverage", "upstream", "downstream") \
+                and len(cands) > 3:
+            on_track = [c for c in cands if track.exposure(c, r) >= 0.005]
+            if len(on_track) >= 2:
+                cands = on_track
         if anchor and len(cands) > 2:
             # Exposure floor: keep only the top ~40% by track coverage, so
             # an opener can never be parked somewhere it sees little track.
             ranked = sorted(cands, key=lambda c: -track.exposure(c, r))
             cands = ranked[:max(2, int(len(ranked) * 0.4))]
+        if cands and rng.random() < self.explore:
+            # Explore, but only AMONG the on-track candidates above. The old
+            # branch sampled raw buildable spots here and frequently placed
+            # towers with no track in range; exploration should vary WHICH
+            # good spot, not whether the tower can see the track at all.
+            self._last_spot_src = "explore"
+            return list(rng.choice(cands))
 
         # The carry anchors the geometry for debuffers and buffers.
         carries = set(self.roles.get("carry", []))
