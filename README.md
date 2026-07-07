@@ -132,6 +132,7 @@ once; after that your daily loop is just steps 6–8.
     python learner.py selftest
     python campaign.py selftest
     python tools/test_cash_floor.py                     # cash-misread guard
+    python tools/test_placement_avoid.py                # never-stack-towers guard
     python tools/simulate_solve.py --seeds 5 --ablate   # end-to-end sim
     python tools/simulate_solve.py --deploy --seeds 5   # deploy path
     ```
@@ -745,6 +746,17 @@ window hasn't been moved since calibration.
   died. Defeat is detected by the lives counter (auto-located from the
   red heart icon) hitting 0, because the round counter stays visible on
   the defeat screen and can't be the signal.
+- **Never stack a tower on an occupied spot (`placement.py`).** Before
+  clicking, a placement drops every candidate spot within a tower-sized
+  radius of one already taken — a monkey placed this run, or one a *probe*
+  caught — and when the whole planned neighborhood is full it relocates to
+  the nearest genuinely-free mask point instead of clicking a tower and
+  failing. When a placement still can't find a home, the executor clicks the
+  planned spot with no ghost held: if an upgrade panel pops open, a monkey is
+  sitting there, so that point is blacklisted for the rest of the run and no
+  later buy wastes clicks on it again. This stops the "try to place on top of
+  an existing tower a couple times, then give up" loop. The pure geometry has
+  an offline test (`python tools/test_placement_avoid.py`).
 - **Stuck-panel recovery.** Upgrades verify the tower got selected and the
   panel closed afterwards, deselect clicks go to mask points far from
   every tower, and if the HUD ever stays dark mid-run the main loop

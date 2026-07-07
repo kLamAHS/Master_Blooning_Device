@@ -75,6 +75,9 @@ def dbg(msg):
 # low cash misread non-fatal: the bot keeps buying up to what it PROVABLY has
 # instead of freezing behind a phantom-broke wallet and leaking the run.
 from cashguard import CashFloor
+# Pure placement geometry (see placement.py): never click a spot we know is
+# already taken -- relocate to the nearest free mask point instead.
+from placement import free_placement_spots
 
 try:
     import pytesseract
@@ -1871,6 +1874,26 @@ def placement_candidates(spot, tower=None, limit=12):
     return candidates
 
 
+def _probe_occupied(screen, cfg, spot):
+    """Is a monkey sitting on `spot`? With NO ghost held, a bare left click on
+    an occupied spot opens that tower's upgrade panel, while a click on empty
+    placeable ground does nothing. That is how the executor turns a mystery
+    placement failure into a KNOWN-occupied point it can avoid from then on.
+    Drops any held ghost first and closes the panel it opens, so the UI is
+    left clean; if a ghost/overlay can't be cleared it declines to probe
+    rather than risk a stray click."""
+    click("right")                        # drop any held ghost
+    time.sleep(0.2)
+    if not counter_visible(screen, cfg, tries=2):
+        return False                      # ghost/overlay stuck -- don't risk it
+    click_norm(screen, spot)
+    time.sleep(0.3)
+    if detect_panel_side(screen):
+        clear_ui(screen, cfg)             # close the panel the probe opened
+        return True
+    return False
+
+
 def act_place(screen, cfg, action):
     """Try to place a tower. Returns (status, landed):
       ("placed", [x, y])  -- tower is down at that coordinate
@@ -1880,19 +1903,22 @@ def act_place(screen, cfg, action):
                              as a placement failure.
       ("no_spot", None)   -- ghost held but every candidate click was
                              rejected: genuinely unplaceable around here."""
-    key = TOWER_HOTKEYS[action["tower"].lower()]
+    tl = action["tower"].lower()
+    large = tl in LARGE_TOWERS
+    key = TOWER_HOTKEYS[tl]
     spot = action["at"]
-    candidates = placement_candidates(spot, action["tower"].lower())
-    # Never retry ON another tower this run already placed: those clicks
-    # can only fail (or select the neighbor), and watching the bot try
-    # to stack glue on glue for a minute is silly.
-    avoid = action.get("avoid") or []
-    if avoid:
-        min_d = 0.05 if action["tower"].lower() in LARGE_TOWERS else 0.03
-        far = [c for c in candidates
-               if all((c[0] - a[0]) ** 2 + (c[1] - a[1]) ** 2
-                      >= min_d ** 2 for a in avoid)]
-        candidates = far or candidates
+    candidates = placement_candidates(spot, tl)
+    # Never click ON a spot we KNOW is taken -- a tower this run already
+    # placed (`avoid`), or one a probe caught a monkey sitting on (`occupied`,
+    # a persistent per-episode blacklist). Those clicks can only fail or select
+    # the neighbor; watching the bot try to stack glue on glue is silly.
+    occupied = action.get("occupied")            # mutable list, grown on probe
+    avoid = list(action.get("avoid") or [])
+    if occupied:
+        avoid += list(occupied)
+    min_d = 0.05 if large else 0.03
+    candidates = free_placement_spots(
+        candidates, avoid, min_d, MASK_ROOMY if large else MASK_POINTS, spot)
     deadline = time.time() + action.get("timeout", 60)
 
     cash_before = read_cash(screen, cfg)
@@ -1966,6 +1992,16 @@ def act_place(screen, cfg, action):
               f"  (cash-verified late, ${baseline} -> ${spent})")
         clear_ui(screen, cfg)
         return "placed", target
+    # Still nothing placed. Before giving up, find out WHY the planned spot
+    # refused us: a bare click there (no ghost held) that opens an upgrade
+    # panel means a monkey is sitting on it. Blacklist that point so this
+    # item's own retries -- and every later buy -- relocate instead of
+    # clicking the same dead spot again.
+    if occupied is not None and _probe_occupied(screen, cfg, spot):
+        pt = [round(spot[0], 4), round(spot[1], 4)]
+        if pt not in occupied:
+            occupied.append(pt)
+            dbg(f"{tl}: {pt} is occupied by a monkey -- blacklisted this run")
     return "no_spot", None
 
 
@@ -2728,6 +2764,11 @@ def run_episode(screen, cfg, genome, final_round, abort_lives=50,
 
     queue = list(genome)
     landed_by_ref, towers = {}, {}
+    # Spots a probe caught a monkey sitting on (a tower we didn't track, or
+    # one whose real position drifted from where we recorded it). Grown by
+    # act_place and fed back into every placement so no buy keeps clicking a
+    # spot that's already taken.
+    occupied_spots = []
     lives_by_round = {}
     cash_by_round = {}       # cash at the start of each round (telemetry
     spent_by_round = {}      # for the learned income curve)
@@ -2844,7 +2885,8 @@ def run_episode(screen, cfg, genome, final_round, abort_lives=50,
             st, landed = act_place(
                 screen, cfg,
                 {**item, "timeout": 10,
-                 "avoid": [t["at"] for t in towers.values()]})
+                 "avoid": [t["at"] for t in towers.values()],
+                 "occupied": occupied_spots})
             if landed is None:
                 if st == "no_spot":
                     print(f"   pre-start {ttype}: no placeable spot near "
@@ -3087,7 +3129,8 @@ def run_episode(screen, cfg, genome, final_round, abort_lives=50,
                     st, landed = act_place(
                         screen, cfg,
                         {**item, "timeout": 10,
-                         "avoid": [t["at"] for t in towers.values()]})
+                         "avoid": [t["at"] for t in towers.values()],
+                         "occupied": occupied_spots})
                     if landed is not None:
                         # Key by the genome's own ref when present: place
                         # items can execute out of order (broke/no-spot
