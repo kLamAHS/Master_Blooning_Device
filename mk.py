@@ -723,7 +723,9 @@ def _plausible_cash_shape(box):
         return False
     x, y, w, h = box
     return (0.015 <= h <= 0.10          # digit strip, not a map chunk
-            and w <= 0.35               # never wider than the HUD zone
+            and w <= 0.13               # a 6-digit cash run is ~0.11 wide;
+            #                             wider is the snap's runaway growth
+            #                             (0.15 boxes read a constant junk $1)
             and 1.0 <= w / h <= 12.0    # wide strip (fractions, so a
             and y + h <= 0.16)          # 2-digit run is ~1.15) / top HUD
 
@@ -2861,6 +2863,22 @@ def run_episode(screen, cfg, genome, final_round, abort_lives=50,
                 f", using ${out}")
         return out
 
+    def recalibrate_cash_if_stuck():
+        """A cash box that has drifted onto junk reads a CONSTANT low value
+        (the field bug: a '$1' at round 27 while cash is really in the
+        thousands), which the floor then substitutes on every buy -- the whole
+        plan freezes behind a phantom-low wallet until the run is lost. When
+        sane_cash has substituted many times running with no good read, the
+        BOX is broken, not the game: re-find the counter from scratch off the
+        coin/heart HUD landmark and re-seed the floor from the fresh read."""
+        if not cash_floor.stuck():
+            return
+        dbg("cash reads stuck low -- recalibrating the counter from the "
+            "HUD landmark")
+        preflight_cash_box(screen, cfg, recalibrate=True)
+        cash_floor.reset_stuck()
+        confirm_floor()
+
     def set_watermark(price=None):
         """Record the cash level of a money-failure. Being broke for a
         KNOWN price means cash < price BY DEFINITION, so the watermark is
@@ -2966,6 +2984,7 @@ def run_episode(screen, cfg, genome, final_round, abort_lives=50,
     outcome = "hud_lost"
     while True:
         unpause_if_needed(screen, cfg)        # cheap; a paused game shows
+        recalibrate_cash_if_stuck()           # broken box -> re-find, not freeze
         value, *_ = read_round(screen, cfg)   # a frozen-but-visible counter
         prev_lives = lives
         lives = read_lives(screen, cfg)

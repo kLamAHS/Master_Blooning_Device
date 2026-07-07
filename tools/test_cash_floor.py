@@ -99,24 +99,39 @@ def main():
     check("unseeded with no round hint passes any read through",
           f.sane(4) == 4)
 
-    # --- Stale-LOW provable floor + income: the income bound still catches a
-    # misread the spent-down floor would miss (the '$1' case the user hit). ---
+    # --- The SEEDED floor governs; the rough income model never overrides a
+    # real read (a good $443 getting pushed up to $542 was field churn). ------
     f = CashFloor(income_model=income_model)   # income_model(20) = 5300
-    f.confirm(5000)                            # floor high...
-    f.spend(4980)                              # ...then spent down to 20
-    check("floor is stale-low after heavy spending", f.value == 20)
-    # A '$1' misread: the spent-down floor alone (20) wouldn't reject it, but
-    # the income bound 0.5*(5300-4980)=160 does.
-    check("income bound catches a $1 misread past a stale-low floor",
-          f.sane(1, round_hint=20) == 160)
-    # A genuine low read consistent with the income bound still passes.
-    check("read at the income bound passes through",
-          f.sane(200, round_hint=20) == 200)
-    # Without the round hint only the (stale-low) provable floor is in play, so
-    # it CAN'T catch the $1 -- which is exactly why the real sane_cash always
-    # passes round_hint=last_round.
-    check("no round hint: stale-low floor alone lets the $1 through",
-          f.sane(1) == 1)
+    f.confirm(435)                             # the field scenario: floor 435
+    check("a good read just above the floor passes through untouched, NOT "
+          "inflated by the income model to $542",
+          f.sane(443, round_hint=20) == 443)
+    # The provable floor still catches a genuine low misread, as before.
+    f.confirm(3000)
+    check("the seeded floor still catches a real $1 misread",
+          f.sane(1, round_hint=20) == 3000)
+
+    # --- stuck(): a BROKEN box (constant low read) is distinguished from the
+    # odd intermittent misread, so the caller can recalibrate not freeze. -----
+    f = CashFloor(income_model=income_model)
+    f.confirm(3000)                            # floor $3000
+    check("not stuck initially", not f.stuck())
+    for _ in range(11):
+        f.sane(1)                              # box reads a constant junk $1
+    check("11 low reads: not yet flagged stuck (default n=12)", not f.stuck())
+    f.sane(1)
+    check("12 low reads in a row -> stuck (box is broken)", f.stuck())
+    f.sane(2950)                               # one good read...
+    check("a single good read clears the stuck streak", not f.stuck())
+    # intermittent misreads (a good read between them) never trip stuck
+    f2 = CashFloor()
+    f2.confirm(3000)
+    for _ in range(30):
+        f2.sane(1)
+        f2.sane(2950)
+    check("intermittent misreads never trip stuck", not f2.stuck())
+    f.reset_stuck()
+    check("reset_stuck clears it", not f.stuck())
 
     print()
     if _fails:
