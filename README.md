@@ -535,15 +535,26 @@ python mk.py solve monkey_meadow
   covers only ~3% of track by its own small range and, buying first, drains
   the whole $650 so nothing else can be afforded (a real training log showed
   205/205 runs dying at rounds 6–9 with **one** tower down). The one-life
-  opener now (a) fits several **cheap popping defenders** into the starting
-  budget at the start round — preferring real DPS over the hero, which
-  schedules a couple rounds later behind the defense; (b) the opener is a
-  **killer, never pure crowd-control** (glue/ice slow but barely pop, so a
-  glue opener let round 6 walk past the one life); and (c) the opener gets
-  **early teeth** — its first two main-path tiers are pinned ahead of even
-  the carry's, because a base tower can't pop round 6. The expensive carry
-  saves up behind that defense. Forgiving rungs keep the hero-as-opener
-  behavior. (`tools/test_opener.py`.)
+  opener now:
+  - **fits several cheap popping defenders** into the starting budget at the
+    start round — preferring real DPS over the hero, which schedules a couple
+    rounds later behind the defense;
+  - is a **cheap tower that SCALES into a tier-4/5 carry** (tack → Tack Zone,
+    dart → Crossbow, boomerang → MOAB Press), drawn from on-track AoE / multi-
+    shot group-clearers — never pure crowd-control (glue/ice only slow), never
+    a pricey $500 ninja that eats the whole $650 and leaves nothing to upgrade,
+    never an off-track single-target sniper that can't clear a round-6 group.
+    Its build follows that carry template instead of a random path, so the
+    early upgrades are an investment, not throwaway;
+  - gets **early teeth** — its first two main-path tiers are pinned to land
+    *before* the plan sinks cash into the hero and the expensive carry base,
+    because a base tower can't pop round 6;
+  - takes the **highest-coverage lane spot deterministically** (the survival
+    anchors never scatter to a random spot on a one-life run, so they sit on
+    the tightest track loop; the carry still clusters so its support reaches
+    it).
+
+  Forgiving rungs keep the hero-as-opener behavior. (`tools/test_opener.py`.)
 - **The whole game is scheduled.** Threat coverage now spans the full
   ladder: camo (r24), lead (r28), MOAB prep (r40), ceramic cleanup
   (r63+), DDT answers (r90-99, MIB/Sabotage/Impale class), and a BAD

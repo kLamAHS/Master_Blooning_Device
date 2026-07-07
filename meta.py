@@ -870,13 +870,19 @@ class MetaBrain:
             if roomy:
                 def roomy_near(c, _r=roomy):
                     return any(_dist(c, rp) <= 0.066 for rp in _r)
-        if cands and rng.random() < self.explore:
+        if cands and rng.random() < self.explore \
+                and not (anchor and self._one_life() and not cluster):
             # Explore, but only AMONG the on-track candidates above. The old
             # branch sampled raw buildable spots here and frequently placed
             # towers with no track in range; exploration should vary WHICH
             # good spot, not whether the tower can see the track at all. A
             # buffer explores only among spots that still cover the carry, so
-            # exploration never breaks the link it exists to make.
+            # exploration never breaks the link it exists to make. On a
+            # ONE-LIFE rung the survival anchors (opener + hero, i.e. anchors
+            # that don't cluster) never explore their spot -- they always take
+            # the highest-coverage lane spot, because a scattered opener is
+            # exactly the bad lane coverage that leaks the single life. The
+            # carry still explores/clusters so its support can reach it.
             self._last_spot_src = "explore"
             if style == "buddy" and carry_spot is not None:
                 in_range = [c for c in cands
@@ -998,10 +1004,14 @@ class MetaBrain:
             return (rank.get(style, 1), i)
         return sorted(range(len(picks)), key=key)
 
-    def _pick_build(self, rng, ttype):
+    def _pick_build(self, rng, ttype, follow_template=False):
         """(main, cross) for a tower: meta build templates re-weighted by
-        the learned per-path posterior; explore = any legal combo."""
-        if rng.random() < self.explore:
+        the learned per-path posterior; explore = any legal combo.
+        follow_template skips the random-explore branch so a scaling anchor
+        (the one-life opener) always builds toward a real tier-5 carry line
+        -- tack -> Tack Zone, dart -> Crossbow -- instead of a throwaway
+        random path."""
+        if not follow_template and rng.random() < self.explore:
             main = rng.randrange(3)
             cross = rng.choice([p for p in range(3) if p != main])
             return main, cross, "explore"
@@ -1290,11 +1300,34 @@ class MetaBrain:
                 cands = [t for t in self.roles.get(role, [])
                          if t in pool] or pool
                 if role == "opener" and self._one_life():
-                    # A one-life opener must KILL, not just slow: pure crowd
-                    # control (glue/ice) lets round 6 walk past the single
-                    # life. Keep only towers that actually pop.
-                    killers = [t for t in cands if t not in _SLOW_ONLY]
-                    cands = killers or cands
+                    # A one-life opener should be a CHEAP tower that also
+                    # SCALES into a tier-5 carry (tack -> Tack Zone, dart ->
+                    # Crossbow, boomerang -> MOAB Press): it holds round 6 AND
+                    # becomes the mid-game core, so its early upgrades are an
+                    # investment, not throwaway. Draw from cheap, build-
+                    # templated KILLERS -- never pure crowd-control (glue/ice
+                    # only slow), never the pricey ones ($500 ninja) that eat
+                    # the whole $650 and leave no room to upgrade or add a
+                    # second tower.
+                    cap = 0.6 * self.income(self.start_round)
+
+                    def _oc(t, _p=price_of):
+                        return (_p(t) if _p else None) or ROUGH_COST.get(t, 600)
+
+                    def _style(t):
+                        return (self.towers.get(t, {}).get("placement")
+                                or {}).get("style", "coverage")
+                    # cheap + scales + KILLS GROUPS (on-track AoE/multi-shot).
+                    # Exclude pure slow (glue/ice) and OFFSIDE single-target
+                    # (a base sniper has infinite range but pops one bloon at a
+                    # time -- it can't clear a round-6 group before it leaks).
+                    scalers = [t for t in pool
+                               if t not in _SLOW_ONLY
+                               and _style(t) != "offside"
+                               and self.towers.get(t, {}).get("builds")
+                               and _oc(t) <= cap]
+                    cands = scalers or [t for t in cands
+                                        if t not in _SLOW_ONLY] or cands
             ttype = self._pick_tower(rng, cands, [t for t, _ in picks],
                                      novelty=novelty,
                                      deep_slot=role == "carry")
@@ -1437,10 +1470,12 @@ class MetaBrain:
             taken.append(spot)
             placed_ctx.append((ttype, spot))
         placed = []      # (ref, ttype, spot, main, cross, label)
-        for ref, (ttype, _role) in enumerate(picks):
+        for ref, (ttype, role) in enumerate(picks):
             if ref not in spots:
                 continue
-            main, cross, label = self._pick_build(rng, ttype)
+            main, cross, label = self._pick_build(
+                rng, ttype,
+                follow_template=(role == "opener" and self._one_life()))
             placed.append((ref, ttype, spots[ref], main, cross, label))
 
         def base_cost(ttype):
@@ -1570,7 +1605,12 @@ class MetaBrain:
                     early_anchor = early_carry or early_opener
                     dl = self._deadline(ttype, main, p_i, tier, need)
                     if early_opener:
-                        dl = 1.0 + 3.0 * tier
+                        # BEFORE the hero (place deadline 2) and the carry
+                        # BASE (3): the opener's teeth must accumulate in the
+                        # income-paced walk before the plan sinks $600 into the
+                        # hero and reserves $2500 for the carry, or its first
+                        # tier lands ~round 18 and round 6 is held by a base.
+                        dl = 1.0 + 0.3 * tier
                     elif early_carry:
                         # The carry's first tiers outrank every support
                         # BASE: upgrade the tower you have before buying

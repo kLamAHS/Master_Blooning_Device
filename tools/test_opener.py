@@ -22,7 +22,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 
-from meta import MetaBrain                        # noqa: E402
+from meta import MetaBrain, ROUGH_COST            # noqa: E402
 
 K = json.loads((REPO / "meta_knowledge.json").read_text())
 _fails = []
@@ -130,6 +130,8 @@ def main():
              "all": [[0.5, 0.5]], "roomy": [[0.5, 0.5]]}
     g = brain(mode="chimps", start=6)
     early_defender = killer_opener = early_teeth = opener_seen = 0
+    cheap_opener = 0
+    budget = g.income(6)
     trials = 30
     for _ in range(trials):
         genome = g.next_genome(rng, 5, pools, tower_pool=pool, hero=True,
@@ -146,6 +148,12 @@ def main():
             # the one-life opener must be a killer, never pure slow (glue/ice)
             if (opener.get("tower") or "").lower() not in ("glue", "ice"):
                 killer_opener += 1
+            # ...and cheap enough to leave room for its own upgrades + a
+            # second tower (a $500 ninja ate the whole $650, so only 1 tower
+            # ever landed).
+            if ROUGH_COST.get((opener.get("tower") or "").lower(), 600) \
+                    <= 0.6 * budget:
+                cheap_opener += 1
             # and it must get early teeth: a prio-0 upgrade by ~round 8
             ups = [it for it in genome if it.get("do") == "upgrade"
                    and it.get("ref") == opener["ref"]]
@@ -157,6 +165,8 @@ def main():
     check(f"the one-life opener is a KILLER, not glue/ice "
           f"({killer_opener}/{opener_seen})",
           opener_seen >= trials - 2 and killer_opener == opener_seen)
+    check(f"the one-life opener is affordable, not a budget-eating $500 tower "
+          f"({cheap_opener}/{opener_seen})", cheap_opener == opener_seen)
     check(f"the one-life opener gets early teeth (prio-0 upgrade by r9) "
           f"({early_teeth}/{opener_seen})", early_teeth >= 0.8 * opener_seen)
 
