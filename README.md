@@ -310,6 +310,28 @@ to confuse the colors). It takes a couple of minutes and produces:
 The red-tint check is a heuristic, so a stray dot or two near map edges is
 normal — the GA doesn't care, since bad spots just evolve away.
 
+### `measure-ranges` — teach the brain each tower's real range
+
+The brain reasons about **lane coverage** from each tower's range, but the
+built-in ranges are rough (it modelled a tack shooter as covering ~2% of the
+track, so its placements looked blind). This measures the real thing off the
+**in-game range circle** — the same red tint `scan` reads: it hovers each
+tower's ghost over the track (where the circle turns red) and sizes the red
+disc.
+
+```
+python mk.py measure-ranges                 # all common towers
+python mk.py measure-ranges --tower tack    # just one, to re-check
+```
+
+Load the map (round **not** started), walk away. It writes
+`measured_ranges.json`, which the brain loads to override the defaults, and an
+annotated `debug/range_<tower>.png` per tower — glance at those; the green
+circle should trace the tower's real range. One pass per resolution is enough
+(ranges are in screen fractions). Towers it can't size (couldn't find an
+on-track hover spot, or the ghost was unaffordable) are skipped and keep the
+default.
+
 Where does that leave `locate`? It's only needed for hand-written baseline
 plans (your control experiment that proves the clicking pipeline works) and
 for one-off points like `deselect_point`. The emergent pipeline never uses it.

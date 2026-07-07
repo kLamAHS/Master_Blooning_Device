@@ -2363,6 +2363,79 @@ def ring_red_shift(cur, clean, cx, cy, r_in, r_out):
     return float(np.median(shift_px))
 
 
+def measure_tower_range(screen, cfg, tower, debug_dir=None):
+    """Measure a tower's ACTUAL range as a fraction of screen width, by
+    hovering its ghost over an UNPLACEABLE spot -- where BTD6 paints the whole
+    range circle RED -- and walking a thin ring outward until that red tint
+    ends. That radius is the range. Reuses the very red-shift detector the
+    scanner uses for placeability, so it needs no new calibration idea; the
+    result replaces the rough hardcoded `range` the brain guesses coverage
+    from (a tack modelled at 1.9% of track is why placements looked blind).
+    Returns the range fraction, or None if no red circle could be sized (the
+    ghost never appeared, or no on-track hover spot was found)."""
+    r_in = max(6, int(0.020 * screen.h))          # scan's placeability ring
+    r_out = max(r_in + 4, int(0.050 * screen.h))
+    clean = screen.grab()
+    pyautogui.moveTo(*screen.to_pixels(0.45, 0.50))
+    time.sleep(0.2)
+    press_key(TOWER_HOTKEYS[tower])                # pick up the ghost
+    time.sleep(0.45)
+    cx0, cy0 = int(0.45 * screen.w), int(0.50 * screen.h)
+    held = screen.grab()
+    if np.abs(held[cy0 - r_out:cy0 + r_out, cx0 - r_out:cx0 + r_out].astype(int)
+              - clean[cy0 - r_out:cy0 + r_out, cx0 - r_out:cx0 + r_out]
+              .astype(int)).mean() < 2.0:
+        click("right")
+        return None                                # no ghost (unaffordable?)
+
+    # Find the reddest (most clearly on-track) hover spot: the range circle is
+    # only red where the cursor itself sits on an unplaceable cell.
+    best = None
+    for hx in (0.34, 0.42, 0.50, 0.26, 0.58, 0.38, 0.46, 0.30):
+        for hy in (0.50, 0.42, 0.58, 0.35, 0.66):
+            pyautogui.moveTo(*screen.to_pixels(hx, hy))
+            time.sleep(0.10)
+            cur = screen.grab()
+            cx, cy = int(hx * screen.w), int(hy * screen.h)
+            red = ring_red_shift(cur, clean, cx, cy, r_in, r_out)
+            if best is None or red > best[0]:
+                best = (red, hx, hy)
+    red0, hx, hy = best
+    if red0 < 10.0:                                # never landed on the track
+        click("right")
+        return None
+    pyautogui.moveTo(*screen.to_pixels(hx, hy))
+    time.sleep(0.15)
+    cur = screen.grab()
+    click("right")                                 # done: drop the ghost
+    cx, cy = int(hx * screen.w), int(hy * screen.h)
+
+    # Radial red profile: thin rings from just outside the monkey body out to a
+    # quarter-screen. The red tint fills the circle, so it stays high to the
+    # edge and then falls off -- the farthest ring still clearly red is R.
+    step = max(2, int(0.0035 * screen.w))
+    prof = []
+    r = max(6, int(0.016 * screen.h))
+    while r < int(0.26 * screen.w):
+        prof.append((r, ring_red_shift(cur, clean, cx, cy,
+                                       max(2, r - step), r + step)))
+        r += step
+    peak = max((v for _, v in prof), default=0.0)
+    if peak < 10.0:
+        return None
+    thr = max(6.0, 0.45 * peak)                    # half the fill's red shift
+    strong = [rr for rr, v in prof if v >= thr]
+    if not strong:
+        return None
+    R = max(strong)
+    if debug_dir is not None:
+        shot = cur.copy()
+        cv2.circle(shot, (cx, cy), R, (0, 255, 0), 2)
+        cv2.circle(shot, (cx, cy), 3, (0, 255, 0), -1)
+        cv2.imwrite(str(Path(debug_dir) / f"range_{tower}.png"), shot)
+    return round(R / screen.w, 4)
+
+
 def cmd_scan(args):
     """Machine-generated placement knowledge: no human hovering required.
     Hold a tower ghost, sweep the cursor over a grid, and ask the game
@@ -2493,6 +2566,62 @@ def cmd_scan(args):
     print("Green = safe interior spots (use these for plans). Orange = "
           "valid but hugging an edge. If it disagrees with the map, tune "
           "\"scan_red_shift\" in config.json and rescan.")
+
+
+MEASURED_RANGES_PATH = Path(__file__).parent / "measured_ranges.json"
+
+
+def cmd_measure_ranges(args):
+    """Measure each tower's TRUE range from the in-game range circle and save
+    it, so the brain reasons about lane coverage with real numbers instead of
+    the rough hardcoded guesses (a tack it thought covered ~2% of track). Load
+    the map (round NOT started) and walk away; each tower's ghost is hovered
+    over the track, where its range circle turns red, and the red disc is
+    measured. Writes measured_ranges.json (merged), which meta.py loads."""
+    cfg = load_config()
+    screen, hwnd = make_screen(cfg)
+    debug_dir = Path(__file__).parent / "debug"
+    debug_dir.mkdir(exist_ok=True)
+    if args.tower:
+        towers = [args.tower.lower()]
+    else:
+        towers = [t for t in ("dart", "tack", "boomerang", "sniper", "ninja",
+                              "bomb", "glue", "ice", "wizard", "druid",
+                              "alchemist", "engineer", "mortar", "super",
+                              "village") if t in TOWER_HOTKEYS]
+    print("Measuring tower ranges from the in-game range circle. Load the map "
+          "(round NOT started) and don't touch the mouse.")
+    print("Starting in 4 seconds...")
+    focus_game_window(hwnd)
+    time.sleep(4)
+    out = {}
+    for tower in towers:
+        try:
+            r = measure_tower_range(screen, cfg, tower, debug_dir)
+        except Exception:
+            _log_crash(f"measure-range {tower}")
+            r = None
+        try:
+            clear_ui(screen, cfg)
+        except Exception:
+            pass
+        if r:
+            out[tower] = r
+        print(f"   {tower:10} range = "
+              f"{('%.4f (%.0f%% of screen width)' % (r, 100 * r)) if r else 'FAILED -- see debug/range_*.png'}")
+    existing = {}
+    if MEASURED_RANGES_PATH.exists():
+        try:
+            existing = json.loads(MEASURED_RANGES_PATH.read_text())
+        except Exception:
+            existing = {}
+    existing.update(out)
+    MEASURED_RANGES_PATH.write_text(json.dumps(existing, indent=1) + "\n")
+    print(f"\nSaved {len(out)}/{len(towers)} ranges to "
+          f"{MEASURED_RANGES_PATH.name}. The brain now sizes coverage with "
+          f"these. Check debug/range_<tower>.png -- the green circle should "
+          f"trace the real range; if it's off, rerun a single tower with "
+          f"`measure-ranges --tower <name>`.")
 
 
 MASK_POINTS = []     # strict points from the loaded mask; retries use these
@@ -4809,6 +4938,12 @@ def main():
                          dest="final_round",
                          help="round that counts as survival (default: "
                               "the rung's final round)")
+    p_range = sub.add_parser(
+        "measure-ranges", help="measure each tower's TRUE range from the "
+                               "in-game range circle -> measured_ranges.json "
+                               "(load the map, round not started, walk away)")
+    p_range.add_argument("--tower", default=None,
+                         help="measure just this tower (default: all)")
     p_graph = sub.add_parser(
         "graph", help="render training progress from runs_log.jsonl to a "
                       "self-contained progress.html you can open in a browser")
@@ -4823,7 +4958,8 @@ def main():
     {"locate": cmd_locate, "watch": cmd_watch,
      "play": cmd_play, "scan": cmd_scan, "farm": cmd_farm,
      "solve": cmd_solve, "deploy": cmd_deploy, "campaign": cmd_campaign,
-     "learn": cmd_learn, "graph": cmd_graph}[args.command](args)
+     "learn": cmd_learn, "graph": cmd_graph,
+     "measure-ranges": cmd_measure_ranges}[args.command](args)
 
 
 if __name__ == "__main__":

@@ -33,6 +33,10 @@ except ImportError:
 
 KNOWLEDGE_PATH = Path(__file__).parent / "meta_knowledge.json"
 RUNS_PATH = Path(__file__).parent / "runs_log.jsonl"
+# Real tower ranges measured off the in-game range circle (mk.py
+# measure-ranges). When present they override the rough hardcoded ranges, so
+# coverage is reasoned about with true numbers, not guesses.
+MEASURED_RANGES_PATH = Path(__file__).parent / "measured_ranges.json"
 
 # How many episodes' worth of pseudo-evidence the meta prior is worth.
 # After ~PRIOR_STRENGTH real episodes featuring a tower, the bot's own
@@ -419,6 +423,17 @@ class MetaBrain:
         self.evolve = evolve
         self.k = knowledge or _load_json(KNOWLEDGE_PATH)
         self.towers = self.k["towers"]
+        # Measured ranges (mk.py measure-ranges) override the rough defaults so
+        # coverage scoring uses each tower's TRUE range circle, not a guess.
+        if MEASURED_RANGES_PATH.exists():
+            try:
+                measured = json.loads(MEASURED_RANGES_PATH.read_text())
+            except (OSError, ValueError):
+                measured = {}
+            for t, r in (measured or {}).items():
+                if t in self.towers and isinstance(r, (int, float)) \
+                        and 0.005 < r < 0.30:
+                    self.towers[t].setdefault("placement", {})["range"] = r
         self.roles = self.k["roles"]
         # A knowledge file from before the late-game kinds still gets
         # ceramic/ddt/bad answers -- regenerating the file overrides.
