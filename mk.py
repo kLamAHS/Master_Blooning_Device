@@ -2589,7 +2589,7 @@ def random_genome(rng, n_towers, hero=False):
 
 def run_episode(screen, cfg, genome, final_round, abort_lives=50,
                 flow_sensor=None, play_out=False, danger_rounds=None,
-                abilities=False):
+                abilities=False, one_life=False):
     """Play one layout to survival or defeat. Returns (outcome,
     final_round_reached, towers, lives_by_round, cash_by_round,
     spent_by_round).
@@ -2801,7 +2801,14 @@ def run_episode(screen, cfg, genome, final_round, abort_lives=50,
                             screen.grab())
         elif lives is not None:
             zero_streak = 0
-        if (lives == 0 and prev_lives == 0) or zero_streak >= 3:
+        digit_defeat = (lives == 0 and prev_lives == 0) or zero_streak >= 3
+        if digit_defeat and (not one_life or looks_defeated(screen)):
+            # A one-life run cannot afford a false defeat: a burst of lives
+            # MISREADS (the CHIMPS "1" flickering to 0, coin/heart noise)
+            # would otherwise restart a game that is still alive. There the
+            # digit reading must be backed by the DEFEAT screen itself.
+            # Multi-life rungs keep the digit-only exit (a leak to 0 there
+            # is unambiguous and the HUD stays up).
             outcome = "defeat"                # defeat screen (HUD stays!)
             break
         near_final = (play_out and last_round is not None
@@ -2824,8 +2831,15 @@ def run_episode(screen, cfg, genome, final_round, abort_lives=50,
             round_seen_at = time.time()
         buyable_now = any(it.get("round", 0) <= (last_round or 0)
                           for it in queue)
-        if not buyable_now and time.time() - round_seen_at > 60 \
-                and (lives is None or lives < 40):
+        # "Critical lives" for the frozen-round net: on a normal rung, a
+        # low life count during a minute-long stall means we quietly leaked
+        # to death behind a covered HUD. On a ONE-LIFE rung that test is
+        # meaningless -- lives is permanently 1, so `lives < 40` is always
+        # true and any stall (a BAD/ZOMG round, a UI overlay, a drifted
+        # crop) got misread as a defeat and restarted a live game. There,
+        # only an actual leaked-out (lives 0) counts.
+        crit = (lives == 0) if one_life else (lives is None or lives < 40)
+        if not buyable_now and time.time() - round_seen_at > 60 and crit:
             # Round frozen for a minute, nothing buyable at this round,
             # critical lives: that is the defeat screen, whatever the
             # pixels say. (Checked against ELIGIBLE buys, not the raw
@@ -3561,7 +3575,8 @@ def cmd_farm(args):
              spent_by_round) = run_episode(
                 screen, cfg, genome, args.final_round,
                 abort_lives=args.abort_lives, flow_sensor=sensor,
-                danger_rounds=danger, abilities=not args.no_abilities)
+                danger_rounds=danger, abilities=not args.no_abilities,
+                one_life=one_life)
         except KeyboardInterrupt:
             raise
         except Exception:
@@ -3759,7 +3774,7 @@ def cmd_solve(args):
                 screen, cfg, genome, target, abort_lives=abort_lives,
                 flow_sensor=sensor, play_out=True,
                 danger_rounds=danger,
-                abilities=not args.no_abilities)
+                abilities=not args.no_abilities, one_life=one_life)
         except KeyboardInterrupt:
             raise
         except Exception:
@@ -4003,7 +4018,7 @@ def cmd_deploy(args):
                 screen, cfg, genome, target, abort_lives=abort_lives,
                 flow_sensor=sensor, play_out=True,
                 danger_rounds=danger,
-                abilities=not args.no_abilities)
+                abilities=not args.no_abilities, one_life=one_life)
         except KeyboardInterrupt:
             raise
         except Exception:
