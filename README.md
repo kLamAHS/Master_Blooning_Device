@@ -131,6 +131,7 @@ once; after that your daily loop is just steps 6–8.
     python meta.py selftest
     python learner.py selftest
     python campaign.py selftest
+    python tools/test_cash_floor.py                     # cash-misread guard
     python tools/simulate_solve.py --seeds 5 --ablate   # end-to-end sim
     python tools/simulate_solve.py --deploy --seeds 5   # deploy path
     ```
@@ -712,6 +713,20 @@ window hasn't been moved since calibration.
   re-checked visually after ~45 s of blocking a buy — one menu open, and
   a green-row sighting overwrites the bad value (a `$210` recorded as
   `$2105` no longer gates the upgrade forever).
+- **A low cash misread can't freeze the buy plan (`cashguard.py`).** The
+  wallet only ever *rises* except through purchases, and every purchase is
+  reported through one choke point, so `floor = last confirmed read − spent
+  since` is a *provable* lower bound on current cash. A read far below the
+  floor — the classic clipped leading digit, `$2,340` read as `340`, which
+  reads low but perfectly "valid" so no range check catches it — is judged a
+  misread: the bot corroborates it and, if it stays low, spends against the
+  floor instead of hoarding behind a phantom-broke wallet and leaking. The
+  floor is seeded at the start and re-anchored to the true level every round;
+  a correct read always passes through untouched. This is the one piece of
+  the cash pipeline that is pure arithmetic, so it has an offline unit test
+  (`python tools/test_cash_floor.py`). The per-round box re-check also
+  re-derives the whole counter box from the coin/heart HUD landmarks, so
+  drift and right-edge clips are recovered, not just clean leading clips.
 - **Money-failure watermarks are misread-proof.** When a buy fails on
   cash, the bot notes the cash level and holds spending until income
   clears it — but the noted level is capped at the item's known price

@@ -70,6 +70,12 @@ def dbg(msg):
     if DEBUG:
         print(f"      . {msg}")
 
+
+# Provable-lower-bound cash guard (pure stdlib; see cashguard.py). It makes a
+# low cash misread non-fatal: the bot keeps buying up to what it PROVABLY has
+# instead of freezing behind a phantom-broke wallet and leaking the run.
+from cashguard import CashFloor
+
 try:
     import pytesseract
 except ImportError:
@@ -793,6 +799,26 @@ def _read_cash_box(screen, box):
     return value if value <= 150000 else None
 
 
+def _read_cash_box_confirmed(screen, box, max_plausible=None):
+    """Corroborated read from an EXPLICIT box (see read_cash_confirmed for
+    the majority-of-three logic). Lets a candidate box be verified before
+    it is adopted, without swapping it into cfg first."""
+    def ok(v):
+        return v is not None and (max_plausible is None or v <= max_plausible)
+
+    a = _read_cash_box(screen, box)
+    time.sleep(0.15)
+    b = _read_cash_box(screen, box)
+    if a == b:
+        return a if ok(a) else None
+    time.sleep(0.12)
+    c = _read_cash_box(screen, box)
+    for v in (a, b, c):
+        if ok(v) and [a, b, c].count(v) >= 2:
+            return v
+    return None
+
+
 def _repair_clipped_cash_box(screen, box, min_x=0.0):
     """If a saved/refit box starts too far right, it can read the visible
     suffix only ('$850' -> 50). Probe left-expanded versions and adopt one
@@ -815,26 +841,74 @@ def _repair_clipped_cash_box(screen, box, min_x=0.0):
     return best[0] if best else None
 
 
-def recheck_cash_box(screen, cfg):
-    """Mid-run guard against the leading-digit clip that only appears once
-    cash grows past the digit count the box was calibrated for at preflight
-    (on the small STARTING cash the clip isn't visible yet, so the preflight
-    repair can't see it, and nothing else rechecks the box). Re-runs the
-    left-widen repair; it adopts a wider box only when that box reads a
-    strictly larger value containing the current read as a suffix -- the
-    signature of a clip -- so it is a safe no-op whenever nothing is
-    clipped. Cheap enough to call once a round."""
+def recheck_cash_box(screen, cfg, round_hint=None, mode="standard"):
+    """Mid-run guard against a cash box that has started misreading -- the
+    leading-digit clip that only appears once cash grows past the digit count
+    the box was calibrated for (invisible on the small STARTING cash, so the
+    preflight repair can't see it), plus HUD drift, a right-edge clip, or an
+    UNCLEAN clip that the left-widen repair alone can't recover.
+
+    Two passes, cheap first:
+      1. Re-run the left-widen repair -- adopts a wider box only when it reads
+         a strictly larger value containing the current read as a suffix (the
+         clean-clip signature). Safe no-op when nothing is clipped.
+      2. If that finds nothing, re-derive the WHOLE box from a live HUD
+         landmark (the coin, whose fixed offset means the leading digit can
+         never clip; then the heart as fallback). A re-anchored box is
+         adopted only when it is shape-sane, clear of the lives counter, and
+         reads a CORROBORATED value strictly LARGER than the current box
+         (recovering a lost digit, never inventing one) within the round's
+         plausible magnitude. This recovers drift / right-clip / unclean clip
+         the left-widen misses, without risking a spurious box.
+
+    Cheap enough to call once a round."""
     box = cfg.get("cash_box")
     if not box:
         return
     lb = cfg.get("lives_box")
     fence = (lb[0] + lb[2]) if lb else 0.0
+    ceiling = None
+    if round_hint is not None:
+        try:
+            from meta import earned_by
+            ceiling = 2.0 * earned_by(round_hint, mode)   # generous per-round
+        except Exception:                                 # magnitude cap
+            ceiling = None
+
+    def _adopt(cand, why):
+        cfg["cash_box"] = cand
+        save_config_value("cash_box", cand)
+        dbg(f"cash box re-anchored mid-run ({why}): {box} -> {cand}")
+
+    # Pass 1: cheap left-widen -- recovers a clean leading-digit clip.
     repaired = _repair_clipped_cash_box(screen, box, min_x=fence)
     if repaired and repaired != box and _plausible_cash_shape(repaired):
-        cfg["cash_box"] = repaired
-        save_config_value("cash_box", repaired)
-        dbg(f"cash box re-widened mid-run to recover a clipped digit: "
-            f"{box} -> {repaired}")
+        _adopt(repaired, "clipped digit")
+        return
+
+    # Pass 2: landmark re-anchor -- recovers drift / right-clip / unclean clip.
+    cur = _read_cash_box(screen, box)
+    candidates = []
+    coin = _cash_box_from_coin(screen)
+    if coin:
+        snapped = _snap_cash_box_to_digits(screen, coin, min_x=fence)
+        candidates.append(snapped or coin)
+    candidates += _cash_boxes_from_heart(screen)
+    for cand in candidates:
+        if not cand or cand == box:
+            continue
+        if not _plausible_cash_shape(cand) or _overlaps_lives(cand, cfg):
+            continue
+        quick = _read_cash_box(screen, cand)              # cheap pre-filter
+        if quick is None or (ceiling is not None and quick > ceiling):
+            continue
+        if cur is not None and quick <= cur:
+            continue          # not a recovery -- only ever adopt MORE digits
+        val = _read_cash_box_confirmed(screen, cand, ceiling)   # corroborate
+        if val is None or (cur is not None and val <= cur):
+            continue
+        _adopt(cand, "landmark re-anchor")
+        return
 
 
 def _cash_boxes_from_heart(screen):
@@ -1051,21 +1125,7 @@ def read_cash_confirmed(screen, cfg, max_plausible=None):
     model's cap for the round), rejects any read above it: a clipped
     leading digit ('$2,851' -> '851') reads fluently but low while an
     inflated box reads high -- both are dropped rather than trusted."""
-    def ok(v):
-        return v is not None and (max_plausible is None or v <= max_plausible)
-
-    a = read_cash(screen, cfg)
-    time.sleep(0.15)
-    b = read_cash(screen, cfg)
-    if a == b:                       # agree (incl. both None): fast path
-        return a if ok(a) else None
-    # Disagreement: a third read decides by majority.
-    time.sleep(0.12)
-    c = read_cash(screen, cfg)
-    for v in (a, b, c):
-        if ok(v) and [a, b, c].count(v) >= 2:
-            return v
-    return None
+    return _read_cash_box_confirmed(screen, cfg.get("cash_box"), max_plausible)
 
 
 def _overlaps_lives(box, cfg):
@@ -2624,7 +2684,8 @@ def random_genome(rng, n_towers, hero=False):
 
 def run_episode(screen, cfg, genome, final_round, abort_lives=50,
                 flow_sensor=None, play_out=False, danger_rounds=None,
-                abilities=False, one_life=False, freeplay=False):
+                abilities=False, one_life=False, freeplay=False,
+                mode="standard"):
     """Play one layout to survival or defeat. Returns (outcome,
     final_round_reached, towers, lives_by_round, cash_by_round,
     spent_by_round).
@@ -2655,12 +2716,15 @@ def run_episode(screen, cfg, genome, final_round, abort_lives=50,
         f"lives={read_lives(screen, cfg)}")
 
     try:
-        from meta import choose_buy
+        from meta import choose_buy, earned_by
     except ImportError:                       # no brain: old greedy rule
         def choose_buy(q, _round, _cash, _cost, now, emergency=False,
                        gate_ok=None):
             return next((j for j, it in enumerate(q)
                          if it.get("_wake", 0) <= now), None)
+
+        def earned_by(_r, _mode="standard"):  # no income model available
+            return 0
 
     queue = list(genome)
     landed_by_ref, towers = {}, {}
@@ -2669,6 +2733,9 @@ def run_episode(screen, cfg, genome, final_round, abort_lives=50,
     spent_by_round = {}      # for the learned income curve)
     broke_at = [None, 0.0]   # cash watermark: level + time of last set
     emergency_until = [0.0]  # leak emergency: reserves off until this time
+    # Provable lower bound on current cash: it only falls through purchases
+    # (all reported via record_spend), so a read far below it is a misread.
+    cash_floor = CashFloor(income_model=lambda r: earned_by(r, mode))
     prev_round_lives = [None]
     last_ping = [0.0]        # ability-hotkey pinger cooldown
     final_seen = None        # play_out: when the final round was reached
@@ -2678,6 +2745,38 @@ def run_episode(screen, cfg, genome, final_round, abort_lives=50,
         if amount:
             key = str(last_round if last_round is not None else 0)
             spent_by_round[key] = spent_by_round.get(key, 0) + amount
+            cash_floor.spend(amount)      # keep the provable floor valid
+
+    def confirm_floor():
+        """Raise the cash floor from a corroborated read (see CashFloor).
+        Called at episode start (seed) and at each round change / successful
+        buy (re-anchor to the true level so the floor never goes stale-low).
+        A per-round magnitude cap keeps a spurious-high read from INFLATING
+        the floor (which would make the bot try to over-buy); too-tight a cap
+        merely under-raises it, which is the safe direction."""
+        cap = None
+        if last_round is not None:
+            try:
+                cap = 2.0 * earned_by(last_round, mode)
+            except Exception:
+                cap = None
+        cash_floor.confirm(read_cash_confirmed(screen, cfg, max_plausible=cap))
+
+    def sane_cash():
+        """read_cash, but a read implausibly far below what we PROVABLY have
+        is a clipped/misread number, not a real drop -- corroborate it and,
+        if it stays low, substitute the floor so a low misread can never
+        freeze the buy plan and leak the run. A correct read passes through
+        unchanged. (The floor logic itself lives in cashguard.CashFloor.)"""
+        v = read_cash(screen, cfg)
+        out = cash_floor.sane(
+            v, confirm_fn=lambda: read_cash_confirmed(screen, cfg),
+            round_hint=last_round)
+        if v is not None and out is not None and out != v:
+            dbg(f"sane_cash: read ${v} << floor "
+                f"${int(cash_floor.value) if cash_floor.value is not None else out}"
+                f", using ${out}")
+        return out
 
     def set_watermark(price=None):
         """Record the cash level of a money-failure. Being broke for a
@@ -2738,7 +2837,7 @@ def run_episode(screen, cfg, genome, final_round, abort_lives=50,
             item = queue[idx]
             ttype = item["tower"].lower()
             base = PRICES.get(price_key(ttype))
-            cash = read_cash(screen, cfg)
+            cash = sane_cash()
             if base and cash is not None and cash < base:
                 skipped.add(id(item))          # can't afford yet: try others
                 continue
@@ -2765,7 +2864,8 @@ def run_episode(screen, cfg, genome, final_round, abort_lives=50,
             record_spend(PRICES.get(price_key(ttype)) or item.get("est") or 0)
             clear_ui(screen, cfg)
 
-    place_prestart_openers()
+    confirm_floor()                # seed the floor from starting cash before
+    place_prestart_openers()       # any pre-start buy lowers it
     clean = screen.grab() if flow_sensor else None
     press_key("space")
     time.sleep(0.3)
@@ -2807,10 +2907,13 @@ def run_episode(screen, cfg, genome, final_round, abort_lives=50,
                 # Cash grows a digit or two over a run; re-widen the box if
                 # its leading digit has started clipping (the preflight fit
                 # couldn't see a clip that didn't exist yet on starting cash).
-                recheck_cash_box(screen, cfg)
+                recheck_cash_box(screen, cfg, round_hint=last_round, mode=mode)
+                # Re-anchor the floor to the true level each round so it never
+                # goes stale-low as income outgrows the last confirmed read.
+                confirm_floor()
                 if lives is not None:
                     lives_by_round[str(last_round)] = lives
-                cash_now = read_cash(screen, cfg)
+                cash_now = sane_cash()
                 if cash_now is not None:
                     cash_by_round[str(last_round)] = cash_now
                 print(f"   [round {last_round:>3}]  lives={lives}  "
@@ -2946,7 +3049,7 @@ def run_episode(screen, cfg, genome, final_round, abort_lives=50,
                 ent = towers.get(tuple(lnd)) if lnd else None
                 return bool(ent) and max(ent["path"]) >= g["tier"]
 
-            cash_now = read_cash(screen, cfg)
+            cash_now = sane_cash()
             rush = time.time() < emergency_until[0]
             try:
                 idx = choose_buy(queue, last_round, cash_now, _cost_of,
@@ -2966,7 +3069,7 @@ def run_episode(screen, cfg, genome, final_round, abort_lives=50,
             elif item["do"] == "place":
                 ttype = item["tower"].lower()
                 base = PRICES.get(price_key(ttype))
-                cash = read_cash(screen, cfg)
+                cash = sane_cash()
                 if base and cash is not None and cash < base:
                     msg = f"{ttype}: saving up (${cash}/${base})"
                     if item.get("_dbg") != msg:
@@ -3002,6 +3105,7 @@ def run_episode(screen, cfg, genome, final_round, abort_lives=50,
                         broke_at[0] = None
                         record_spend(PRICES.get(price_key(ttype))
                                      or item.get("est") or 0)
+                        confirm_floor()        # re-anchor to true post-buy cash
                     elif st == "broke":
                         est_c = base or item.get("est")
                         lvl = read_cash_confirmed(screen, cfg)
@@ -3069,7 +3173,7 @@ def run_episode(screen, cfg, genome, final_round, abort_lives=50,
                         dbg(f"{tname} path{pi + 1}: closed, skip")
                         queue.pop(idx)         # path closed on this tower
                     elif (known := PRICES.get(price_key(ttype, pi, tier))) \
-                            and (cash := read_cash(screen, cfg)) is not None \
+                            and (cash := sane_cash()) is not None \
                             and cash < known:
                         # Known price, can't afford: no menu, just sleep
                         # this item and let income build.
@@ -3102,6 +3206,7 @@ def run_episode(screen, cfg, genome, final_round, abort_lives=50,
                                 record_spend(
                                     PRICES.get(price_key(ttype, pi, tier))
                                     or item.get("est") or 0)
+                                confirm_floor()
                             elif st in ("locked", "closed"):
                                 queue.pop(idx)
                             else:
@@ -3113,7 +3218,7 @@ def run_episode(screen, cfg, genome, final_round, abort_lives=50,
                         else:
                             item["_wake"] = time.time() + 3
                     elif broke_at[0] is not None \
-                            and (cash := read_cash(screen, cfg)) is not None \
+                            and (cash := sane_cash()) is not None \
                             and watermark_holds(cash):
                         msg = (f"{tname} path{pi + 1}: watermark hold "
                                f"(${cash} <= ${broke_at[0]}+100)")
@@ -3132,6 +3237,7 @@ def run_episode(screen, cfg, genome, final_round, abort_lives=50,
                             record_spend(
                                 PRICES.get(price_key(ttype, pi, tier))
                                 or item.get("est") or 0)
+                            confirm_floor()
                         elif st in ("locked", "closed"):
                             queue.pop(idx)     # recorded; done with it
                         elif st == "broke":
@@ -3619,7 +3725,7 @@ def cmd_farm(args):
                 screen, cfg, genome, args.final_round,
                 abort_lives=args.abort_lives, flow_sensor=sensor,
                 danger_rounds=danger, abilities=not args.no_abilities,
-                one_life=one_life)
+                one_life=one_life, mode=game_mode)
         except KeyboardInterrupt:
             raise
         except Exception:
@@ -3835,7 +3941,7 @@ def cmd_solve(args):
                 flow_sensor=sensor, play_out=True,
                 danger_rounds=danger,
                 abilities=not args.no_abilities, one_life=one_life,
-                freeplay=getattr(args, "freeplay", False))
+                freeplay=getattr(args, "freeplay", False), mode=game_mode)
         except KeyboardInterrupt:
             raise
         except Exception:
@@ -4080,7 +4186,7 @@ def cmd_deploy(args):
                 flow_sensor=sensor, play_out=True,
                 danger_rounds=danger,
                 abilities=not args.no_abilities, one_life=one_life,
-                freeplay=getattr(args, "freeplay", False))
+                freeplay=getattr(args, "freeplay", False), mode=game_mode)
         except KeyboardInterrupt:
             raise
         except Exception:
