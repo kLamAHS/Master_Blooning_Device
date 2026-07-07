@@ -718,14 +718,25 @@ def _plausible_cash_shape(box):
     widens its search window from the SAVED box, so one rogue tall
     'character' compounds session over session (0.055 -> 0.0845 ->
     0.1676 -> 0.3249 in the field) unless implausible shapes are
-    refused both when produced and when loaded."""
+    refused both when produced and when loaded.
+
+    The width cap is deliberately GENEROUS (0.22): a legit 6-digit run
+    on a wide HUD measures ~0.148 (field: [0.2029, 0.0416, 0.1479,
+    0.0651]), and a runaway 'junk $1' box measured ~0.151 -- the two are
+    a hair apart, so width CANNOT discriminate good from broken. A cap
+    tuned tight enough to reject the junk box (e.g. 0.13) also rejects
+    the real counter, which blinds the economy for the whole run. So we
+    only reject GROSSLY oversized boxes here (the 0.32 runaway tail) and
+    let the stuck-detector (cash_floor.stuck() -> recalibrate) catch a
+    box that is plausibly shaped but reads garbage."""
     if not box:
         return False
     x, y, w, h = box
     return (0.015 <= h <= 0.10          # digit strip, not a map chunk
-            and w <= 0.13               # a 6-digit cash run is ~0.11 wide;
-            #                             wider is the snap's runaway growth
-            #                             (0.15 boxes read a constant junk $1)
+            and w <= 0.22               # a 6-digit run is ~0.11-0.15 wide;
+            #                             only reject the gross runaway tail
+            #                             (0.32+); the stuck-detector, not
+            #                             width, catches a garbage-reading box
             and 1.0 <= w / h <= 12.0    # wide strip (fractions, so a
             and y + h <= 0.16)          # 2-digit run is ~1.15) / top HUD
 
