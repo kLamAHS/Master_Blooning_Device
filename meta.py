@@ -934,11 +934,23 @@ class MetaBrain:
             if len(clustered) >= 3:
                 cands = clustered
         roomy_near = None
-        if anchor and len(cands) > 2:
+        one_life_anchor = anchor and not cluster and self._one_life()
+        if anchor and len(cands) > 2 and not one_life_anchor:
             # Exposure floor: keep only the top ~40% by track coverage, so an
             # anchor (hero/opener/carry) always sees a lot of track.
             ranked = sorted(cands, key=lambda c: -track.exposure(c, r))
             cands = ranked[:max(2, int(len(ranked) * 0.4))]
+        elif one_life_anchor and len(cands) > 4:
+            # A one-life survival anchor (opener/hero) must not be HARD-gated
+            # to the max-coverage spot, because on this map those sit in the
+            # back half of the track -- placed there the opener has almost no
+            # lane left to catch a leak and one bloon ends the run (measured:
+            # 54% of openers landed past 0.6, a quarter near the exit). Keep a
+            # generous on-track pool (top ~70% by coverage) and let the strong
+            # kill-early bias below choose an EARLY spot among them, so the
+            # whole track works for the tower that has to hold the single life.
+            ranked = sorted(cands, key=lambda c: -track.exposure(c, r))
+            cands = ranked[:max(4, int(len(ranked) * 0.7))]
         if cluster:
             # ONLY the carry gets nudged toward a spot a support tower can
             # cluster on -- a roomy, village-placeable spot within buff range.
@@ -1037,6 +1049,14 @@ class MetaBrain:
                         # the entry leaves room for error; a defense
                         # camped at the exit pops with zero margin.
                         s *= 1.25 - 0.50 * sp[1]
+                        # A one-life survival anchor (opener/hero) is far
+                        # more exit-sensitive: placed near the end it has no
+                        # lane left to catch a leak, so ONE bloon ends the
+                        # run. Bias it HARD toward the entry half so the
+                        # whole track works for it and a marginal early
+                        # defense still holds round 6.
+                        if one_life_anchor:
+                            s *= max(0.12, 1.0 - 1.3 * sp[1])
                 # A FREE damage tower should CLUSTER with the carry, not go
                 # solo to its own best lane spot: one village + alchemist can
                 # only buff towers inside its range, so a tight buffed group
@@ -1400,7 +1420,16 @@ class MetaBrain:
                     # only slow), never the pricey ones ($500 ninja) that eat
                     # the whole $650 and leave no room to upgrade or add a
                     # second tower.
-                    cap = 0.6 * self.income(self.start_round)
+                    #
+                    # Budget off cash IN HAND pre-wave -- income(start_round-1),
+                    # ~$650 -- NOT income(start_round) which counts round-6 pops
+                    # you have not made yet ($813) and inflates the cap to $488,
+                    # letting in wizard/druid/engineer. Those have a pricey base
+                    # AND $325 second tiers, so they strand at 0-0-1 and leak the
+                    # one life. At the real $390 cap only dart/tack/boomerang
+                    # qualify -- cheap group-clearers whose first two tiers both
+                    # fit the opening wallet (a real 0-0-2 by round 6).
+                    cap = 0.6 * self.income(max(1, self.start_round - 1))
 
                     def _oc(t, _p=price_of):
                         return (_p(t) if _p else None) or ROUGH_COST.get(t, 600)
