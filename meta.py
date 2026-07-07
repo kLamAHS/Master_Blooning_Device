@@ -304,6 +304,11 @@ def _buddy_linked(at, ttype, layout, k):
 # minute of retries discovering the game wouldn't allow it.
 SEP = 0.028
 SEP_LARGE = 0.045
+# How close a free DPS tower should sit to the carry to share support buffs.
+# ~an alchemist's range (measured 0.115): towers inside it get the village
+# and alch buffs, so the free damage clusters here instead of scattering to
+# its own lane spot and going unbuffed.
+BUFF_CLUSTER_R = 0.115
 
 
 def _spread(cands, taken, sep, pull=None):
@@ -716,10 +721,19 @@ class MetaBrain:
         rung has fewer than three of its own, near-winning layouts from
         the map's other rungs seed the pool (discounted -- they beat an
         easier game)."""
-        rows = [(self._reward(r), i, r) for i, r in enumerate(self.history)
-                if self.usable(r)]
-        rows.sort(key=lambda x: (-x[0], -x[1]))   # best first, recent first
-        out = [(rw, r) for rw, _, r in rows[:top]]
+        def _cov(r):
+            # How many of this rung's threats the layout already answers.
+            # A tiebreaker AFTER reward: among layouts that reached the same
+            # round, the one that already covers camo/lead/MOAB/... is the
+            # better champion -- it needs less coverage-repair when replayed,
+            # and it's what the report should surface as "best".
+            g = self.coverage_gaps(r.get("towers", []))
+            return sum(1 for x in g.values() if x["covered"])
+        rows = [(self._reward(r), _cov(r), i, r)
+                for i, r in enumerate(self.history) if self.usable(r)]
+        # best reward first, then most-covered, then most recent
+        rows.sort(key=lambda x: (-x[0], -x[1], -x[2]))
+        out = [(rw, r) for rw, _cov_n, _, r in rows[:top]]
         if len(out) < 3 and self.seed_rows:
             out += [(rw * 0.8, r) for rw, r in
                     self.seed_rows[:top - len(out)]]
@@ -880,6 +894,16 @@ class MetaBrain:
             if nearby:
                 cands = [rng.choice(nearby)
                          for _ in range(min(30, len(nearby)))] + cands[:20]
+        elif style == "coverage" and not anchor and carry_spot is not None:
+            # A free DPS tower clusters with the carry (shared support buffs),
+            # so guarantee the sample includes spots inside the buff disc -- a
+            # raw draw of 70 easily misses that small region and the tower
+            # then scatters to its own lane, unbuffed (the field complaint).
+            in_buff = [p for p in base
+                       if _dist(p, carry_spot) <= BUFF_CLUSTER_R]
+            if in_buff:
+                cands = [rng.choice(in_buff)
+                         for _ in range(min(40, len(in_buff)))] + cands[:30]
         cands = _spread(cands, taken, SEP_LARGE if large else SEP,
                         pull=carry_spot if style == "buddy" else None)
         # Keep towers that shoot bloons ON the track: drop candidates that
@@ -895,6 +919,20 @@ class MetaBrain:
             on_track = [c for c in cands if track.exposure(c, r) >= 0.005]
             if len(on_track) >= 2:
                 cands = on_track
+        if style == "coverage" and not anchor and carry_spot is not None \
+                and len(cands) > 3:
+            # Cluster FLOOR (not just the +50% nudge below, which exposure
+            # differences drown out): when enough on-track spots sit inside
+            # the carry's buff disc, RESTRICT the free DPS to them, then the
+            # scorer picks the best-coverage spot AMONG the cluster. This is
+            # what actually keeps damage tight enough for one village + alch
+            # to buff it all; it falls back to open scoring only if the disc
+            # has too few track spots (so it never lands off the track).
+            clustered = [c for c in cands
+                         if _dist(c, carry_spot) <= BUFF_CLUSTER_R
+                         and track.exposure(c, r) >= 0.005]
+            if len(clustered) >= 3:
+                cands = clustered
         roomy_near = None
         if anchor and len(cands) > 2:
             # Exposure floor: keep only the top ~40% by track coverage, so an
@@ -999,6 +1037,18 @@ class MetaBrain:
                         # the entry leaves room for error; a defense
                         # camped at the exit pops with zero margin.
                         s *= 1.25 - 0.50 * sp[1]
+                # A FREE damage tower should CLUSTER with the carry, not go
+                # solo to its own best lane spot: one village + alchemist can
+                # only buff towers inside its range, so a tight buffed group
+                # out-damages the same towers scattered and unbuffed. Reward
+                # proximity to the carry within a support tower's reach.
+                # Exposure stays the base term, so a clustered spot must still
+                # see the track (the on-track floor already dropped dead ones)
+                # -- this decides WHICH good spot, pulling it into buff range.
+                if not anchor and carry_spot is not None:
+                    d = _dist(c, carry_spot)
+                    if d <= BUFF_CLUSTER_R:
+                        s *= 1.0 + 0.5 * (1.0 - d / BUFF_CLUSTER_R)
             # Learned-region posterior nudges the score. For most towers it
             # only swings +/-20% via a Thompson draw (a wider swing once
             # drowned out short-range towers' small exposure differences). The
