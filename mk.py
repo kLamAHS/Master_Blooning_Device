@@ -769,6 +769,39 @@ def _snap_cash_box_to_digits(screen, box, min_x=0.0):
     return snapped if _plausible_cash_shape(snapped) else None
 
 
+def _read_cash_box(screen, box):
+    """Read cash from an explicit box without mutating cfg."""
+    if not box:
+        return None
+    crop = screen.grab(box)
+    value = _read_number_image(crop)
+    if value is None:
+        return None
+    return value if value <= 150000 else None
+
+
+def _repair_clipped_cash_box(screen, box, min_x=0.0):
+    """If a saved/refit box starts too far right, it can read the visible
+    suffix only ('$850' -> 50). Probe left-expanded versions and adopt one
+    only when it cleanly contains the current reading as a suffix."""
+    base = _read_cash_box(screen, box)
+    x, y, w, h = box
+    left_fence = min(max(min_x, 0.14), x)
+    best = None
+    for grow in (0.7, 1.0, 1.4, 1.8, 2.3):
+        nx = max(left_fence, x - grow * h)
+        cand = [round(nx, 4), y, round(w + (x - nx), 4), h]
+        if cand == box or not _plausible_cash_shape(cand):
+            continue
+        value = _read_cash_box(screen, cand)
+        if value is None:
+            continue
+        if base is None or (value > base and str(value).endswith(str(base))):
+            if best is None or value > best[1]:
+                best = (cand, value)
+    return best[0] if best else None
+
+
 def _cash_boxes_from_heart(screen):
     """Fallback anchor: the heart locator is rock-solid, and the coin sits
     at a fixed offset to its right, so cash can be derived even when the
@@ -964,46 +997,24 @@ def _read_number_image(crop):
 def read_cash(screen, cfg):
     """Current cash as an int, or None. Primary reader: exact-font
     template matching (see _read_number_image) -- reads are exact or
-    None. Tesseract remains only as a fallback, with '$'-anchored
-    parsing. Implausibly huge readings return None."""
+    None. Do not fall back to OCR for money values: a wrong cash read is
+    worse than no read because it can poison timing, watermarks, and the
+    learned price book. Implausibly huge readings return None."""
     box = cfg.get("cash_box")
-    if not box:
-        return None
-    crop = screen.grab(box)
-    value = _read_number_image(crop)
-    if value is None and pytesseract is not None:
-        processed = preprocess_round_crop(crop)
-        text = pytesseract.image_to_string(
-            processed,
-            config="--psm 7 -c tessedit_char_whitelist=0123456789$,"
-        ).strip()
-        if "$" in text:
-            text = text.rsplit("$", 1)[1]
-        digits = re.sub(r"\D", "", text)
-        value = int(digits) if digits else None
-    if value is None:
-        return None
-    return value if value <= 150000 else None
+    return _read_cash_box(screen, box)
 
 
 def read_cash_confirmed(screen, cfg):
-    """Two reads that must corroborate: equal -> that value; one a clean
-    AFFIX of the other -> the shorter. A junk glyph can attach at either
-    end of the digit run ('851' inside '6851' = prepended, '600' inside
-    '6005' = appended), and both signatures poison watermarks the same
-    way, so both resolve to the shorter read. Else None. Used where a
-    single bad read does lasting damage (watermarks, price recording)."""
+    """Two reads that must corroborate. Equal reads confirm the value;
+    affix pairs like 950/50 or 600/6005 are contradictions, not
+    confirmation. Return None unless both reads agree exactly. Used where
+    a single bad read does lasting damage (watermarks, price recording)."""
     a = read_cash(screen, cfg)
     time.sleep(0.15)
     b = read_cash(screen, cfg)
     if a is None or b is None:
         return a if a == b else None
     if a == b:
-        return a
-    sa, sb = str(a), str(b)
-    if sa.endswith(sb) or sa.startswith(sb):
-        return b
-    if sb.endswith(sa) or sb.startswith(sa):
         return a
     return None
 
@@ -1039,13 +1050,21 @@ def preflight_cash_box(screen, cfg, recalibrate=False):
     if not recalibrate and original and read_cash(screen, cfg) is not None:
         # The box reads -- but a box that clips the leading digit ALSO
         # reads ('$2,851' -> 851) and would stay wrong forever. Always try
-        # the digit snap; adopt it when it reads and differs.
+        # a left-widen repair first, then the digit snap.
         lb = cfg.get("lives_box")
         fence = (lb[0] + lb[2]) if lb else 0.0
+        repaired = _repair_clipped_cash_box(screen, original, min_x=fence)
+        if repaired and repaired != original:
+            cfg["cash_box"] = repaired
+            save_config_value("cash_box", repaired)
+            dbg(f"cash box widened left to recover clipped digits: "
+                f"{repaired}")
+            return True
+        original_value = read_cash(screen, cfg)
         snapped = _snap_cash_box_to_digits(screen, original, min_x=fence)
         if snapped and snapped != original:
             cfg["cash_box"] = snapped
-            if read_cash(screen, cfg) is not None:
+            if read_cash(screen, cfg) == original_value:
                 save_config_value("cash_box", snapped)
                 dbg(f"cash box re-fitted to the digit run: {snapped}")
                 return True
@@ -1074,10 +1093,19 @@ def preflight_cash_box(screen, cfg, recalibrate=False):
         if ok:
             lb = cfg.get("lives_box")
             fence = (lb[0] + lb[2]) if lb else 0.0
+            repaired = _repair_clipped_cash_box(screen, box, min_x=fence)
+            if repaired:
+                cfg["cash_box"] = repaired
+                if read_cash(screen, cfg) is not None:
+                    box = repaired
+                    how += " + left widen"
+                else:
+                    cfg["cash_box"] = box
+            box_value = read_cash(screen, cfg)
             snapped = _snap_cash_box_to_digits(screen, box, min_x=fence)
             if snapped:
                 cfg["cash_box"] = snapped
-                if read_cash(screen, cfg) is not None:
+                if read_cash(screen, cfg) == box_value:
                     box = snapped
                     how += " + digit snap"
                 else:
@@ -1099,6 +1127,7 @@ def preflight_cash_box(screen, cfg, recalibrate=False):
         dbg(f"cash: {len(candidates)} candidate boxes all failed to read "
             f"-- crops dumped to debug/cash_cand*.png")
     return read_cash(screen, cfg) is not None
+
 
 
 def wait_for_cash(screen, cfg, amount, timeout=120):
@@ -1258,7 +1287,7 @@ def clear_ui(screen, cfg):
     return False
 
 
-# ---------------------------------------------------------------------------
+## ---------------------------------------------------------------------------
 # Upgrade-panel vision: read prices, XP locks, and closed paths by LOOKING,
 # never by pressing. Geometry measured from the user's screenshots
 # (normalized to the game client, so it scales with resolution).
@@ -1400,6 +1429,88 @@ def _classify_price_text(text):
     return "none", None
 
 
+
+
+def expected_panel_side_for_tower(at):
+    """BTD6 opens the upgrade panel on the side opposite the selected
+    tower so the panel does not cover the tower. Towers left of the
+    screen midpoint open the panel on the right; towers right of the
+    midpoint open it on the left. This is only a prediction -- the bot
+    still verifies the actual side by looking for the panel wood."""
+    try:
+        x = float(at[0])
+    except Exception:
+        return None
+    return "right" if x < 0.5 else "left"
+
+
+def _detect_panel_side(screen, preferred=None):
+    """Detect which upgrade panel is visible. When a tower-position
+    prediction is available, check that side first so a small stale piece
+    of the old panel on the other side does not win a tie."""
+    order = []
+    if preferred in ("left", "right"):
+        order.append(preferred)
+    order.extend(side for side in ("left", "right") if side not in order)
+    x_of = {"left": PANEL_GEOM["title_band"]["left"][:1]
+            + [PANEL_GEOM["title_band"]["left"][2]],
+            "right": PANEL_GEOM["title_band"]["right"][:1]
+            + [PANEL_GEOM["title_band"]["right"][2]]}
+    best = None
+    for side in order:
+        sx, sw = x_of[side]
+        hits = 0
+        score = 0.0
+        for sy, sh in PANEL_GEOM["brown_strips"]:
+            frac = _brown_fraction(screen.grab([sx, sy, sw, sh]))
+            score += frac
+            if frac >= 0.35:
+                hits += 1
+        if hits >= 2:
+            if side == preferred:
+                return side
+            if best is None or (hits, score) > best[0]:
+                best = ((hits, score), side)
+    return best[1] if best else None
+
+
+def _read_upgrade_price_box(screen, box):
+    """Read an upgrade price from an explicit normalized box. Like cash,
+    upgrade prices are exact-or-unknown: Tesseract is not trusted. If the
+    visible box reads a suffix such as 50, probe a little farther left and
+    only adopt a larger value when it cleanly ends with that suffix, e.g.
+    850 -> 50. This prevents clipped prices from entering prices.json."""
+    if not box:
+        return None
+    base = _read_number_image(screen.grab(box))
+    x, y, w, h = box
+    best = None
+    for grow in (0.0, 0.35, 0.60, 0.90, 1.20):
+        nx = max(0.0, x - grow * h)
+        cand = [nx, y, w + (x - nx), h]
+        val = _read_number_image(screen.grab(cand))
+        if val is None:
+            continue
+        if base is not None and val != base:
+            if not (val > base and str(val).endswith(str(base))):
+                # Conflicting reads from nearby crops mean the row is not
+                # trustworthy enough to save or press from.
+                continue
+        if best is None or val > best:
+            best = val
+    return best
+
+
+def _panel_pixel_box_to_norm(parent_box, px_box, parent_shape):
+    """Convert a pixel box inside a grabbed parent crop back into a
+    normalized screen box."""
+    px, py, pw, ph = px_box
+    ih, iw = parent_shape[:2]
+    return [round(parent_box[0] + px / iw * parent_box[2], 4),
+            round(parent_box[1] + py / ih * parent_box[3], 4),
+            round(pw / iw * parent_box[2], 4),
+            round(ph / ih * parent_box[3], 4)]
+
 def _vivid_nongreen_fraction(img):
     """Fraction of saturated, bright, NOT-green pixels. Every tower
     portrait background is a solid vivid color (blue, purple, ...) while
@@ -1412,27 +1523,18 @@ def _vivid_nongreen_fraction(img):
     return float((vivid & ~green).mean())
 
 
-def detect_panel_side(screen):
+def detect_panel_side(screen, preferred=None):
     """Which side is an upgrade panel open on, if any? Portrait COLOR is
     useless: backgrounds are category-themed and Military's is GREEN --
     on a grass map, a sniper's panel was literally camouflaged from the
     old detector. Instead, triangulate the panel's WOOD: brown must show
     at 2 of 3 fixed heights (title band, under-portrait gap, sell bar).
     Grass/path/bloons can't fake brown; the HUD's gold coin covers far
-    too little of one strip to matter."""
-    x_of = {"left": PANEL_GEOM["title_band"]["left"][:1]
-            + [PANEL_GEOM["title_band"]["left"][2]],
-            "right": PANEL_GEOM["title_band"]["right"][:1]
-            + [PANEL_GEOM["title_band"]["right"][2]]}
-    for side in ("left", "right"):
-        sx, sw = x_of[side]
-        hits = 0
-        for sy, sh in PANEL_GEOM["brown_strips"]:
-            if _brown_fraction(screen.grab([sx, sy, sw, sh])) >= 0.35:
-                hits += 1
-        if hits >= 2:
-            return side
-    return None
+    too little of one strip to matter.
+
+    preferred may be the side predicted from tower position; it is checked
+    first but the result is still vision-verified."""
+    return _detect_panel_side(screen, preferred=preferred)
 
 
 
@@ -1477,8 +1579,11 @@ def scan_panel_rows(screen, side):
             if _white_fraction(upper) > 0.22:
                 result[k] = ("xp", None)
                 continue
-            strip = band[y + int(0.52 * h):y + int(0.97 * h), x:x + w]
-            price = _read_number_image(strip)
+            py = y + int(0.52 * h)
+            ph = max(1, int(0.45 * h))
+            price_box = _panel_pixel_box_to_norm(
+                band_box, (x, py, w, ph), band.shape)
+            price = _read_upgrade_price_box(screen, price_box)
             result[k] = ("cash", price) if price else ("unread", None)
             continue
         # RED price check, self-aligning: a fixed core slice decapitated
@@ -1510,6 +1615,9 @@ def scan_panel_rows(screen, side):
                 keep = {i for _, i in best}
                 iso = np.zeros_like(band)
                 iso[np.isin(lab, list(keep))] = 255
+                # Red shortfall prices are isolated by color. They are never
+                # used to press an upgrade, but they can be saved as a price
+                # hint, so keep them on the exact-font reader as well.
                 result[k] = ("short", _read_number_image(iso))
     return result
 
@@ -1526,13 +1634,14 @@ def read_upgrade_row(screen, side, row_i):
     button = screen.grab([bx, ry, bw, rh])
     green = _green_fraction(button)
     ty, th = PANEL_GEOM["text_strip"]
-    crop = screen.grab([bx, ry + ty * rh, bw, th * rh])
+    price_box = [bx, ry + ty * rh, bw, th * rh]
+    crop = screen.grab(price_box)
 
     if green >= 0.10:
         upper = button[:max(1, int(button.shape[0] * 0.55))]
         if _white_fraction(upper) > 0.22:
             return "xp", None            # the big white unlock arrow
-        price = _read_number_image(crop)
+        price = _read_upgrade_price_box(screen, price_box)
         if price:
             return "cash", price
 
@@ -1727,12 +1836,16 @@ def act_upgrade(screen, cfg, action, tower=None, timeout=8):
     # Selection success = a panel APPEARED (either side). The old check --
     # "did the round counter hide?" -- only worked for right-side panels;
     # left panels leave the counter visible and were invisible to it.
+    expected_side = expected_panel_side_for_tower(action.get("at"))
     side = None
     for _ in range(3):
         click_norm(screen, action["at"])
         time.sleep(cfg["action_delay"])
-        side = detect_panel_side(screen)
+        side = detect_panel_side(screen, preferred=expected_side)
         if side:
+            if expected_side and side != expected_side:
+                dbg(f"panel opened on {side}; expected {expected_side} "
+                    f"from tower x={action['at'][0]:.3f}")
             break
     if not side:
         dbg(f"select failed at {action['at']} (no panel appeared)")
@@ -1775,6 +1888,15 @@ def act_upgrade(screen, cfg, action, tower=None, timeout=8):
     else:
         rows = [None, None, None]     # lazy: read only the row being bought
 
+    def broke_status(have=None, need=None):
+        if have is not None and need is not None:
+            return f"broke (${have}/${need})"
+        if need is not None:
+            return f"broke (cash unreadable/${need})"
+        if have is not None:
+            return f"broke (${have}/?)"
+        return "broke"
+
     status = "bought"
     for i, count in enumerate(action["path"]):
         for _ in range(count):
@@ -1807,7 +1929,7 @@ def act_upgrade(screen, cfg, action, tower=None, timeout=8):
                 if state == "short":
                     # Greyed button + red price: a real upgrade we can't
                     # afford yet. Price is booked; the caller saves up.
-                    status = "broke"
+                    status = broke_status(read_cash(screen, cfg), seen_price)
                     break
                 if state == "closed":
                     if tower:
@@ -1822,7 +1944,7 @@ def act_upgrade(screen, cfg, action, tower=None, timeout=8):
             known = PRICES.get(pkey) if pkey else None
             cash = read_cash(screen, cfg)
             if known is not None and cash is not None and cash < known:
-                status = "broke"               # caller waits, menu closed
+                status = broke_status(cash, known)  # caller waits, menu closed
                 break
             press_key(UPGRADE_KEYS[i])
             time.sleep(0.5)
@@ -1865,7 +1987,8 @@ def act_upgrade(screen, cfg, action, tower=None, timeout=8):
                     # NOT an XP lock; marking it locked would be poison.
                     dbg(f"press didn't take on a cash row (path {i + 1}) "
                         f"-- treating as broke")
-                    status = "broke"
+                    status = broke_status(after if after is not None else cash,
+                                           info[1] if info else known)
                     break
                 # No visual info and an affordable press moved nothing:
                 # the safety net -- treat as locked and stop pressing.
@@ -2409,10 +2532,10 @@ def run_episode(screen, cfg, genome, final_round, abort_lives=50,
     """Play one layout to survival or defeat. Returns (outcome,
     final_round_reached, towers, lives_by_round, cash_by_round,
     spent_by_round).
-    flow_sensor, when given, is called once with the pre-start clean
-    frame right after the round starts -- its window to watch where the
-    first bloons appear (nothing has been bought yet, so leaking a few
-    seconds of round 1 costs nothing).
+    flow_sensor, when given, is called once with a pre-start frame right
+    after the round starts -- its window to watch where the first bloons
+    appear. Opening towers due on the starting round are placed before
+    Space is pressed, so the run does not leak while waiting for OCR.
     play_out: don't declare survival at the START of the final round --
     play THROUGH it and only call it survived once the victory screen
     covers the HUD (or the final round has sat finished for minutes).
@@ -2443,12 +2566,6 @@ def run_episode(screen, cfg, genome, final_round, abort_lives=50,
             return next((j for j, it in enumerate(q)
                          if it.get("_wake", 0) <= now), None)
 
-    clean = screen.grab() if flow_sensor else None
-    press_key("space")
-    time.sleep(0.3)
-    press_key("space")                        # fast-forward
-    if flow_sensor:
-        flow_sensor(clean)
     queue = list(genome)
     landed_by_ref, towers = {}, {}
     lives_by_round = {}
@@ -2459,6 +2576,7 @@ def run_episode(screen, cfg, genome, final_round, abort_lives=50,
     prev_round_lives = [None]
     last_ping = [0.0]        # ability-hotkey pinger cooldown
     final_seen = None        # play_out: when the final round was reached
+    last_round = prev_read = None
 
     def record_spend(amount):
         if amount:
@@ -2500,8 +2618,55 @@ def run_episode(screen, cfg, genome, final_round, abort_lives=50,
             pool, key=lambda q: -min((q[0] - p[0]) ** 2 + (q[1] - p[1]) ** 2
                                      for p in spots))[:3]
     place_i = 0
+
+    def place_prestart_openers():
+        """Put down any due opening towers before pressing start. The old
+        flow started the round first, then waited for OCR to say which round
+        we were on before buying; on hard/CHIMPS that can leak before the
+        hero/carry is even placed."""
+        nonlocal place_i
+        start_round = read_round_stable(screen, cfg, tries=3) or 1
+        while True:
+            idx = next((j for j, it in enumerate(queue)
+                        if it.get("do") == "place"
+                        and it.get("round", 0) <= start_round), None)
+            if idx is None:
+                break
+            item = queue[idx]
+            ttype = item["tower"].lower()
+            base = PRICES.get(price_key(ttype))
+            cash = read_cash(screen, cfg)
+            if base and cash is not None and cash < base:
+                break
+            st, landed = act_place(
+                screen, cfg,
+                {**item, "timeout": 10,
+                 "avoid": [t["at"] for t in towers.values()]})
+            if landed is None:
+                if st == "no_spot":
+                    print(f"   pre-start {ttype}: no placeable spot near "
+                          f"{item['at']} -- skipping")
+                    landed_by_ref[item.get("ref", place_i)] = None
+                    queue.pop(idx)
+                break
+            landed_by_ref[item.get("ref", place_i)] = landed
+            towers[tuple(landed)] = {"tower": item["tower"], "at": landed,
+                                     "path": [0, 0, 0],
+                                     **({"name": item["name"]}
+                                        if item.get("name") else {})}
+            place_i += 1
+            queue.pop(idx)
+            record_spend(PRICES.get(price_key(ttype)) or item.get("est") or 0)
+            clear_ui(screen, cfg)
+
+    place_prestart_openers()
+    clean = screen.grab() if flow_sensor else None
+    press_key("space")
+    time.sleep(0.3)
+    press_key("space")                        # fast-forward
+    if flow_sensor:
+        flow_sensor(clean)
     attempts = 0
-    last_round = prev_read = None
     lives = prev_lives = None
     zero_streak = 0
     dumped_defeat_check = False
@@ -2966,7 +3131,6 @@ def run_episode(screen, cfg, genome, final_round, abort_lives=50,
              for t in towers.values()]
     return (outcome, last_round, clean, lives_by_round,
             cash_by_round, spent_by_round)
-
 
 def _wait_until(cond, timeout, poll=0.3):
     """Poll cond() until it's truthy or timeout seconds pass."""
