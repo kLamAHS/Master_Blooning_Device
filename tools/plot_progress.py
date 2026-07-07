@@ -71,7 +71,7 @@ def load_runs(path):
     killed mid-write) or a stray blank line must never lose the whole history."""
     rows = []
     try:
-        text = Path(path).read_text()
+        text = Path(path).read_text(encoding="utf-8")
     except (OSError, ValueError):
         return rows
     for line in text.splitlines():
@@ -89,7 +89,7 @@ def load_runs(path):
 
 def load_progress(path):
     try:
-        data = json.loads(Path(path).read_text())
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return {}
     rungs = data.get("rungs")
@@ -319,7 +319,9 @@ def main(argv=None):
     progress = load_progress(args.progress)
     payload = build_payload(runs, progress)
     html = render_html(payload)
-    Path(args.out).write_text(html)
+    # UTF-8 always: the dashboard uses ✓ / ✕ / — / · etc., which Windows'
+    # default cp1252 codec can't encode (it crashed write_text there).
+    Path(args.out).write_text(html, encoding="utf-8")
     n = payload["totalEpisodes"]
     where = Path(args.out).resolve()
     if not runs:
