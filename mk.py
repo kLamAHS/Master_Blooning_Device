@@ -3319,6 +3319,105 @@ def run_episode(screen, cfg, genome, final_round, abort_lives=50,
                 ent = towers.get(tuple(lnd)) if lnd else None
                 return bool(ent) and max(ent["path"]) >= g["tier"]
 
+            def do_batched_upgrade(item, entry, landed, pi, tier,
+                                   ttype, tname):
+                """Buy every DUE tier for THIS tower in ONE panel session:
+                open once, buy the whole affordable run, close once --
+                instead of open/buy/close per queued tier (act_upgrade
+                already buys a multi-count path vector in one panel; the
+                queue just split every tier into its own item). A reservation
+                for the priciest OTHER due buy keeps a tower's cheap tiers
+                from starving the carry we are saving toward, so this never
+                spends money choose_buy would not have released this round;
+                worst case it degrades to the single selected tier (no
+                regression). Returns how many tiers were bought."""
+                now = time.time()
+                reserve = max(
+                    [_cost_of(it) or 0 for it in queue
+                     if it.get("ref") != item["ref"]
+                     and it.get("round", 0) <= (last_round or 0)],
+                    default=0)
+                cashb = sane_cash()
+                budget = None if cashb is None else max(0, cashb - reserve)
+                proj = list(entry["path"])
+                vec = [0, 0, 0]
+                members = []                       # (queue_item, path_i)
+                spent_known = 0
+                ordered = [item] + [
+                    it for it in queue
+                    if it is not item and it.get("ref") == item["ref"]
+                    and it.get("do") == "upgrade"]
+                for it in ordered:
+                    p = it["path"].index(1) if 1 in it["path"] else 0
+                    t = proj[p] + 1
+                    if is_locked(ttype, p, t) \
+                            or p in entry.get("closed_paths", []):
+                        continue
+                    if it is not item and it.get("_wake", 0) > now:
+                        continue
+                    price = PRICES.get(price_key(ttype, p, t))
+                    if it is not item and budget is not None \
+                            and price is not None \
+                            and spent_known + price > budget:
+                        continue                   # would dip into reserve
+                    if price is not None:
+                        spent_known += price
+                    vec[p] += 1
+                    proj[p] += 1
+                    members.append((it, p))
+                before = list(entry["path"])
+                st = act_upgrade(
+                    screen, cfg,
+                    {**item, "at": landed, "path": vec,
+                     "sane_cash": sane_cash}, entry)
+                bought = [entry["path"][k] - before[k] for k in range(3)]
+                nb = sum(bought)
+                giveup = 4 if st in ("no_select", "unread") else 6
+                need = list(bought)
+                for it, p in members:
+                    if need[p] > 0:                # this tier landed
+                        need[p] -= 1
+                        try:
+                            queue.remove(it)
+                        except ValueError:
+                            pass
+                    else:                          # didn't land: keep it
+                        t = entry["path"][p] + 1
+                        if p in entry.get("closed_paths", []) \
+                                or is_locked(ttype, p, t):
+                            try:
+                                queue.remove(it)   # path closed / XP-locked
+                            except ValueError:
+                                pass
+                        else:
+                            it["_fails"] = it.get("_fails", 0) + 1
+                            it["_wake"] = time.time() + (
+                                min(10 * 2 ** (it["_fails"] - 1), 60)
+                                if st == "broke" else 10)
+                            if it["_fails"] >= giveup:
+                                try:
+                                    queue.remove(it)
+                                except ValueError:
+                                    pass
+                if nb > 0:
+                    broke_at[0] = None
+                    for k in range(3):
+                        for t in range(before[k] + 1, entry["path"][k] + 1):
+                            record_spend(
+                                PRICES.get(price_key(ttype, k, t))
+                                or item.get("est") or 0)
+                    confirm_floor()
+                    if nb > 1:
+                        dbg(f"{tname}: bought {nb} tiers in one panel "
+                            f"{bought}")
+                    else:
+                        dbg(f"{tname} path{pi + 1} t{tier}: bought")
+                else:
+                    dbg(f"{tname} path{pi + 1} t{tier}: {st}")
+                    if st == "broke":
+                        set_watermark(PRICES.get(price_key(ttype, pi, tier)))
+                return nb
+
             cash_now = sane_cash()
             rush = time.time() < emergency_until[0]
             try:
@@ -3500,35 +3599,13 @@ def run_episode(screen, cfg, genome, final_round, abort_lives=50,
                             dbg(msg)
                         item["_wake"] = time.time() + 5
                     else:
-                        st = act_upgrade(
-                            screen, cfg,
-                            {**item, "at": landed,
-                             "sane_cash": sane_cash}, entry)
-                        dbg(f"{tname} path{pi + 1} t{tier}: {st}")
-                        if st == "bought":
-                            queue.pop(idx)
-                            broke_at[0] = None
+                        # One panel session buys every DUE tier for this
+                        # tower (open/buy.../close), not one tier per open.
+                        # The helper pops the tiers that landed, sleeps or
+                        # drops the rest, and books the spend.
+                        if do_batched_upgrade(item, entry, landed, pi, tier,
+                                              ttype, tname) > 0:
                             attempts = 0
-                            record_spend(
-                                PRICES.get(price_key(ttype, pi, tier))
-                                or item.get("est") or 0)
-                            confirm_floor()
-                        elif st in ("locked", "closed"):
-                            queue.pop(idx)     # recorded; done with it
-                        elif st == "broke":
-                            set_watermark(
-                                PRICES.get(price_key(ttype, pi, tier)))
-                            item["_fails"] = item.get("_fails", 0) + 1
-                            item["_wake"] = time.time() + min(
-                                10 * 2 ** (item["_fails"] - 1), 60)
-                            if item["_fails"] >= 6:
-                                queue.pop(idx)
-                        else:                  # no_select / unread
-                            item["_fails"] = item.get("_fails", 0) + 1
-                            item["_wake"] = time.time() + 10
-                            if item["_fails"] >= 4:
-                                print(f"   giving up on an upgrade ({st})")
-                                queue.pop(idx)
 
         endgame = (play_out and last_round is not None
                    and last_round >= final_round)
