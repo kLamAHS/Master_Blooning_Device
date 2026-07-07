@@ -58,7 +58,9 @@ def towers_from_genome(genome):
     for e in genome:
         if e.get("do") == "place":
             by_ref[e["ref"]] = {"tower": e["tower"].lower(),
-                                "at": list(e["at"]), "path": [0, 0, 0]}
+                                "at": list(e["at"]), "path": [0, 0, 0],
+                                **({"name": e["name"]}
+                                   if e.get("name") else {})}
     for e in genome:
         if e.get("do") == "upgrade" and e.get("ref") in by_ref:
             if 1 in e.get("path", []):
@@ -230,6 +232,17 @@ class OutcomeLearner:
                         covered = 1.0
             f["covers_" + kind] = covered
 
+        # Role reasoning as scalars the model can weight: how many distinct
+        # threat roles the layout answers, and how many of the EARLY ones
+        # (camo/lead/moab -- the walls a CHIMPS run meets first) it still
+        # leaves open. Aggregates the covers_<kind> flags above so the model
+        # learns "MOAB damage but no camo answer" as a shape, not 21 tiers.
+        f["role_coverage_count"] = sum(f.get("covers_" + k, 0.0)
+                                       for k in solutions)
+        f["uncovered_early"] = sum(
+            1.0 for k in ("camo", "lead", "moab")
+            if k in solutions and f.get("covers_" + k, 0.0) < 1.0)
+
         if self.track is not None and getattr(self.track, "ok", False):
             exposures = []
             carry_exp = 0.0
@@ -267,6 +280,16 @@ class OutcomeLearner:
                            for _t2, o, _r2 in spots):
                         near += 1
                 f["buddy_linked_frac"] = near / len(buddies)
+            # Is the CARRY specifically buffed? Support multiplies the DPS
+            # core -- an alch on the carry is worth far more than one on a
+            # filler dart -- so the model gets that link as its own signal.
+            carry_spots = [at for t, at, _r in spots if t in carries]
+            if carry_spots:
+                f["carry_buffed"] = 1.0 if any(
+                    math.hypot(bat[0] - cs[0],
+                               (bat[1] - cs[1]) * 9.0 / 16.0) <= br * 0.9
+                    for _bt, bat, br in buddies for cs in carry_spots) \
+                    else 0.0
         return f
 
     # ------------------------------------------------------- training

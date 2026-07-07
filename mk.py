@@ -70,6 +70,15 @@ def dbg(msg):
     if DEBUG:
         print(f"      . {msg}")
 
+
+# Provable-lower-bound cash guard (pure stdlib; see cashguard.py). It makes a
+# low cash misread non-fatal: the bot keeps buying up to what it PROVABLY has
+# instead of freezing behind a phantom-broke wallet and leaking the run.
+from cashguard import CashFloor
+# Pure placement geometry (see placement.py): never click a spot we know is
+# already taken -- relocate to the nearest free mask point instead.
+from placement import free_placement_spots
+
 try:
     import pytesseract
 except ImportError:
@@ -388,12 +397,18 @@ def read_round(screen, cfg):
     return parse_round(text), text, crop, processed
 
 
+# Freeplay pushes past a beaten mode, so its round counter is a bare number
+# (no "/total") that keeps climbing past 100. `solve --freeplay` sets this so
+# the first-read sanity bound stops rejecting rounds above 100.
+FREEPLAY = False
+
+
 def plausible(new, last):
     """Rounds only move forward, and only a little at a time."""
     if new is None:
         return False
     if last is None:
-        return 1 <= new <= 100
+        return 1 <= new <= (200 if FREEPLAY else 100)
     return last <= new <= last + 3
 
 
@@ -724,7 +739,8 @@ def _snap_cash_box_to_digits(screen, box, min_x=0.0):
     the scale, and the result must pass _plausible_cash_shape or the
     snap returns nothing rather than an inflated box."""
     x, y, w, h = box
-    wide = [max(min_x, x - h), max(0.0, y - 0.3 * h), w + 2 * h, h * 1.6]
+    wide = [max(min_x, x - 1.3 * h), max(0.0, y - 0.3 * h),
+            w + 2.3 * h, h * 1.6]
     crop = screen.grab(wide)
     proc = preprocess_round_crop(crop)
     try:
@@ -761,10 +777,16 @@ def _snap_cash_box_to_digits(screen, box, min_x=0.0):
     dy1 = min(d[2] for d in digits) / scale
     dy2 = max(d[4] for d in digits) / scale
     bh = max(dy2 - dy1, 8)
-    nx0 = wide[0] + max(0.0, dx1 - 0.25 * bh) / screen.w
+    # Leave ~0.7 digit-widths of slack on the LEFT (was 0.25): cash grows a
+    # digit or two over a run and, on this HUD, the number expands leftward,
+    # so a box fitted tight to the starting digits clips the new leading
+    # digit later. Still well clear of the '$' (~a full digit further left),
+    # which the reader skips anyway. The width grows to match so the right
+    # room is unchanged; the mid-run recheck heals any clip that still slips.
+    nx0 = wide[0] + max(0.0, dx1 - 0.7 * bh) / screen.w
     ny0 = wide[1] + max(0.0, dy1 - 0.35 * bh) / screen.h
     snapped = [round(nx0, 4), round(ny0, 4),
-               round((dx2 - dx1 + 2.2 * bh) / screen.w, 4),  # right room
+               round((dx2 - dx1 + 2.65 * bh) / screen.w, 4),  # room L+R
                round(1.7 * bh / screen.h, 4)]
     return snapped if _plausible_cash_shape(snapped) else None
 
@@ -778,6 +800,26 @@ def _read_cash_box(screen, box):
     if value is None:
         return None
     return value if value <= 150000 else None
+
+
+def _read_cash_box_confirmed(screen, box, max_plausible=None):
+    """Corroborated read from an EXPLICIT box (see read_cash_confirmed for
+    the majority-of-three logic). Lets a candidate box be verified before
+    it is adopted, without swapping it into cfg first."""
+    def ok(v):
+        return v is not None and (max_plausible is None or v <= max_plausible)
+
+    a = _read_cash_box(screen, box)
+    time.sleep(0.15)
+    b = _read_cash_box(screen, box)
+    if a == b:
+        return a if ok(a) else None
+    time.sleep(0.12)
+    c = _read_cash_box(screen, box)
+    for v in (a, b, c):
+        if ok(v) and [a, b, c].count(v) >= 2:
+            return v
+    return None
 
 
 def _repair_clipped_cash_box(screen, box, min_x=0.0):
@@ -800,6 +842,84 @@ def _repair_clipped_cash_box(screen, box, min_x=0.0):
             if best is None or value > best[1]:
                 best = (cand, value)
     return best[0] if best else None
+
+
+def recheck_cash_box(screen, cfg, round_hint=None, mode="standard"):
+    """Mid-run guard against a cash box that has started misreading -- the
+    leading-digit clip that only appears once cash grows past the digit count
+    the box was calibrated for (invisible on the small STARTING cash, so the
+    preflight repair can't see it), plus HUD drift, a right-edge clip, or an
+    UNCLEAN clip that the left-widen repair alone can't recover.
+
+    Two passes, cheap first:
+      1. Re-run the left-widen repair -- adopts a wider box only when it reads
+         a strictly larger value containing the current read as a suffix (the
+         clean-clip signature). Safe no-op when nothing is clipped.
+      2. If that finds nothing, re-derive the WHOLE box from a live HUD
+         landmark (the coin, whose fixed offset means the leading digit can
+         never clip; then the heart as fallback). A re-anchored box is
+         adopted only when it is shape-sane, clear of the lives counter, and
+         reads a CORROBORATED value strictly LARGER than the current box
+         (recovering a lost digit, never inventing one) within the round's
+         plausible magnitude. This recovers drift / right-clip / unclean clip
+         the left-widen misses, without risking a spurious box.
+
+    Cheap enough to call once a round."""
+    box = cfg.get("cash_box")
+    if not box:
+        return
+    lb = cfg.get("lives_box")
+    fence = (lb[0] + lb[2]) if lb else 0.0
+    ceiling = None
+    if round_hint is not None:
+        try:
+            from meta import earned_by
+            ceiling = 2.0 * earned_by(round_hint, mode)   # generous per-round
+        except Exception:                                 # magnitude cap
+            ceiling = None
+
+    def _adopt(cand, why):
+        cfg["cash_box"] = cand
+        save_config_value("cash_box", cand)
+        dbg(f"cash box re-anchored mid-run ({why}): {box} -> {cand}")
+
+    # Pass 1: cheap left-widen -- recovers a clean leading-digit clip.
+    repaired = _repair_clipped_cash_box(screen, box, min_x=fence)
+    if repaired and repaired != box and _plausible_cash_shape(repaired):
+        _adopt(repaired, "clipped digit")
+        return
+
+    # Pass 2: landmark re-anchor -- recovers drift / right-clip / unclean clip,
+    # AND heals a box that has started reading a truncated low value (e.g. a
+    # single '$1'): a landmark that reads a strictly LARGER, corroborated value
+    # is the real number. Only ever adopts a recovery over the CURRENT reading,
+    # so it can never adopt a stray low-digit box. If the current box reads
+    # nothing at all, leave it -- a dark box is handled safely upstream
+    # (sane_cash returns None -> "buy anyway"), and adopting a landmark we
+    # can't compare against risks locking onto a stray glyph.
+    cur = _read_cash_box(screen, box)
+    if cur is None:
+        return
+    candidates = []
+    coin = _cash_box_from_coin(screen)
+    if coin:
+        snapped = _snap_cash_box_to_digits(screen, coin, min_x=fence)
+        candidates.append(snapped or coin)
+    candidates += _cash_boxes_from_heart(screen)
+    for cand in candidates:
+        if not cand or cand == box:
+            continue
+        if not _plausible_cash_shape(cand) or _overlaps_lives(cand, cfg):
+            continue
+        quick = _read_cash_box(screen, cand)              # cheap pre-filter
+        if quick is None or quick <= cur \
+                or (ceiling is not None and quick > ceiling):
+            continue          # not a recovery -- only ever adopt MORE digits
+        val = _read_cash_box_confirmed(screen, cand, ceiling)   # corroborate
+        if val is None or val <= cur:
+            continue
+        _adopt(cand, "landmark re-anchor")
+        return
 
 
 def _cash_boxes_from_heart(screen):
@@ -1004,19 +1124,19 @@ def read_cash(screen, cfg):
     return _read_cash_box(screen, box)
 
 
-def read_cash_confirmed(screen, cfg):
-    """Two reads that must corroborate. Equal reads confirm the value;
-    affix pairs like 950/50 or 600/6005 are contradictions, not
-    confirmation. Return None unless both reads agree exactly. Used where
-    a single bad read does lasting damage (watermarks, price recording)."""
-    a = read_cash(screen, cfg)
-    time.sleep(0.15)
-    b = read_cash(screen, cfg)
-    if a is None or b is None:
-        return a if a == b else None
-    if a == b:
-        return a
-    return None
+def read_cash_confirmed(screen, cfg, max_plausible=None):
+    """Corroborated cash read for decisions a single bad read would harm
+    (watermarks, price recording). The fast path is unchanged -- two reads
+    that agree exactly confirm the value. If they DISAGREE (fast-forward
+    cash animation ticking between reads is the usual cause), a third read
+    breaks the tie by majority instead of giving up. Affix pairs like
+    950/50 or 600/6005 are contradictions, not confirmation.
+
+    `max_plausible`, when the caller passes a ceiling (e.g. the income
+    model's cap for the round), rejects any read above it: a clipped
+    leading digit ('$2,851' -> '851') reads fluently but low while an
+    inflated box reads high -- both are dropped rather than trusted."""
+    return _read_cash_box_confirmed(screen, cfg.get("cash_box"), max_plausible)
 
 
 def _overlaps_lives(box, cfg):
@@ -1396,6 +1516,53 @@ def looks_defeated(screen):
     return float((orange > 0).mean()) > 0.08
 
 
+# The defeat screen comes in two layouts -- Home/Restart and, more often,
+# Home/Restart/Review Map -- which put the RESTART button in different
+# places, so a single calibrated point misses one of them (and on the
+# 3-button layout the old point can land on HOME and bounce us to the main
+# menu). This band spans just the low button row: clear of the orange
+# DEFEAT lettering above and the fast-forward control off to the side, and
+# the two neighbouring buttons are cyan, so the golden-yellow RESTART
+# button is the only warm blob in it.
+DEFEAT_BUTTON_BAND = (0.30, 0.70, 0.42, 0.20)   # x, y, w, h (normalized)
+
+
+def find_defeat_restart(screen, cfg):
+    """Normalized centre of the defeat-screen RESTART button, found by its
+    yellow colour so both button layouts work regardless of where it lands.
+    Falls back to the calibrated cfg['defeat_restart'] point when the button
+    can't be seen (wrong screen, odd theme)."""
+    fallback = cfg.get("defeat_restart")
+    try:
+        bx, by, bw, bh = DEFEAT_BUTTON_BAND
+        strip = screen.grab([bx, by, bw, bh])
+        hsv = cv2.cvtColor(strip, cv2.COLOR_BGR2HSV)
+        mask = cv2.inRange(hsv, (14, 110, 140), (38, 255, 255))
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL,
+                                       cv2.CHAIN_APPROX_SIMPLE)
+        best = None
+        for c in contours:
+            area = cv2.contourArea(c)
+            x, y, w, h = cv2.boundingRect(c)
+            if area < 0.0006 * screen.w * screen.h:   # skip text/specks
+                continue
+            if w > 0.20 * screen.w or h > 0.22 * screen.h:
+                continue
+            if not (0.6 <= w / max(h, 1) <= 2.4):      # a button-ish block
+                continue
+            if best is None or area > best[0]:
+                best = (area, x, y, w, h)
+        if best is None:
+            dbg("defeat RESTART not found by colour -- using calibrated point")
+            return fallback
+        _, x, y, w, h = best
+        nx = bx + (x + w / 2) / screen.w
+        ny = by + (y + h / 2) / screen.h
+        return [round(nx, 4), round(ny, 4)]
+    except Exception:
+        return fallback
+
+
 def looks_restart_confirm(screen):
     """Is the 'RESTART?' confirmation dialog up? Green header ribbon
     carrying white text, with the dialog's light-blue body below it.
@@ -1715,6 +1882,26 @@ def placement_candidates(spot, tower=None, limit=12):
     return candidates
 
 
+def _probe_occupied(screen, cfg, spot):
+    """Is a monkey sitting on `spot`? With NO ghost held, a bare left click on
+    an occupied spot opens that tower's upgrade panel, while a click on empty
+    placeable ground does nothing. That is how the executor turns a mystery
+    placement failure into a KNOWN-occupied point it can avoid from then on.
+    Drops any held ghost first and closes the panel it opens, so the UI is
+    left clean; if a ghost/overlay can't be cleared it declines to probe
+    rather than risk a stray click."""
+    click("right")                        # drop any held ghost
+    time.sleep(0.2)
+    if not counter_visible(screen, cfg, tries=2):
+        return False                      # ghost/overlay stuck -- don't risk it
+    click_norm(screen, spot)
+    time.sleep(0.3)
+    if detect_panel_side(screen):
+        clear_ui(screen, cfg)             # close the panel the probe opened
+        return True
+    return False
+
+
 def act_place(screen, cfg, action):
     """Try to place a tower. Returns (status, landed):
       ("placed", [x, y])  -- tower is down at that coordinate
@@ -1724,19 +1911,22 @@ def act_place(screen, cfg, action):
                              as a placement failure.
       ("no_spot", None)   -- ghost held but every candidate click was
                              rejected: genuinely unplaceable around here."""
-    key = TOWER_HOTKEYS[action["tower"].lower()]
+    tl = action["tower"].lower()
+    large = tl in LARGE_TOWERS
+    key = TOWER_HOTKEYS[tl]
     spot = action["at"]
-    candidates = placement_candidates(spot, action["tower"].lower())
-    # Never retry ON another tower this run already placed: those clicks
-    # can only fail (or select the neighbor), and watching the bot try
-    # to stack glue on glue for a minute is silly.
-    avoid = action.get("avoid") or []
-    if avoid:
-        min_d = 0.05 if action["tower"].lower() in LARGE_TOWERS else 0.03
-        far = [c for c in candidates
-               if all((c[0] - a[0]) ** 2 + (c[1] - a[1]) ** 2
-                      >= min_d ** 2 for a in avoid)]
-        candidates = far or candidates
+    candidates = placement_candidates(spot, tl)
+    # Never click ON a spot we KNOW is taken -- a tower this run already
+    # placed (`avoid`), or one a probe caught a monkey sitting on (`occupied`,
+    # a persistent per-episode blacklist). Those clicks can only fail or select
+    # the neighbor; watching the bot try to stack glue on glue is silly.
+    occupied = action.get("occupied")            # mutable list, grown on probe
+    avoid = list(action.get("avoid") or [])
+    if occupied:
+        avoid += list(occupied)
+    min_d = 0.05 if large else 0.03
+    candidates = free_placement_spots(
+        candidates, avoid, min_d, MASK_ROOMY if large else MASK_POINTS, spot)
     deadline = time.time() + action.get("timeout", 60)
 
     cash_before = read_cash(screen, cfg)
@@ -1810,6 +2000,16 @@ def act_place(screen, cfg, action):
               f"  (cash-verified late, ${baseline} -> ${spent})")
         clear_ui(screen, cfg)
         return "placed", target
+    # Still nothing placed. Before giving up, find out WHY the planned spot
+    # refused us: a bare click there (no ghost held) that opens an upgrade
+    # panel means a monkey is sitting on it. Blacklist that point so this
+    # item's own retries -- and every later buy -- relocate instead of
+    # clicking the same dead spot again.
+    if occupied is not None and _probe_occupied(screen, cfg, spot):
+        pt = [round(spot[0], 4), round(spot[1], 4)]
+        if pt not in occupied:
+            occupied.append(pt)
+            dbg(f"{tl}: {pt} is occupied by a monkey -- blacklisted this run")
     return "no_spot", None
 
 
@@ -1942,9 +2142,16 @@ def act_upgrade(screen, cfg, action, tower=None, timeout=8):
                     status = "unread"          # can't be sure: don't press
                     break
             known = PRICES.get(pkey) if pkey else None
-            cash = read_cash(screen, cfg)
-            if known is not None and cash is not None and cash < known:
-                status = broke_status(cash, known)  # caller waits, menu closed
+            cash = read_cash(screen, cfg)           # raw: for the buy delta
+            # Affordability is decided on the FLOOR-protected value, not the
+            # raw read: a clipped '$1' misread would otherwise fake a "broke"
+            # and, retried, get the whole upgrade dropped. When the read is
+            # implausibly low the gate falls back to "unreadable" (proceed and
+            # let the row-based verification below judge), never a false broke.
+            sc = action.get("sane_cash")
+            gate_cash = sc() if sc is not None else cash
+            if known is not None and gate_cash is not None and gate_cash < known:
+                status = broke_status(gate_cash, known)  # caller waits, closed
                 break
             press_key(UPGRADE_KEYS[i])
             time.sleep(0.5)
@@ -2528,7 +2735,8 @@ def random_genome(rng, n_towers, hero=False):
 
 def run_episode(screen, cfg, genome, final_round, abort_lives=50,
                 flow_sensor=None, play_out=False, danger_rounds=None,
-                abilities=False):
+                abilities=False, one_life=False, freeplay=False,
+                mode="standard"):
     """Play one layout to survival or defeat. Returns (outcome,
     final_round_reached, towers, lives_by_round, cash_by_round,
     spent_by_round).
@@ -2559,20 +2767,31 @@ def run_episode(screen, cfg, genome, final_round, abort_lives=50,
         f"lives={read_lives(screen, cfg)}")
 
     try:
-        from meta import choose_buy
+        from meta import choose_buy, earned_by
     except ImportError:                       # no brain: old greedy rule
         def choose_buy(q, _round, _cash, _cost, now, emergency=False,
                        gate_ok=None):
             return next((j for j, it in enumerate(q)
                          if it.get("_wake", 0) <= now), None)
 
+        def earned_by(_r, _mode="standard"):  # no income model available
+            return 0
+
     queue = list(genome)
     landed_by_ref, towers = {}, {}
+    # Spots a probe caught a monkey sitting on (a tower we didn't track, or
+    # one whose real position drifted from where we recorded it). Grown by
+    # act_place and fed back into every placement so no buy keeps clicking a
+    # spot that's already taken.
+    occupied_spots = []
     lives_by_round = {}
     cash_by_round = {}       # cash at the start of each round (telemetry
     spent_by_round = {}      # for the learned income curve)
     broke_at = [None, 0.0]   # cash watermark: level + time of last set
     emergency_until = [0.0]  # leak emergency: reserves off until this time
+    # Provable lower bound on current cash: it only falls through purchases
+    # (all reported via record_spend), so a read far below it is a misread.
+    cash_floor = CashFloor(income_model=lambda r: earned_by(r, mode))
     prev_round_lives = [None]
     last_ping = [0.0]        # ability-hotkey pinger cooldown
     final_seen = None        # play_out: when the final round was reached
@@ -2582,6 +2801,38 @@ def run_episode(screen, cfg, genome, final_round, abort_lives=50,
         if amount:
             key = str(last_round if last_round is not None else 0)
             spent_by_round[key] = spent_by_round.get(key, 0) + amount
+            cash_floor.spend(amount)      # keep the provable floor valid
+
+    def confirm_floor():
+        """Raise the cash floor from a corroborated read (see CashFloor).
+        Called at episode start (seed) and at each round change / successful
+        buy (re-anchor to the true level so the floor never goes stale-low).
+        A per-round magnitude cap keeps a spurious-high read from INFLATING
+        the floor (which would make the bot try to over-buy); too-tight a cap
+        merely under-raises it, which is the safe direction."""
+        cap = None
+        if last_round is not None:
+            try:
+                cap = 2.0 * earned_by(last_round, mode)
+            except Exception:
+                cap = None
+        cash_floor.confirm(read_cash_confirmed(screen, cfg, max_plausible=cap))
+
+    def sane_cash():
+        """read_cash, but a read implausibly far below what we PROVABLY have
+        is a clipped/misread number, not a real drop -- corroborate it and,
+        if it stays low, substitute the floor so a low misread can never
+        freeze the buy plan and leak the run. A correct read passes through
+        unchanged. (The floor logic itself lives in cashguard.CashFloor.)"""
+        v = read_cash(screen, cfg)
+        out = cash_floor.sane(
+            v, confirm_fn=lambda: read_cash_confirmed(screen, cfg),
+            round_hint=last_round)
+        if v is not None and out is not None and out != v:
+            dbg(f"sane_cash: read ${v} << floor "
+                f"${int(cash_floor.value) if cash_floor.value is not None else out}"
+                f", using ${out}")
+        return out
 
     def set_watermark(price=None):
         """Record the cash level of a money-failure. Being broke for a
@@ -2626,29 +2877,40 @@ def run_episode(screen, cfg, genome, final_round, abort_lives=50,
         hero/carry is even placed."""
         nonlocal place_i
         start_round = read_round_stable(screen, cfg, tries=3) or 1
+        # Openers we can't place THIS pass (unaffordable now, or a transient
+        # miss) are set aside, not allowed to block the rest: a free hero
+        # must never be stranded behind a carry we can't yet afford -- that
+        # leaks the very opening rounds CHIMPS never forgives. Set-aside
+        # items stay queued; the main loop buys them once cash arrives.
+        skipped = set()
         while True:
             idx = next((j for j, it in enumerate(queue)
                         if it.get("do") == "place"
-                        and it.get("round", 0) <= start_round), None)
+                        and it.get("round", 0) <= start_round
+                        and id(it) not in skipped), None)
             if idx is None:
                 break
             item = queue[idx]
             ttype = item["tower"].lower()
             base = PRICES.get(price_key(ttype))
-            cash = read_cash(screen, cfg)
+            cash = sane_cash()
             if base and cash is not None and cash < base:
-                break
+                skipped.add(id(item))          # can't afford yet: try others
+                continue
             st, landed = act_place(
                 screen, cfg,
                 {**item, "timeout": 10,
-                 "avoid": [t["at"] for t in towers.values()]})
+                 "avoid": [t["at"] for t in towers.values()],
+                 "occupied": occupied_spots})
             if landed is None:
                 if st == "no_spot":
                     print(f"   pre-start {ttype}: no placeable spot near "
                           f"{item['at']} -- skipping")
                     landed_by_ref[item.get("ref", place_i)] = None
                     queue.pop(idx)
-                break
+                    continue
+                skipped.add(id(item))          # transient miss: leave queued
+                continue
             landed_by_ref[item.get("ref", place_i)] = landed
             towers[tuple(landed)] = {"tower": item["tower"], "at": landed,
                                      "path": [0, 0, 0],
@@ -2659,7 +2921,8 @@ def run_episode(screen, cfg, genome, final_round, abort_lives=50,
             record_spend(PRICES.get(price_key(ttype)) or item.get("est") or 0)
             clear_ui(screen, cfg)
 
-    place_prestart_openers()
+    confirm_floor()                # seed the floor from starting cash before
+    place_prestart_openers()       # any pre-start buy lowers it
     clean = screen.grab() if flow_sensor else None
     press_key("space")
     time.sleep(0.3)
@@ -2698,9 +2961,16 @@ def run_episode(screen, cfg, genome, final_round, abort_lives=50,
             blind_since = None                # counter is readable again
             if accepted != last_round:
                 last_round = accepted
+                # Cash grows a digit or two over a run; re-widen the box if
+                # its leading digit has started clipping (the preflight fit
+                # couldn't see a clip that didn't exist yet on starting cash).
+                recheck_cash_box(screen, cfg, round_hint=last_round, mode=mode)
+                # Re-anchor the floor to the true level each round so it never
+                # goes stale-low as income outgrows the last confirmed read.
+                confirm_floor()
                 if lives is not None:
                     lives_by_round[str(last_round)] = lives
-                cash_now = read_cash(screen, cfg)
+                cash_now = sane_cash()
                 if cash_now is not None:
                     cash_by_round[str(last_round)] = cash_now
                 print(f"   [round {last_round:>3}]  lives={lives}  "
@@ -2730,7 +3000,14 @@ def run_episode(screen, cfg, genome, final_round, abort_lives=50,
                             screen.grab())
         elif lives is not None:
             zero_streak = 0
-        if (lives == 0 and prev_lives == 0) or zero_streak >= 3:
+        digit_defeat = (lives == 0 and prev_lives == 0) or zero_streak >= 3
+        if digit_defeat and (not one_life or looks_defeated(screen)):
+            # A one-life run cannot afford a false defeat: a burst of lives
+            # MISREADS (the CHIMPS "1" flickering to 0, coin/heart noise)
+            # would otherwise restart a game that is still alive. There the
+            # digit reading must be backed by the DEFEAT screen itself.
+            # Multi-life rungs keep the digit-only exit (a leak to 0 there
+            # is unambiguous and the HUD stays up).
             outcome = "defeat"                # defeat screen (HUD stays!)
             break
         near_final = (play_out and last_round is not None
@@ -2753,8 +3030,15 @@ def run_episode(screen, cfg, genome, final_round, abort_lives=50,
             round_seen_at = time.time()
         buyable_now = any(it.get("round", 0) <= (last_round or 0)
                           for it in queue)
-        if not buyable_now and time.time() - round_seen_at > 60 \
-                and (lives is None or lives < 40):
+        # "Critical lives" for the frozen-round net: on a normal rung, a
+        # low life count during a minute-long stall means we quietly leaked
+        # to death behind a covered HUD. On a ONE-LIFE rung that test is
+        # meaningless -- lives is permanently 1, so `lives < 40` is always
+        # true and any stall (a BAD/ZOMG round, a UI overlay, a drifted
+        # crop) got misread as a defeat and restarted a live game. There,
+        # only an actual leaked-out (lives 0) counts.
+        crit = (lives == 0) if one_life else (lives is None or lives < 40)
+        if not buyable_now and time.time() - round_seen_at > 60 and crit:
             # Round frozen for a minute, nothing buyable at this round,
             # critical lives: that is the defeat screen, whatever the
             # pixels say. (Checked against ELIGIBLE buys, not the raw
@@ -2822,7 +3106,7 @@ def run_episode(screen, cfg, genome, final_round, abort_lives=50,
                 ent = towers.get(tuple(lnd)) if lnd else None
                 return bool(ent) and max(ent["path"]) >= g["tier"]
 
-            cash_now = read_cash(screen, cfg)
+            cash_now = sane_cash()
             rush = time.time() < emergency_until[0]
             try:
                 idx = choose_buy(queue, last_round, cash_now, _cost_of,
@@ -2842,7 +3126,7 @@ def run_episode(screen, cfg, genome, final_round, abort_lives=50,
             elif item["do"] == "place":
                 ttype = item["tower"].lower()
                 base = PRICES.get(price_key(ttype))
-                cash = read_cash(screen, cfg)
+                cash = sane_cash()
                 if base and cash is not None and cash < base:
                     msg = f"{ttype}: saving up (${cash}/${base})"
                     if item.get("_dbg") != msg:
@@ -2860,7 +3144,8 @@ def run_episode(screen, cfg, genome, final_round, abort_lives=50,
                     st, landed = act_place(
                         screen, cfg,
                         {**item, "timeout": 10,
-                         "avoid": [t["at"] for t in towers.values()]})
+                         "avoid": [t["at"] for t in towers.values()],
+                         "occupied": occupied_spots})
                     if landed is not None:
                         # Key by the genome's own ref when present: place
                         # items can execute out of order (broke/no-spot
@@ -2878,6 +3163,7 @@ def run_episode(screen, cfg, genome, final_round, abort_lives=50,
                         broke_at[0] = None
                         record_spend(PRICES.get(price_key(ttype))
                                      or item.get("est") or 0)
+                        confirm_floor()        # re-anchor to true post-buy cash
                     elif st == "broke":
                         est_c = base or item.get("est")
                         lvl = read_cash_confirmed(screen, cfg)
@@ -2945,7 +3231,7 @@ def run_episode(screen, cfg, genome, final_round, abort_lives=50,
                         dbg(f"{tname} path{pi + 1}: closed, skip")
                         queue.pop(idx)         # path closed on this tower
                     elif (known := PRICES.get(price_key(ttype, pi, tier))) \
-                            and (cash := read_cash(screen, cfg)) is not None \
+                            and (cash := sane_cash()) is not None \
                             and cash < known:
                         # Known price, can't afford: no menu, just sleep
                         # this item and let income build.
@@ -2969,8 +3255,10 @@ def run_episode(screen, cfg, genome, final_round, abort_lives=50,
                             item["_recheck_at"] = time.time() + 60
                             dbg(f"{tname} path{pi + 1}: re-checking "
                                 f"unverified ${known}")
-                            st = act_upgrade(screen, cfg,
-                                             {**item, "at": landed}, entry)
+                            st = act_upgrade(
+                                screen, cfg,
+                                {**item, "at": landed,
+                                 "sane_cash": sane_cash}, entry)
                             dbg(f"{tname} path{pi + 1} t{tier}: {st}")
                             if st == "bought":
                                 queue.pop(idx)
@@ -2978,6 +3266,7 @@ def run_episode(screen, cfg, genome, final_round, abort_lives=50,
                                 record_spend(
                                     PRICES.get(price_key(ttype, pi, tier))
                                     or item.get("est") or 0)
+                                confirm_floor()
                             elif st in ("locked", "closed"):
                                 queue.pop(idx)
                             else:
@@ -2989,7 +3278,7 @@ def run_episode(screen, cfg, genome, final_round, abort_lives=50,
                         else:
                             item["_wake"] = time.time() + 3
                     elif broke_at[0] is not None \
-                            and (cash := read_cash(screen, cfg)) is not None \
+                            and (cash := sane_cash()) is not None \
                             and watermark_holds(cash):
                         msg = (f"{tname} path{pi + 1}: watermark hold "
                                f"(${cash} <= ${broke_at[0]}+100)")
@@ -2998,8 +3287,10 @@ def run_episode(screen, cfg, genome, final_round, abort_lives=50,
                             dbg(msg)
                         item["_wake"] = time.time() + 5
                     else:
-                        st = act_upgrade(screen, cfg,
-                                         {**item, "at": landed}, entry)
+                        st = act_upgrade(
+                            screen, cfg,
+                            {**item, "at": landed,
+                             "sane_cash": sane_cash}, entry)
                         dbg(f"{tname} path{pi + 1} t{tier}: {st}")
                         if st == "bought":
                             queue.pop(idx)
@@ -3008,6 +3299,7 @@ def run_episode(screen, cfg, genome, final_round, abort_lives=50,
                             record_spend(
                                 PRICES.get(price_key(ttype, pi, tier))
                                 or item.get("est") or 0)
+                            confirm_floor()
                         elif st in ("locked", "closed"):
                             queue.pop(idx)     # recorded; done with it
                         elif st == "broke":
@@ -3049,7 +3341,11 @@ def run_episode(screen, cfg, genome, final_round, abort_lives=50,
                 outcome = "survived"
                 break
         if last_round is not None and last_round >= final_round:
-            if not play_out:
+            if not play_out or freeplay:
+                # Freeplay is endless: there is NO victory screen at the
+                # target, so REACHING it IS the win -- don't wait for a
+                # screen that will never come. (Non-play_out farm runs also
+                # stop here, as before.)
                 outcome = "survived"
                 break
             # Safety net for a win the covered-HUD path above missed:
@@ -3208,8 +3504,9 @@ def restart_game(screen, cfg, outcome, start_round=1):
         if looks_restart_confirm(screen):
             how = "leftover RESTART? dialog"
         elif looks_defeated(screen):
-            how = "defeat screen"
-            click_norm(screen, cfg["defeat_restart"])
+            spot = find_defeat_restart(screen, cfg)
+            how = f"defeat screen (RESTART at {spot[0]:.3f},{spot[1]:.3f})"
+            click_norm(screen, spot)
         elif looks_paused(screen):
             how = "pause menu"
             click_norm(screen, cfg["pause_restart"])
@@ -3227,7 +3524,7 @@ def restart_game(screen, cfg, outcome, start_round=1):
                 # the dialog gate below (on a live game it just clicks
                 # map and the missing dialog sends us around again).
                 how = "unrecognized screen -- trying the defeat button"
-                click_norm(screen, cfg["defeat_restart"])
+                click_norm(screen, find_defeat_restart(screen, cfg))
         dbg(f"restart attempt {attempt + 1}: {how}")
         if not _wait_until(lambda: looks_restart_confirm(screen), 4.0):
             dbg("restart: RESTART? dialog did not appear -- re-evaluating")
@@ -3489,7 +3786,8 @@ def cmd_farm(args):
              spent_by_round) = run_episode(
                 screen, cfg, genome, args.final_round,
                 abort_lives=args.abort_lives, flow_sensor=sensor,
-                danger_rounds=danger, abilities=not args.no_abilities)
+                danger_rounds=danger, abilities=not args.no_abilities,
+                one_life=one_life, mode=game_mode)
         except KeyboardInterrupt:
             raise
         except Exception:
@@ -3572,7 +3870,8 @@ def cmd_solve(args):
                  f"{args.name}` first.")
     load_mask(mask_path)
 
-    global PRICE_DIFFICULTY
+    global PRICE_DIFFICULTY, FREEPLAY
+    FREEPLAY = args.freeplay          # relax the round cap before preflight
     rng = random.Random(args.seed)
     runs_path = Path(__file__).parent / "runs_log.jsonl"
 
@@ -3592,16 +3891,32 @@ def cmd_solve(args):
               "episode start. Rung detection needs it, so pass "
               "--difficulty/--mode if detection fails.")
 
-    lv, start_round, difficulty, game_mode = detect_loaded_rung(
-        screen, cfg, flag_difficulty=args.difficulty,
-        flag_mode=args.mode)
-    if difficulty is None:
-        sys.exit(f"Couldn't detect the loaded difficulty (lives read "
-                 f"{lv}, start round {start_round}) -- pass "
-                 f"--difficulty (and --mode chimps if applicable).")
+    if args.freeplay:
+        # Freeplay: the game continued past a beaten mode, so lives/round
+        # match no rung and the counter is a bare number that climbs past
+        # 100. Skip detection -- the user names the difficulty (for the
+        # right price book / income; freeplay keeps that mode's economy)
+        # and the target round to push to.
+        difficulty = args.difficulty or "hard"
+        game_mode = "standard"
+        lv = read_lives(screen, cfg)
+        start_round = _stable_round(screen, cfg) or 1
+        target = args.final_round or 100
+        print(f"Freeplay: '{difficulty}' economy, currently ~round "
+              f"{start_round} (lives {lv}); reading the bare round counter "
+              f"and pushing to round {target}.")
+    else:
+        lv, start_round, difficulty, game_mode = detect_loaded_rung(
+            screen, cfg, flag_difficulty=args.difficulty,
+            flag_mode=args.mode)
+        if difficulty is None:
+            sys.exit(f"Couldn't detect the loaded difficulty (lives read "
+                     f"{lv}, start round {start_round}) -- pass "
+                     f"--difficulty (and --mode chimps if applicable, or "
+                     f"--freeplay for a freeplay game).")
+        target = args.final_round or campaign.rung_target(difficulty,
+                                                          game_mode)
     PRICE_DIFFICULTY = difficulty
-    target = args.final_round or campaign.rung_target(difficulty,
-                                                      game_mode)
     # One-life is a property of the RUNG, not of one startup lives read.
     # Deriving it from `lv` alone meant an unreadable-lives launch (the
     # very case the preflight tells the user to fix with --mode chimps)
@@ -3687,7 +4002,8 @@ def cmd_solve(args):
                 screen, cfg, genome, target, abort_lives=abort_lives,
                 flow_sensor=sensor, play_out=True,
                 danger_rounds=danger,
-                abilities=not args.no_abilities)
+                abilities=not args.no_abilities, one_life=one_life,
+                freeplay=getattr(args, "freeplay", False), mode=game_mode)
         except KeyboardInterrupt:
             raise
         except Exception:
@@ -3931,7 +4247,8 @@ def cmd_deploy(args):
                 screen, cfg, genome, target, abort_lives=abort_lives,
                 flow_sensor=sensor, play_out=True,
                 danger_rounds=danger,
-                abilities=not args.no_abilities)
+                abilities=not args.no_abilities, one_life=one_life,
+                freeplay=getattr(args, "freeplay", False), mode=game_mode)
         except KeyboardInterrupt:
             raise
         except Exception:
@@ -4045,6 +4362,21 @@ def cmd_learn(args):
         except Exception:
             track = None
     print(brain.report(track=track, mask_points=mask_pts))
+
+
+def cmd_graph(args):
+    """Render training progress (runs_log.jsonl + progress.json) to a
+    self-contained HTML dashboard. Pure-stdlib generator in tools/, so it
+    needs no game and no extra dependencies."""
+    tools_dir = Path(__file__).parent / "tools"
+    sys.path.insert(0, str(tools_dir))
+    import plot_progress
+    argv = []
+    if getattr(args, "out", None):
+        argv += ["--out", args.out]
+    if getattr(args, "open", False):
+        argv += ["--open"]
+    return plot_progress.main(argv)
 
 
 def cmd_play(args):
@@ -4341,6 +4673,14 @@ def main():
     p_solve.add_argument("--final-round", type=int, default=None,
                          dest="final_round",
                          help="override the rung's final round")
+    p_solve.add_argument("--freeplay", action="store_true",
+                         help="the loaded game is in FREEPLAY (past a "
+                              "beaten mode): skip lives-based rung "
+                              "detection, read the bare round counter, and "
+                              "push to --final-round. Pass --difficulty for "
+                              "the right price book (defaults to hard); "
+                              "set --final-round for the target (default "
+                              "100)")
     p_solve.add_argument("--explore", type=float, default=0.20,
                          help="base exploration rate (the campaign "
                               "policy adjusts it per episode)")
@@ -4417,6 +4757,13 @@ def main():
                          dest="final_round",
                          help="round that counts as survival (default: "
                               "the rung's final round)")
+    p_graph = sub.add_parser(
+        "graph", help="render training progress from runs_log.jsonl to a "
+                      "self-contained progress.html you can open in a browser")
+    p_graph.add_argument("--out", default=None,
+                         help="output HTML path (default: progress.html)")
+    p_graph.add_argument("--open", action="store_true",
+                         help="open the dashboard in a browser when done")
     args = parser.parse_args()
     print(f"btd6_bot build {BUILD}")
     global DEBUG
@@ -4424,7 +4771,7 @@ def main():
     {"locate": cmd_locate, "watch": cmd_watch,
      "play": cmd_play, "scan": cmd_scan, "farm": cmd_farm,
      "solve": cmd_solve, "deploy": cmd_deploy, "campaign": cmd_campaign,
-     "learn": cmd_learn}[args.command](args)
+     "learn": cmd_learn, "graph": cmd_graph}[args.command](args)
 
 
 if __name__ == "__main__":

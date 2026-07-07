@@ -54,17 +54,59 @@ def answers(genome, solutions, kind, by_round, cap=5):
     return False
 
 
-def simulate(genome, solutions, rng, quirk_carry=None):
+def anchor_spot(genome):
+    """The opening anchor's map spot -- hero, else opener, else carry, else
+    the earliest place. Matched to meta.MetaBrain._anchor_index so the
+    sim's opener wall and the brain's opener credit judge the SAME piece."""
+    places = [e for e in genome
+              if e.get("do") == "place" and e.get("at")]
+    if not places:
+        return None
+    for e in places:
+        if e["tower"] == "hero":
+            return e["at"]
+    for want in ("opener", "carry"):
+        for e in places:
+            if meta._role_of_name(e.get("name")) == want:
+                return e["at"]
+    return min(places, key=lambda e: e.get("round", 0)).get("at")
+
+
+def carry_and_amps(genome):
+    """The carry's spot and every alch/village spot -- for the synergy
+    wall's 'is support actually reaching the carry' check."""
+    places = [e for e in genome
+              if e.get("do") == "place" and e.get("at")]
+    carry = next((e["at"] for e in places
+                  if meta._role_of_name(e.get("name")) == "carry"), None)
+    amps = [e["at"] for e in places
+            if e["tower"] in ("alchemist", "village")]
+    return carry, amps
+
+
+def simulate(genome, solutions, rng, track=None, quirk_carry=None,
+             quirk_leak_bucket=None, walls=None):
     """Death round for a scheduled buy list, or None (= survived 100).
     Each wall is checked in game order; noise keeps labels honest.
 
-    quirk_carry is the HIDDEN map quirk: one strong carry family that
-    secretly underperforms here (think: a map whose line-of-sight
-    breaks that tower). No prior can know it -- only the bot's own
-    episodes can. This is what makes the sim a test of LEARNING rather
-    than of the scripted baseline."""
+    TWO hidden per-seed quirks make this a test of LEARNING, not of the
+    scripted baseline -- on orthogonal axes so the bot must learn both:
+      * quirk_carry: one carry FAMILY that secretly performs here (a
+        line-of-sight / track-shape quirk the meta can't know).
+      * quirk_leak_bucket: one high-exposure OPENER SPOT that secretly
+        leaks. The static exposure heuristic PREFERS it, so a prior-only
+        bot parks its anchor there and dies every game; only a bot whose
+        failure attribution demoted that spot (pos_post) steers away.
+    `walls` toggles individual walls off for isolation ablations."""
+    walls = walls or {}
     if rng.random() < 0.04:
         return rng.randint(10, 30)          # game chaos: bad RNG round
+    # Opener wall: the hidden leaky pocket. Fires on the anchor's spot, in
+    # the opener window (r8-18) so the brain reads it as an opener leak.
+    if walls.get("opener", True) and quirk_leak_bucket is not None:
+        a = anchor_spot(genome)
+        if a is not None and meta._bucket(a) == quirk_leak_bucket:
+            return 8 + rng.randint(0, 10)
     if not answers(genome, solutions, "camo", 22):
         return 24 + rng.randint(0, 2)
     if not answers(genome, solutions, "lead", 27):
@@ -76,11 +118,9 @@ def simulate(genome, solutions, rng, quirk_carry=None):
     types, tiers = owned_by(genome, 55)
     if max(tiers.values(), default=0) < 4:
         return 47 + rng.randint(0, 12)
-    # The hidden quirk: exactly ONE carry family actually performs on
-    # this map (think line-of-sight, track shape, camo pockets). A
-    # defense whose deep towers don't include it folds in the
-    # mid-game, whatever the meta says. No prior can know which family
-    # it is -- only played episodes can.
+    # The hidden carry quirk: exactly ONE carry family actually performs
+    # on this map. A defense whose deep towers don't include it folds in
+    # the mid-game, whatever the meta says.
     if quirk_carry:
         types60, tiers60 = owned_by(genome, 60)
         blessed_deep = any(types60[ref] == quirk_carry and t >= 4
@@ -93,9 +133,24 @@ def simulate(genome, solutions, rng, quirk_carry=None):
             return 52 + rng.randint(0, 14)
     if not answers(genome, solutions, "ceramic", 61, cap=4):
         return 63 + rng.randint(0, 15)
-    # Sustain wall: total tiers by r85 measure the whole defense.
+    # r78 milestone: the denser ceramic wave demands the defense be MOSTLY
+    # online by r76 -- a WHEN check (timing), distinct from the r85 total.
+    if walls.get("milestone", True):
+        _t76, tiers76 = owned_by(genome, 76)
+        if sum(tiers76.values()) < 12:
+            return 78 + rng.randint(0, 8)
+    # Sustain wall, synergy-multiplied: a linked alch/village MULTIPLIES
+    # the carry's firepower, so a supported defense holds with fewer raw
+    # tiers than one grinding alone -- CHIMPS can't brute-force with money.
     _types, tiers85 = owned_by(genome, 85)
-    if sum(tiers85.values()) < 15:
+    effective = sum(tiers85.values())
+    if walls.get("synergy", True):
+        carry_at, amp_ats = carry_and_amps(genome)
+        n_linked = sum(1 for a in amp_ats
+                       if carry_at
+                       and meta._dist(a, carry_at) <= 0.06 * 0.9)
+        effective *= (1.0 + 0.25 * n_linked)
+    if effective < 15:
         return 76 + rng.randint(0, 10)
     if not answers(genome, solutions, "ddt", 88):
         return 90 + rng.randint(0, 5)
@@ -106,7 +161,38 @@ def simulate(genome, solutions, rng, quirk_carry=None):
     return None
 
 
-def run_campaign(seed, episodes=60, verbose=True, learning=True):
+def anchor_score(track, pt):
+    """The score meta._spot_for gives a coverage anchor at `pt`, ignoring
+    the learned posterior (exposure biased toward killing bloons EARLY).
+    Used to find the spot a PRIOR-ONLY bot parks its opener on."""
+    exp = track.exposure(pt, 0.045)
+    sp = track.span(pt, 0.045)
+    return exp * (1.25 - 0.5 * sp[1]) if (sp and track.oriented) else exp
+
+
+def leak_bucket_for(track, pts, seed):
+    """The hidden leaky OPENER pocket: the very spot a prior-only bot's
+    anchor-placement heuristic likes BEST. So an unlearning bot parks its
+    opener there and leaks every game; only a bot whose failure
+    attribution demoted the spot (pos_post) moves to a near-equal
+    neighbour. The `seed` term only breaks ties among near-identical
+    top spots -- the leak stays the anchor's default pick so it actually
+    fires."""
+    best = {}
+    for pt in pts:
+        b = meta._bucket(pt)
+        best[b] = max(best.get(b, 0.0), anchor_score(track, pt))
+    top = sorted(best, key=lambda b: -best[b])
+    if not top:
+        return None
+    # Keep it the anchor's default (top[0]); rotate only within a hair of
+    # the best so every seed's wall still fires on the default placement.
+    near = [b for b in top if best[b] >= best[top[0]] * 0.98]
+    return near[seed % len(near)]
+
+
+def run_campaign(seed, episodes=60, verbose=True, learning=True,
+                 walls=None):
     """One simulated solve session. learning=False is the ablation: the
     brain never observes an episode (no posteriors, no evolution, no
     attempts, no model) -- pure prior-guided random search, the
@@ -131,9 +217,10 @@ def run_campaign(seed, episodes=60, verbose=True, learning=True):
     # The hidden map quirk rotates with the seed: the ONE carry family
     # that works "on this map".
     quirk = ["tack", "super", "wizard", "bomb", "glue"][seed % 5]
+    leak_bucket = leak_bucket_for(track, pts, seed)
     if verbose:
-        print(f"  (hidden quirk this seed: only a deep {quirk} "
-              f"defense holds the mid-game)")
+        print(f"  (hidden quirks this seed: only a deep {quirk} holds the "
+              f"mid-game; opener spot {leak_bucket} secretly leaks)")
     screened = 0
     for ep in range(1, episodes + 1):
         decision = policy.decide(rng) if learning \
@@ -156,15 +243,18 @@ def run_campaign(seed, episodes=60, verbose=True, learning=True):
         # decision stream -- otherwise one lucky draw repeats across
         # arms/quirks and fakes episode-1 wins.
         sim_rng = random.Random(seed * 100003 + ep)
-        death = simulate(genome, brain.solutions, sim_rng,
-                         quirk_carry=quirk)
+        death = simulate(genome, brain.solutions, sim_rng, track=track,
+                         quirk_carry=quirk, quirk_leak_bucket=leak_bucket,
+                         walls=walls)
         if learning:
             import learner
+            lbr = ({6: 1} if death is None else {6: 1, death: 0})
             row = {"mode": "solve", "map": "sim_map",
                    "difficulty": "hard", "game_mode": "chimps",
                    "target_round": 100, "start_round": 6,
                    "outcome": "defeat" if death else "victory",
                    "final_round": death if death else 100,
+                   "lives_by_round": lbr,
                    "strategy": brain.last_strategy,
                    "towers": learner.towers_from_genome(genome)}
             brain.observe(row, quiet=True)
@@ -200,6 +290,7 @@ def run_deploy(seed, train_episodes=60, games=25, verbose=True):
     pool = ["dart", "tack", "bomb", "sniper", "ninja", "wizard", "druid",
             "alchemist", "glue", "ice"] + meta.META_EXTRA_TOWERS
     quirk = ["tack", "super", "wizard", "bomb", "glue"][seed % 5]
+    leak_bucket = leak_bucket_for(track, pts, seed)
 
     # An untrained model has no champion -- the gate `deploy` enforces
     # before ever starting a game.
@@ -231,13 +322,15 @@ def run_deploy(seed, train_episodes=60, games=25, verbose=True):
                                        novelty=decision.get("novelty",
                                                             False))
         sim_rng = random.Random(seed * 100003 + ep)
-        death = simulate(genome, brain.solutions, sim_rng,
-                         quirk_carry=quirk)
+        death = simulate(genome, brain.solutions, sim_rng, track=track,
+                         quirk_carry=quirk, quirk_leak_bucket=leak_bucket)
         row = {"mode": "solve", "map": "sim_map", "difficulty": "hard",
                "game_mode": "chimps", "target_round": 100,
                "start_round": 6,
                "outcome": "defeat" if death else "victory",
                "final_round": death if death else 100,
+               "lives_by_round": ({6: 1} if death is None
+                                  else {6: 1, death: 0}),
                "strategy": brain.last_strategy,
                "towers": learner.towers_from_genome(genome)}
         brain.observe(row, quiet=True)
@@ -259,8 +352,8 @@ def run_deploy(seed, train_episodes=60, games=25, verbose=True):
                                       tower_pool=pool, hero=True)
         assert genome is not None, "trained model lost its champion"
         sim_rng = random.Random(seed * 7919 + g * 101 + 1)
-        death = simulate(genome, brain.solutions, sim_rng,
-                         quirk_carry=quirk)
+        death = simulate(genome, brain.solutions, sim_rng, track=track,
+                         quirk_carry=quirk, quirk_leak_bucket=leak_bucket)
         wins += 1 if death is None else 0
         if verbose:
             print(f"  deploy game {g:>2}: "
@@ -282,7 +375,18 @@ def main():
                          "straight (no exploration, no learning) and "
                          "confirm the finished model wins on its own")
     ap.add_argument("-q", "--quiet", action="store_true")
+    ap.add_argument("--no-opener-wall", action="store_true",
+                    help="disable the hidden leaky-opener wall (isolate "
+                         "the opener/real-estate lever)")
+    ap.add_argument("--no-synergy-wall", action="store_true",
+                    help="disable the synergy-multiplied sustain wall "
+                         "(isolate the support-synergy lever)")
+    ap.add_argument("--no-milestone-wall", action="store_true",
+                    help="disable the r78 timing milestone wall")
     args = ap.parse_args()
+    walls = {"opener": not args.no_opener_wall,
+             "synergy": not args.no_synergy_wall,
+             "milestone": not args.no_milestone_wall}
     if args.deploy:
         total_w = total_g = solved = 0
         for seed in range(args.seeds):
@@ -313,7 +417,7 @@ def main():
     wins, ablated = [], []
     for seed in range(args.seeds):
         won_at, screened = run_campaign(seed, episodes=args.episodes,
-                                        verbose=not args.quiet)
+                                        verbose=not args.quiet, walls=walls)
         if won_at:
             print(f"seed {seed}: CHIMPS (sim) beaten at episode "
                   f"{won_at} (model screened {screened} episodes)")
@@ -322,7 +426,8 @@ def main():
             print(f"seed {seed}: NOT beaten in {args.episodes} episodes")
         if args.ablate:
             base_at, _ = run_campaign(seed, episodes=args.episodes,
-                                      verbose=False, learning=False)
+                                      verbose=False, learning=False,
+                                      walls=walls)
             ablated.append(base_at)
             print(f"   ablation (no learning): "
                   + (f"episode {base_at}" if base_at

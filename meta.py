@@ -46,6 +46,25 @@ PRIOR_STRENGTH = 6.0
 GLOBAL_CAP = 4.0
 GLOBAL_PATH_CAP = 3.0
 
+# Failure attribution (credit assignment). A defeat no longer folds one
+# scalar equally onto every tower: the reward is docked for the tower
+# actually responsible for the round the run died on, so the bandit
+# learns WHICH piece failed, not just that the layout did. A win still
+# credits everyone fully -- these only ever apply to defeats. Kept small
+# and asymmetric (an in-time answer keeps full credit) so a good species
+# is never demoted for a death it did not cause.
+EARLY_WINDOW = 14        # a defeat within this many rounds of the start
+#                          counts as an OPENER leak, not a role failure.
+DPS_ZONE = 45            # a mid/late defeat at/after this round, with its
+#                          threats already answered, is a raw-DPS wall.
+BLAME_ABSENT = 0.25      # owed the killing threat's answer, never built it
+BLAME_CARRY = 0.20       # a DPS wall (threats answered) -> the carry
+BLAME_UNLINKED = 0.12    # an amplifier standing in range of nobody
+LEAK_FLOOR = 0.05        # an opener that leaked early: near-zero credit,
+LEAK_WEIGHT = 2.5        # ...folded with strong confidence so ONE leak is
+#                          enough to steer the spot off the prime pocket.
+AMPLIFIERS = frozenset({"alchemist", "village"})
+
 # Version handshake with mk.py. A stale meta.py sitting next to a newer
 # mk.py (mixed zip extractions, leftover __pycache__) once CRASHED every
 # episode with a TypeError; mk.py now checks this and degrades politely.
@@ -214,6 +233,38 @@ def _dist(a, b):
     return math.hypot(a[0] - b[0], (a[1] - b[1]) * ASPECT)
 
 
+def _role_of_name(name):
+    """The role tag baked into a logged tower name like 'tack#1(carry)',
+    or None. Lets credit assignment recover a tower's role after the fact
+    without threading strategy state through the runs log."""
+    if not name:
+        return None
+    i, j = name.rfind("("), name.rfind(")")
+    return name[i + 1:j] if 0 <= i < j else None
+
+
+def _covers(ttype, path, kind, solutions):
+    """Does one tower (type + path tiers) answer `kind`? The single-tower
+    coverage test shared by attempt_genome's repair and observe's credit
+    assignment: a solver whose requirement is None answers by existing; a
+    tiered requirement answers once that path reaches the required tier."""
+    req = (solutions.get(kind) or {}).get(ttype, "absent")
+    if req is None:
+        return True
+    return req != "absent" and bool(path) and path[req[0]] >= req[1]
+
+
+def _buddy_linked(at, ttype, layout, k):
+    """Is an amplifier at `at` within buff range of any teammate? Mirrors
+    learner.features' buddy_linked_frac geometry (an alch brew that reaches
+    nobody buffs nobody), so the reward can dock a dead support buy."""
+    prof = (k.get("towers", {}).get(ttype, {}).get("placement")) or {}
+    r = prof.get("range") or 0.06
+    return any(o_at is not None and o_at is not at
+               and _dist(at, o_at) <= r * 0.9
+               for _o_tt, o_at, _o_path in layout)
+
+
 # Minimum spacing between planned towers, in width-fractions. A tower
 # footprint is ~0.013 wide-radius, so two centers need ~0.028 -- the old
 # 0.015 planned towers ON TOP of each other and the executor burned a
@@ -222,16 +273,19 @@ SEP = 0.028
 SEP_LARGE = 0.045
 
 
-def _spread(cands, taken, sep):
-    """Candidates at least sep away from every taken spot; if none
-    qualify, the single candidate FARTHEST from the layout (never an
-    overlapping one at random)."""
+def _spread(cands, taken, sep, pull=None):
+    """Candidates at least sep away from every taken spot. If none qualify,
+    fall back to a single candidate: the one NEAREST `pull` when given (a
+    buffer must stay next to its carry even in a tight cluster), otherwise
+    the one FARTHEST from the layout (never an overlapping one at random)."""
     free = [c for c in cands
             if all(_dist(c, t) >= sep for t in taken)]
     if free:
         return free
     if not taken or not cands:
         return cands
+    if pull is not None:
+        return [min(cands, key=lambda c: _dist(c, pull))]
     return [max(cands, key=lambda c: min(_dist(c, t) for t in taken))]
 
 
@@ -441,9 +495,9 @@ class MetaBrain:
                 and row.get("game_mode", "standard") == self.mode)
 
     @staticmethod
-    def _fold(post, key, r, init=None):
+    def _fold(post, key, r, init=None, w=1.0):
         a, b = post.setdefault(key, list(init) if init else [0.0, 0.0])
-        post[key] = [a + r, b + (1.0 - r)]
+        post[key] = [a + w * r, b + w * (1.0 - r)]
 
     def observe(self, row, quiet=False):
         """Fold one episode row (runs_log.jsonl format) into the
@@ -471,20 +525,22 @@ class MetaBrain:
                 del self.seed_rows[5:]
             return
         r = self._reward(row)
-        for t in row["towers"]:
+        credit = self._credit(row, r)
+        for idx, t in enumerate(row["towers"]):
             ttype = t.get("tower", "").lower()
             if not ttype:
                 continue
-            self._fold(self.t_post, ttype, r)
+            r_i, w_i = credit[idx]
+            self._fold(self.t_post, ttype, r_i, w=w_i)
             path = t.get("path") or [0, 0, 0]
             if max(path) > 0:
-                self._fold(self.p_post, (ttype, path.index(max(path))), r,
-                           init=[1.0, 1.0])
+                self._fold(self.p_post, (ttype, path.index(max(path))), r_i,
+                           init=[1.0, 1.0], w=w_i)
             if max(path) >= 4:
-                self._fold(self.d_post, ttype, r)
+                self._fold(self.d_post, ttype, r_i, w=w_i)
             if t.get("at"):
-                self._fold(self.pos_post, _bucket(t["at"]), r,
-                           init=[1.0, 1.0])
+                self._fold(self.pos_post, _bucket(t["at"]), r_i,
+                           init=[1.0, 1.0], w=w_i)
         self.history.append(row)
         if self._income_curve is not None:
             self._income_curve.fit(self.history)
@@ -493,6 +549,120 @@ class MetaBrain:
             n = len(self.history)
             print(f"   [brain] learned from episode "
                   f"(reward {r:.2f}, {n} total on this rung)")
+
+    # --------------------------------------------------- credit assignment
+
+    def _threat_kind_near(self, death, margin=4):
+        """The kind of the known threat nearest a death round, or None when
+        nothing is within `margin` (an early leak or a raw-DPS wall, not a
+        specific role failure). Uses learner.threat_near when present so the
+        two modules agree; falls back to an inline scan otherwise."""
+        if death is None:
+            return None
+        if learner_mod is not None:
+            t = learner_mod.threat_near(death, self.threats, margin=margin)
+            return t.get("kind") if t else None
+        near, best_d = None, margin + 1
+        for t in self.threats:
+            for r_ in t.get("rounds", []):
+                if abs(r_ - death) < best_d:
+                    near, best_d = t, abs(r_ - death)
+        return near.get("kind") if near else None
+
+    def _anchor_index(self, towers, carry_i):
+        """The tower expected to hold the opening rounds -- the hero if one
+        anchors, else the tower tagged 'opener', else the carry. Its early
+        leak (and its spot) take the harshest blame."""
+        for i, t in enumerate(towers):
+            if (t.get("tower") or "").lower() == "hero":
+                return i
+        for i, t in enumerate(towers):
+            if _role_of_name(t.get("name")) == "opener":
+                return i
+        return carry_i
+
+    def _credit(self, row, r_base):
+        """Per-tower (reward, weight) for the LOCAL posteriors -- failure
+        attribution. A win (or an unknown ending) credits every tower with
+        the base reward, exactly as before. A defeat docks the tower
+        responsible for the round it died on: the missing/shallow answer to
+        the nearest threat, the carry on a raw-DPS wall, an amplifier that
+        buffs nobody, and -- hardest -- the opener on an early leak (its
+        species AND its map spot, so the bot learns the pocket is bad). All
+        others keep the base reward. Returns a list parallel to
+        row['towers']."""
+        towers = row.get("towers", [])
+        base = [(r_base, 1.0) for _ in towers]
+        if row.get("outcome") not in ("defeat",):
+            return base
+        death = row.get("final_round")
+        if death is None:
+            return base
+        start = int(row.get("start_round") or self.start_round)
+        kind = self._threat_kind_near(death)
+        early_leak = death <= start + EARLY_WINDOW
+        layout = [((t.get("tower") or "").lower(), t.get("at"),
+                   t.get("path") or [0, 0, 0]) for t in towers]
+        # Did the layout already answer the threat nearest the death? If so
+        # that threat is NOT what killed it -- the wall was raw DPS, and the
+        # blame belongs to the carry, not to a checkbox that was already
+        # ticked. (This is what keeps a glue carry -- also a ceramic
+        # answerer -- from reading a mid-game DPS death as "glue failed
+        # ceramic" and burying the map's one good core.)
+        covered_kill = bool(kind) and any(
+            _covers(tt, p, kind, self.solutions) for tt, _at, p in layout)
+        dps_wall = (not early_leak) and death >= DPS_ZONE \
+            and (kind is None or covered_kill)
+        non_hero = [(i, t) for i, t in enumerate(towers)
+                    if (t.get("tower") or "").lower() != "hero"]
+        carry_i = (max(non_hero,
+                       key=lambda it: (max(it[1].get("path") or [0]), -it[0]))[0]
+                   if non_hero else None)
+        anchor_i = self._anchor_index(towers, carry_i)
+        out = []
+        for i, t in enumerate(towers):
+            tt = (t.get("tower") or "").lower()
+            is_carry = (i == carry_i)
+            r_i, w_i = r_base, 1.0
+            # An UNANSWERED killing threat -> the support that owed the
+            # answer (a solver species that never got upgraded deep enough
+            # to count). Never the carry: coverage is a support role.
+            if kind and not covered_kill and not is_carry \
+                    and tt in (self.solutions.get(kind) or {}):
+                r_i -= BLAME_ABSENT
+            # Died in the DPS zone with the threats already handled -> the
+            # carry's family/depth is the problem, not a missing answer.
+            if dps_wall and is_carry:
+                r_i -= BLAME_CARRY
+            if tt in AMPLIFIERS and t.get("at") \
+                    and not _buddy_linked(t["at"], tt, layout, self.k):
+                r_i -= BLAME_UNLINKED
+            if early_leak and i == anchor_i:
+                r_i, w_i = min(r_i, LEAK_FLOOR), LEAK_WEIGHT
+            out.append((min(max(r_i, 0.0), 1.0), w_i))
+        return out
+
+    def coverage_gaps(self, towers):
+        """Per-kind coverage report for a layout: which threats it answers
+        and the round each must be answered by. The inspectable form of the
+        role reasoning the plan is built on -- 'have MOAB damage, NO camo
+        answer by r24' rather than a pile of upgrades -- surfaced by the
+        `learn` report and mirrored in the outcome model's features.
+        `towers` is a list of {tower, path} (a plan or a logged layout)."""
+        layout = [((t.get("tower") or "").lower(),
+                   t.get("path") or [0, 0, 0]) for t in towers]
+        gaps = {}
+        for kind in ("camo", "lead", "moab", "ceramic", "ddt", "bad"):
+            first = min((r for t in self.threats if t["kind"] == kind
+                         for r in t["rounds"]), default=None)
+            if first is None or first > self.target:
+                continue
+            gaps[kind] = {
+                "first_round": first,
+                "deadline": max(1, first - 2),
+                "covered": any(_covers(tt, p, kind, self.solutions)
+                               for tt, p in layout)}
+        return gaps
 
     def elites(self, top=8):
         """Best layouts of this rung, best-then-recent first. While the
@@ -589,35 +759,69 @@ class MetaBrain:
                 best, best_w = c, w
         return list(best)
 
+    def _pos_mean(self, pt):
+        """The learned value of a spot's region as a DETERMINISTIC mean, not
+        a Thompson draw. Used to weight anchor placement: an unseen spot
+        (mean 0.5) must not randomly swing the choice off the highest-coverage
+        candidate, while a spot the posterior has learned is bad still scores
+        low. Exploration of anchor spots is the explore branch's job, not
+        this scorer's."""
+        ba, bb = self.pos_post.get(_bucket(pt), [1.0, 1.0])
+        return ba / (ba + bb)
+
     def _pos_theta(self, rng, pt):
         ba, bb = self.pos_post.get(_bucket(pt), [1.0, 1.0])
         return _beta(rng, ba, bb)
 
     def _spot_for(self, rng, ttype, pools, taken, placed, track,
-                  large=False):
+                  large=False, anchor=False, cluster=False):
         """Style-aware placement. `placed` is [(ttype, spot), ...] already
         assigned in this layout. Scores candidates by what the tower
         actually wants -- track coverage for DPS, just-upstream coverage
         for debuffers, buff adjacency for alch/village, late track for
         spikes, remoteness for global towers -- multiplied by the learned
-        per-region posterior, so experience still bends the geometry."""
+        per-region posterior, so experience still bends the geometry.
+
+        `anchor` (hero/opener/carry) gates the candidate pool to the top
+        exposure band before scoring: the opener has to actually hold the
+        opening rounds, so it may only stand where it sees a lot of track
+        -- an enforced floor, not a soft nudge. The learned posterior then
+        chooses AMONG those high-coverage spots (and demotes any that
+        proved leaky)."""
         if track is None or not track.ok:
             self._last_spot_src = "no-track"
-            return self._pick_spot(rng, pools, taken, large=large)
-        if rng.random() < self.explore:
-            self._last_spot_src = "explore"
             return self._pick_spot(rng, pools, taken, large=large)
         prof = self.towers.get(ttype, {}).get("placement") \
             or (HERO_PLACEMENT if ttype == "hero" else {})
         style = prof.get("style", "coverage")
         r = prof.get("range") or 0.06
-        if large:
+        if style == "buddy":
+            # A buffer exists to stand next to the carry, which sits on a
+            # near/mid TRACK spot -- but a LARGE buffer (village) drawing
+            # only from the `roomy` interior can never reach it (on a real
+            # mask near-track spots are never roomy). Draw buddies from the
+            # track rings: the large ones from (near|mid) that are ALSO
+            # roomy (so the executor's roomy-snap is a no-op and they stay
+            # near the carry), the small ones from near|mid|roomy (so an
+            # alchemist can also reach a carry that itself sits in roomy).
+            near = pools.get("near") or []
+            mid = pools.get("mid") or []
+            roomy = pools.get("roomy") or []
+            seen, base = set(), []
+            for p in near + mid + roomy:
+                if tuple(p) not in seen:
+                    seen.add(tuple(p))
+                    base.append(p)
+            base = base or pools.get("all") or []
+        elif large:
             base = pools.get("roomy") or pools.get("all") or []
         else:
             base = ((pools.get("near") or []) + (pools.get("mid") or [])) \
                 or pools.get("all") or []
         if not base:
             return None
+        carries = set(self.roles.get("carry", []))
+        carry_spot = next((s for t, s in placed if t in carries and s), None)
         cands = [rng.choice(base) for _ in range(min(70, len(base)))]
         if style == "buddy" and placed:
             # A random sample can easily miss the small disc around the
@@ -629,12 +833,54 @@ class MetaBrain:
             if nearby:
                 cands = [rng.choice(nearby)
                          for _ in range(min(30, len(nearby)))] + cands[:20]
-        cands = _spread(cands, taken, SEP_LARGE if large else SEP)
+        cands = _spread(cands, taken, SEP_LARGE if large else SEP,
+                        pull=carry_spot if style == "buddy" else None)
+        # Keep towers that shoot bloons ON the track: drop candidates that
+        # see essentially NONE of it (the same near-zero-exposure test the
+        # learner uses), so neither the scorer NOR exploration ever parks a
+        # DPS tower or debuffer in a dead corner with no track in range.
+        # Buffers (buddy) and global towers (offside) belong OFF the line,
+        # so they skip this. It's a floor, not a ranking -- a well-placed
+        # upstream debuffer on a modest-exposure spot still qualifies; only
+        # the genuinely off-track spots are removed.
+        if style in ("coverage", "upstream", "downstream") \
+                and len(cands) > 3:
+            on_track = [c for c in cands if track.exposure(c, r) >= 0.005]
+            if len(on_track) >= 2:
+                cands = on_track
+        roomy_near = None
+        if anchor and len(cands) > 2:
+            # Exposure floor: keep only the top ~40% by track coverage, so an
+            # anchor (hero/opener/carry) always sees a lot of track.
+            ranked = sorted(cands, key=lambda c: -track.exposure(c, r))
+            cands = ranked[:max(2, int(len(ranked) * 0.4))]
+        if cluster:
+            # ONLY the carry gets nudged toward a spot a support tower can
+            # cluster on -- a roomy, village-placeable spot within buff range.
+            # The hero and opener are PURE coverage: never pull them off the
+            # best lane spot toward open ground (that once parked the hero in
+            # a low-coverage corner).
+            roomy = pools.get("roomy") or []
+            if roomy:
+                def roomy_near(c, _r=roomy):
+                    return any(_dist(c, rp) <= 0.066 for rp in _r)
+        if cands and rng.random() < self.explore:
+            # Explore, but only AMONG the on-track candidates above. The old
+            # branch sampled raw buildable spots here and frequently placed
+            # towers with no track in range; exploration should vary WHICH
+            # good spot, not whether the tower can see the track at all. A
+            # buffer explores only among spots that still cover the carry, so
+            # exploration never breaks the link it exists to make.
+            self._last_spot_src = "explore"
+            if style == "buddy" and carry_spot is not None:
+                in_range = [c for c in cands
+                            if _dist(c, carry_spot) <= r * 0.9]
+                return list(rng.choice(in_range or cands))
+            return list(rng.choice(cands))
 
-        # The carry anchors the geometry for debuffers and buffers.
-        carries = set(self.roles.get("carry", []))
-        carry_spot = next((s for t, s in placed if t in carries and s),
-                          None)
+        # The carry (found above) anchors the geometry for debuffers and
+        # buffers -- its covered track span orients upstream/downstream and
+        # the buddy overlap term.
         carry_span = None
         if carry_spot is not None:
             carry_r = (self.towers.get(
@@ -665,7 +911,26 @@ class MetaBrain:
                 mates = sum((2.0 if t in carries else 1.0)
                             for t, spot in placed
                             if spot and _dist(c, spot) <= r * 0.9)
-                s = mates + 0.15 * exp
+                if carry_spot is not None:
+                    # A buffer's whole job is to reach the carry. Every spot
+                    # whose buff disc covers the carry outranks every spot
+                    # that doesn't (2.0*covers dominates the 0.05*exp tie-
+                    # break), then proximity + how much of the carry's kill
+                    # zone the disc overlaps decide -- so it never degenerates
+                    # to "wherever it sees the most track", the old bug.
+                    d = _dist(c, carry_spot)
+                    covers = 1.0 if d <= r * 0.9 else 0.0
+                    prox = max(0.0, 1.0 - d / (r * 0.9))
+                    ov = 0.0
+                    if carry_span and track.oriented:
+                        sp = track.span(c, r)
+                        if sp:
+                            ov = max(0.0, min(sp[2], carry_span[2])
+                                     - max(sp[0], carry_span[0]))
+                    s = 2.0 * covers + prox + 0.6 * ov + 0.3 * mates \
+                        + 0.05 * exp
+                else:
+                    s = mates + 0.15 * exp
             elif style == "downstream":
                 sp = track.span(c, r)
                 late = sp[1] if (sp and track.oriented) else 0.5
@@ -681,11 +946,22 @@ class MetaBrain:
                         # the entry leaves room for error; a defense
                         # camped at the exit pops with zero margin.
                         s *= 1.25 - 0.50 * sp[1]
-            # Learned-region posterior nudges the score +/-20%. (It once
-            # swung 0.5x-1.5x, which drowned out the small absolute
-            # exposure differences of short-range towers -- heroes were
-            # landing on 1%-coverage spots on pure noise.)
-            s *= 0.8 + 0.4 * self._pos_theta(rng, c)
+            # Learned-region posterior nudges the score. For most towers it
+            # only swings +/-20% via a Thompson draw (a wider swing once
+            # drowned out short-range towers' small exposure differences). The
+            # ANCHOR uses the deterministic posterior MEAN, not a draw: among
+            # the exposure-gated candidates the HIGHEST-coverage spot must win
+            # on a fresh run (random draws once parked the hero on a mediocre
+            # corner), while a spot the posterior has LEARNED is bad (a leaked
+            # opener) still scores near zero and gets vacated.
+            if anchor:
+                s *= 0.15 + 0.85 * self._pos_mean(c)
+                if roomy_near is not None and roomy_near(c):
+                    s *= 1.25          # carry nudge toward cluster-able (it's
+                    #                    already exposure-gated, so coverage
+                    #                    barely moves; the hero never gets this)
+            else:
+                s *= 0.8 + 0.4 * self._pos_theta(rng, c)
             if s > best_s:
                 best, best_s = c, s
         if best is None:
@@ -697,17 +973,23 @@ class MetaBrain:
     def _placement_order(self, picks):
         """Spot-assignment order: the carry anchors first, coverage DPS
         next, then debuffers/cleanup that position relative to it, and
-        buffers last (they need to see where everyone sits)."""
+        buffers last (they need to see where everyone sits) -- but FILLER
+        dead last of all. Prime, high-coverage real estate is scarce; a
+        free-slot dart must never claim a spot the carry or a support tower
+        still needs, which the old 'coverage style ranks 1' let it do."""
         rank = {"coverage": 1, "upstream": 2, "downstream": 3,
                 "offside": 4, "buddy": 5}
         carries = set(self.roles.get("carry", []))
 
         def key(i):
             ttype, role = picks[i]
+            if role == "carry" or ttype in carries:
+                return (0, i)
+            if role == "free":
+                return (9, i)          # filler after every claimed role
             style = (self.towers.get(ttype, {}).get("placement")
                      or {}).get("style", "coverage")
-            return (0 if (role == "carry" or ttype in carries)
-                    else rank.get(style, 1), i)
+            return (rank.get(style, 1), i)
         return sorted(range(len(picks)), key=key)
 
     def _pick_build(self, rng, ttype):
@@ -1053,6 +1335,23 @@ class MetaBrain:
             if e["do"] == "place" and e["ref"] in min_by:
                 e["round"] = min(e["round"], min_by[e["ref"]])
                 place_round[e["ref"]] = e["round"]
+        # No-leak opener: the single most important anchor (hero, else the
+        # opener, else the carry) must be DOWN by the start round. CHIMPS
+        # begins at round 6 with one life -- an anchor the income curve
+        # would park at round 8 leaks rounds 6-7 it can never recover.
+        places = [e for e in entries if e["do"] == "place"]
+        anchor = None
+        for want in ("hero", "opener", "carry"):
+            anchor = next((e for e in places
+                           if _role_of_name(e.get("name")) == want), None)
+            if anchor:
+                break
+        if anchor is None and places:
+            anchor = min(places, key=lambda e: (e["round"], e["prio"]))
+        if anchor is not None:
+            anchor["round"] = min(anchor["round"], self.start_round)
+            anchor["_anchor"] = True
+            place_round[anchor["ref"]] = anchor["round"]
         for e in entries:
             if e["do"] == "upgrade":
                 e["round"] = max(e["round"], place_round.get(e["ref"], 1))
@@ -1071,9 +1370,11 @@ class MetaBrain:
         spots, spot_src = {}, {}
         taken, placed_ctx = [], []
         for i in self._placement_order(picks):
-            ttype = picks[i][0]
+            ttype, role = picks[i]
             spot = self._spot_for(rng, ttype, pools, taken, placed_ctx,
-                                  track, large=ttype in large_towers)
+                                  track, large=ttype in large_towers,
+                                  anchor=role in ("hero", "opener", "carry"),
+                                  cluster=role == "carry")
             if spot is None:
                 continue
             spots[i] = spot
@@ -1438,22 +1739,10 @@ class MetaBrain:
         # 2. Hazard repair: what killed this layout last time?
         death = row.get("final_round") \
             if row.get("outcome") == "defeat" else None
-        kind = None
-        if death is not None:
-            near, best_d = None, 5
-            for t in self.threats:
-                for r_ in t.get("rounds", []):
-                    if abs(r_ - death) < best_d:
-                        near, best_d = t, abs(r_ - death)
-            kind = near["kind"] if near else None
+        kind = self._threat_kind_near(death)
         def covers(kind_, layout):
-            solvers_ = self.solutions.get(kind_, {})
-            for tt, path in layout:
-                req = solvers_.get(tt, "absent")
-                if req is None or (req != "absent"
-                                   and path[req[0]] >= req[1]):
-                    return True
-            return False
+            return any(_covers(tt, path, kind_, self.solutions)
+                       for tt, path in layout)
         boosted = False
         if death is not None and kind and kind in self.solutions:
             solvers = self.solutions[kind]
@@ -1648,6 +1937,19 @@ class MetaBrain:
                 lines.append(f"  r{row.get('final_round')} "
                              f"({row.get('outcome')}, reward {rw:.2f}): "
                              f"{kinds}")
+            # The champion's role reasoning: which threats it answers and
+            # which it still leaves open before each deadline -- the "have
+            # MOAB damage, no camo answer by r24" view of the plan.
+            gaps = self.coverage_gaps(el[0][1].get("towers", []))
+            if gaps:
+                have = [k for k, g in gaps.items() if g["covered"]]
+                miss = [f"{k}(by r{g['deadline']})"
+                        for k, g in gaps.items() if not g["covered"]]
+                lines.append(
+                    "  champion role coverage: "
+                    + ("have " + ", ".join(have) if have else "nothing yet")
+                    + ("; MISSING " + ", ".join(miss) if miss
+                       else "; all threats answered"))
         deaths = [r.get("final_round") for r in self.history
                   if r.get("outcome") == "defeat"
                   and r.get("final_round")]

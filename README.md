@@ -118,6 +118,24 @@ once; after that your daily loop is just steps 6–8.
     python mk.py learn monkey_meadow            # add --mode chimps for that rung
     ```
 
+10b. **Visualize progress** — turn the training log into a dashboard you can
+    open in a browser (no game, no dependencies, no server):
+
+    ```
+    python mk.py graph            # writes progress.html
+    python mk.py graph --open     # ...and opens it
+    ```
+
+    It reads `runs_log.jsonl` and `progress.json` and draws, per map + mode:
+    a hero number (deepest round reached) and KPI tiles, **progress over
+    episodes** (each run's deepest round, the running personal best, wins,
+    the target line — the "is it learning?" picture), **where runs end** (a
+    histogram of the round each run reached), **outcomes** (victory / defeat /
+    lost track / crashed), the **best run's** lives and cash by round, and the
+    **campaign ladder** from `progress.json`. Charts have hover tooltips, a
+    table view, and light/dark themes. The page is self-contained — the same
+    generator is `python tools/plot_progress.py`.
+
 11. **When the research spreadsheet gets a new version**, regenerate the
     knowledge base (needs `pip install openpyxl`):
 
@@ -131,6 +149,9 @@ once; after that your daily loop is just steps 6–8.
     python meta.py selftest
     python learner.py selftest
     python campaign.py selftest
+    python tools/test_cash_floor.py                     # cash-misread guard
+    python tools/test_placement_avoid.py                # never-stack-towers guard
+    python tools/test_plot_progress.py                  # progress-dashboard math
     python tools/simulate_solve.py --seeds 5 --ablate   # end-to-end sim
     python tools/simulate_solve.py --deploy --seeds 5   # deploy path
     ```
@@ -605,24 +626,33 @@ game:
 python tools/simulate_solve.py --seeds 10 --episodes 120 --ablate
 ```
 
-The real brain/policy/repair stack must beat a hidden-quirk CHIMPS sim
-(each seed hides a different "only this carry works here" quirk no prior
-can know) on every seed, and the `--ablate` flag re-runs each seed with
-learning disabled to prove the learning pulls its weight. Two measured
-results, both reproducible with the command above:
+The real brain/policy/repair stack must beat a hidden-quirk CHIMPS sim on
+every seed, and the `--ablate` flag re-runs each seed with learning
+disabled to prove the learning pulls its weight. Each seed hides **two**
+quirks no prior can know, on orthogonal axes — a carry FAMILY that
+secretly works on this map ("only a deep glue holds the mid-game") and a
+high-exposure OPENER SPOT that secretly leaks. Both are invisible to the
+spreadsheet meta; only failure attribution — crediting the round a run
+died on to the piece actually responsible, and demoting the map spot an
+opener leaked from — learns its way around them. Two measured results,
+both reproducible with the command above:
 
 - **Robustness (the headline).** At the tighter default 60-episode
-  budget, learning solves all 10/10 seeds while prior-only search fails
-  the hidden-quirk seeds it can't stumble into (typically 2/10 unsolved
-  in budget). Learning's real value is finding the off-meta core the
-  map demands, not a faster easy win.
-- **Speed.** At a generous 120-episode budget where prior-only search
-  eventually solves every seed too, learning still gets there ~2.5×
-  faster — mean **8.1** episodes vs **20.1** without.
+  budget, learning solves all **10/10** seeds while prior-only search
+  fails the seed whose off-meta core and safe opener it can't stumble
+  into in budget (typically **9/10**). Learning's value is finding the
+  core and the leak-free opening the map demands, not a faster easy win.
+- **Convergence.** At the generous 120-episode budget prior-only search
+  eventually clears every seed too — but only by blundering through the
+  leaky opener spot and the wrong cores until luck lands a clean run. The
+  learning stack converges without those wasted runs, and the trained
+  champion then wins the sim ~2/3 of the time replayed straight
+  (`--deploy`), its opener having been learned *off* the leaky pocket.
 
-(Beware the ablation's mean-episodes number at tight budgets: it
-averages only the seeds it *did* solve — the easy ones — so it can read
-deceptively low while quietly abandoning the hard maps.)
+(Beware the ablation's mean-episodes number: at tight budgets it averages
+only the seeds it *did* solve — the easy ones — so it reads deceptively
+low while quietly abandoning the hard maps; the honest scoreboard is
+seeds-solved, not mean episodes.)
 
 ## Plan file format
 
@@ -703,6 +733,20 @@ window hasn't been moved since calibration.
   re-checked visually after ~45 s of blocking a buy — one menu open, and
   a green-row sighting overwrites the bad value (a `$210` recorded as
   `$2105` no longer gates the upgrade forever).
+- **A low cash misread can't freeze the buy plan (`cashguard.py`).** The
+  wallet only ever *rises* except through purchases, and every purchase is
+  reported through one choke point, so `floor = last confirmed read − spent
+  since` is a *provable* lower bound on current cash. A read far below the
+  floor — the classic clipped leading digit, `$2,340` read as `340`, which
+  reads low but perfectly "valid" so no range check catches it — is judged a
+  misread: the bot corroborates it and, if it stays low, spends against the
+  floor instead of hoarding behind a phantom-broke wallet and leaking. The
+  floor is seeded at the start and re-anchored to the true level every round;
+  a correct read always passes through untouched. This is the one piece of
+  the cash pipeline that is pure arithmetic, so it has an offline unit test
+  (`python tools/test_cash_floor.py`). The per-round box re-check also
+  re-derives the whole counter box from the coin/heart HUD landmarks, so
+  drift and right-edge clips are recovered, not just clean leading clips.
 - **Money-failure watermarks are misread-proof.** When a buy fails on
   cash, the bot notes the cash level and holds spending until income
   clears it — but the noted level is capped at the item's known price
@@ -721,6 +765,17 @@ window hasn't been moved since calibration.
   died. Defeat is detected by the lives counter (auto-located from the
   red heart icon) hitting 0, because the round counter stays visible on
   the defeat screen and can't be the signal.
+- **Never stack a tower on an occupied spot (`placement.py`).** Before
+  clicking, a placement drops every candidate spot within a tower-sized
+  radius of one already taken — a monkey placed this run, or one a *probe*
+  caught — and when the whole planned neighborhood is full it relocates to
+  the nearest genuinely-free mask point instead of clicking a tower and
+  failing. When a placement still can't find a home, the executor clicks the
+  planned spot with no ghost held: if an upgrade panel pops open, a monkey is
+  sitting there, so that point is blacklisted for the rest of the run and no
+  later buy wastes clicks on it again. This stops the "try to place on top of
+  an existing tower a couple times, then give up" loop. The pure geometry has
+  an offline test (`python tools/test_placement_avoid.py`).
 - **Stuck-panel recovery.** Upgrades verify the tower got selected and the
   panel closed afterwards, deselect clicks go to mask points far from
   every tower, and if the HUD ever stays dark mid-run the main loop
