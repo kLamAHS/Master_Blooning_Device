@@ -724,7 +724,8 @@ def _snap_cash_box_to_digits(screen, box, min_x=0.0):
     the scale, and the result must pass _plausible_cash_shape or the
     snap returns nothing rather than an inflated box."""
     x, y, w, h = box
-    wide = [max(min_x, x - h), max(0.0, y - 0.3 * h), w + 2 * h, h * 1.6]
+    wide = [max(min_x, x - 1.3 * h), max(0.0, y - 0.3 * h),
+            w + 2.3 * h, h * 1.6]
     crop = screen.grab(wide)
     proc = preprocess_round_crop(crop)
     try:
@@ -761,10 +762,16 @@ def _snap_cash_box_to_digits(screen, box, min_x=0.0):
     dy1 = min(d[2] for d in digits) / scale
     dy2 = max(d[4] for d in digits) / scale
     bh = max(dy2 - dy1, 8)
-    nx0 = wide[0] + max(0.0, dx1 - 0.25 * bh) / screen.w
+    # Leave ~0.7 digit-widths of slack on the LEFT (was 0.25): cash grows a
+    # digit or two over a run and, on this HUD, the number expands leftward,
+    # so a box fitted tight to the starting digits clips the new leading
+    # digit later. Still well clear of the '$' (~a full digit further left),
+    # which the reader skips anyway. The width grows to match so the right
+    # room is unchanged; the mid-run recheck heals any clip that still slips.
+    nx0 = wide[0] + max(0.0, dx1 - 0.7 * bh) / screen.w
     ny0 = wide[1] + max(0.0, dy1 - 0.35 * bh) / screen.h
     snapped = [round(nx0, 4), round(ny0, 4),
-               round((dx2 - dx1 + 2.2 * bh) / screen.w, 4),  # right room
+               round((dx2 - dx1 + 2.65 * bh) / screen.w, 4),  # room L+R
                round(1.7 * bh / screen.h, 4)]
     return snapped if _plausible_cash_shape(snapped) else None
 
@@ -800,6 +807,28 @@ def _repair_clipped_cash_box(screen, box, min_x=0.0):
             if best is None or value > best[1]:
                 best = (cand, value)
     return best[0] if best else None
+
+
+def recheck_cash_box(screen, cfg):
+    """Mid-run guard against the leading-digit clip that only appears once
+    cash grows past the digit count the box was calibrated for at preflight
+    (on the small STARTING cash the clip isn't visible yet, so the preflight
+    repair can't see it, and nothing else rechecks the box). Re-runs the
+    left-widen repair; it adopts a wider box only when that box reads a
+    strictly larger value containing the current read as a suffix -- the
+    signature of a clip -- so it is a safe no-op whenever nothing is
+    clipped. Cheap enough to call once a round."""
+    box = cfg.get("cash_box")
+    if not box:
+        return
+    lb = cfg.get("lives_box")
+    fence = (lb[0] + lb[2]) if lb else 0.0
+    repaired = _repair_clipped_cash_box(screen, box, min_x=fence)
+    if repaired and repaired != box and _plausible_cash_shape(repaired):
+        cfg["cash_box"] = repaired
+        save_config_value("cash_box", repaired)
+        dbg(f"cash box re-widened mid-run to recover a clipped digit: "
+            f"{box} -> {repaired}")
 
 
 def _cash_boxes_from_heart(screen):
@@ -2769,6 +2798,10 @@ def run_episode(screen, cfg, genome, final_round, abort_lives=50,
             blind_since = None                # counter is readable again
             if accepted != last_round:
                 last_round = accepted
+                # Cash grows a digit or two over a run; re-widen the box if
+                # its leading digit has started clipping (the preflight fit
+                # couldn't see a clip that didn't exist yet on starting cash).
+                recheck_cash_box(screen, cfg)
                 if lives is not None:
                     lives_by_round[str(last_round)] = lives
                 cash_now = read_cash(screen, cfg)
