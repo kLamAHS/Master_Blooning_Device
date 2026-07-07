@@ -1443,7 +1443,13 @@ class MetaBrain:
             # (observed: 205/205 CHIMPS runs died r6-9 with one tower down).
             # So fit as many CHEAP popping defenders as the starting budget
             # holds, preferring real DPS over the hero, all pinned to round 6.
-            budget = self.income(self.start_round)      # e.g. $650 at r6
+            # Cash IN HAND before the start round plays -- the cumulative by
+            # the END of the previous round (income(r) counts money earned
+            # DURING round r from pops, which you do not have pre-wave: at r6
+            # income(6)=813 but the wallet holds 650). Budgeting the opener at
+            # the real starting cash is what keeps a second tower from
+            # sneaking in and leaving the anchor bare.
+            budget = self.income(max(1, self.start_round - 1))   # ~$650 at r6
             prefer = {"opener": 0, "carry": 1, "control": 2,
                       "amplifier": 3, "hero": 4, "free": 5}
 
@@ -1456,10 +1462,27 @@ class MetaBrain:
                 e["_anchor"] = True
                 place_round[e["ref"]] = e["round"]
 
+            ordered = sorted(places, key=_anchor_key)
+            primary = ordered[0] if ordered else None
+            # Reserve the PRIMARY anchor's first two main-path tiers. A single
+            # upgraded popper (a 0-0-2 dart/tack) holds round 6 far better than
+            # two BARE towers that split the wallet and each leak -- the field
+            # failure: 37/40 one-life runs died r6-9 with bare openers. The
+            # executor buys these teeth pre-start (the pre-round phase has no
+            # clock), so a second tower is pulled only if it fits WITHOUT
+            # eating the opener's teeth.
+            teeth = 0
+            if primary is not None:
+                tcosts = sorted(
+                    (u.get("est") or 300 for u in entries
+                     if u["do"] == "upgrade"
+                     and u["ref"] == primary["ref"]))
+                teeth = sum(tcosts[:2])
             spent = pulled = 0
-            for e in sorted(places, key=_anchor_key):
+            for e in ordered:
                 cost = e.get("est") or 500
-                if spent + cost <= budget:      # fits the opening wallet
+                room = budget - (teeth if e is not primary else 0)
+                if spent + cost <= room:        # fits, teeth budget intact
                     _pull(e)
                     spent += cost
                     pulled += 1

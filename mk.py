@@ -3111,9 +3111,60 @@ def run_episode(screen, cfg, genome, final_round, abort_lives=50,
             queue.pop(idx)
             record_spend(PRICES.get(price_key(ttype)) or item.get("est") or 0)
             clear_ui(screen, cfg)
+        return start_round
+
+    def upgrade_prestart_openers(start_round):
+        """Spend the leftover opening cash UPGRADING the just-placed towers
+        before the round starts. A bare 0-0-0 tower leaks round 6 on one
+        life -- the wave hits before its first tier can be bought mid-round
+        -- but the pre-round phase has NO clock, so buy each opener's due
+        tiers now and start the round with teeth already out. Only tiers the
+        plan already scheduled for the start round are pulled (the opener's
+        early_opener teeth); the carry's pricey upgrades are gated later, so
+        this never drains the wallet, it just front-loads the cheap defence
+        that has to hold round 6."""
+        guard = 0
+        while guard < 12:
+            guard += 1
+            idx = next((j for j, it in enumerate(queue)
+                        if it.get("do") == "upgrade"
+                        and it.get("round", 0) <= start_round
+                        and it.get("ref") in landed_by_ref
+                        and landed_by_ref.get(it["ref"]) is not None), None)
+            if idx is None:
+                break
+            item = queue[idx]
+            landed = landed_by_ref[item["ref"]]
+            entry = towers.get(tuple(landed))
+            if entry is None:
+                queue.pop(idx)
+                continue
+            ttype = entry["tower"].lower()
+            pi = item["path"].index(1) if 1 in item["path"] else 0
+            tier = entry["path"][pi] + 1
+            if is_locked(ttype, pi, tier):
+                queue.pop(idx)
+                continue
+            known = PRICES.get(price_key(ttype, pi, tier))
+            cash = sane_cash()
+            if known is not None and cash is not None and cash < known:
+                break          # can't afford the cheapest due tier: start now
+            st = act_upgrade(
+                screen, cfg,
+                {**item, "at": landed, "sane_cash": sane_cash}, entry)
+            if st == "bought":
+                queue.pop(idx)
+                record_spend(PRICES.get(price_key(ttype, pi, tier))
+                             or item.get("est") or 0)
+                confirm_floor()
+            elif st in ("locked", "closed"):
+                queue.pop(idx)
+            else:
+                break          # broke / no_select: stop, get the round going
 
     confirm_floor()                # seed the floor from starting cash before
-    place_prestart_openers()       # any pre-start buy lowers it
+    _start_round = place_prestart_openers()   # any pre-start buy lowers it
+    upgrade_prestart_openers(_start_round)     # give the opener teeth pre-wave
     clean = screen.grab() if flow_sensor else None
     press_key("space")
     time.sleep(0.3)
