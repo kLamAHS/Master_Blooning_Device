@@ -3126,6 +3126,7 @@ def run_episode(screen, cfg, genome, final_round, abort_lives=50,
     dumped_defeat_check = False
     misreads = 0
     blind_since = None            # when the counter went continuously dark
+    hud_dark_since = None         # when the WHOLE HUD (lives too) went dark
     last_blind_recovery = 0.0     # throttle for clear/recalibrate attempts
     outcome = "hud_lost"
     while True:
@@ -3134,11 +3135,30 @@ def run_episode(screen, cfg, genome, final_round, abort_lives=50,
         value, *_ = read_round(screen, cfg)   # a frozen-but-visible counter
         prev_lives = lives
         lives = read_lives(screen, cfg)
+        if lives is not None and lives > 0:
+            hud_dark_since = None      # a live lives count: HUD isn't dark
         accepted = None
         if value is not None:
             if value == last_round:
                 accepted = value
             elif plausible(value, last_round) and value == prev_read:
+                accepted = value
+            elif (misreads >= 6 and value == prev_read
+                  and last_round is not None
+                  and last_round < value <= last_round + 40
+                  and value <= (200 if FREEPLAY else 100)):
+                # Re-sync after a blind stretch. BTD6 rounds auto-chain, so
+                # while the counter was unreadable (a long buy-spree in the
+                # tower panels, an overlay) the game kept advancing. A read
+                # past last+3 is then NOT a misread but the true, larger
+                # round -- rejecting it forever (as the tight plausible()
+                # jump does) is exactly what made a live round-27 game read
+                # as a lost HUD. Accept it once two consecutive frames agree
+                # (a one-frame garbage read won't repeat) and it is within a
+                # bounded forward jump under the mode cap, so the bot catches
+                # back up instead of declaring hud_lost on a readable counter.
+                dbg(f"counter re-synced after {misreads} misses: "
+                    f"round {last_round} -> {value}")
                 accepted = value
             prev_read = value
         if accepted is None:
@@ -3151,6 +3171,7 @@ def run_episode(screen, cfg, genome, final_round, abort_lives=50,
         else:
             misreads = 0
             blind_since = None                # counter is readable again
+            hud_dark_since = None             # ...so the HUD is not dark
             if accepted != last_round:
                 last_round = accepted
                 # Cash grows a digit or two over a run; re-widen the box if
@@ -3616,7 +3637,35 @@ def run_episode(screen, cfg, genome, final_round, abort_lives=50,
                         and lives is None and not looks_defeated(screen):
                     dbg("whole HUD covered at the final round -- victory")
                     outcome = "survived"
-                break                 # else: genuinely unknown/dead state
+                    break
+                # A one-life game that was alive a moment ago must NOT be
+                # thrown away on a transient dark HUD: an ability/effect can
+                # blank both the counter and the lives digit for a few
+                # frames. Give the dark spell time to clear -- keep healing
+                # the HUD -- and only conclude hud_lost if the WHOLE HUD
+                # stays unreadable for a stretch. A real leak-out shows the
+                # defeat screen (caught above), so unreadable-lives here is
+                # a misread, not a loss. (Multi-life runs keep the old
+                # immediate exit: a leak to 0 there is unambiguous.)
+                if one_life and not looks_defeated(screen):
+                    hud_dark_since = hud_dark_since or time.time()
+                    if time.time() - hud_dark_since < 45:
+                        if time.time() - last_blind_recovery > 12:
+                            last_blind_recovery = time.time()
+                            dbg("whole HUD dark but was alive -- healing, "
+                                "not giving up yet")
+                            clear_ui(screen, cfg)
+                            try:
+                                preflight_round_box(screen, cfg,
+                                                    recalibrate=True)
+                            except Exception:
+                                pass
+                    else:
+                        dbg("whole HUD dark 45s with no defeat screen -- "
+                            "window lost")
+                        break
+                else:
+                    break             # genuinely unknown/dead state
         if not queue and not observing:
             observing = True
             print("   build complete -- observing until survive/abort")
