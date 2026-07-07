@@ -58,7 +58,9 @@ def towers_from_genome(genome):
     for e in genome:
         if e.get("do") == "place":
             by_ref[e["ref"]] = {"tower": e["tower"].lower(),
-                                "at": list(e["at"]), "path": [0, 0, 0]}
+                                "at": list(e["at"]), "path": [0, 0, 0],
+                                **({"name": e["name"]}
+                                   if e.get("name") else {})}
     for e in genome:
         if e.get("do") == "upgrade" and e.get("ref") in by_ref:
             if 1 in e.get("path", []):
