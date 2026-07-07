@@ -4364,6 +4364,21 @@ def cmd_learn(args):
     print(brain.report(track=track, mask_points=mask_pts))
 
 
+def cmd_graph(args):
+    """Render training progress (runs_log.jsonl + progress.json) to a
+    self-contained HTML dashboard. Pure-stdlib generator in tools/, so it
+    needs no game and no extra dependencies."""
+    tools_dir = Path(__file__).parent / "tools"
+    sys.path.insert(0, str(tools_dir))
+    import plot_progress
+    argv = []
+    if getattr(args, "out", None):
+        argv += ["--out", args.out]
+    if getattr(args, "open", False):
+        argv += ["--open"]
+    return plot_progress.main(argv)
+
+
 def cmd_play(args):
     cfg = load_config()
     setup_tesseract(cfg)
@@ -4742,6 +4757,13 @@ def main():
                          dest="final_round",
                          help="round that counts as survival (default: "
                               "the rung's final round)")
+    p_graph = sub.add_parser(
+        "graph", help="render training progress from runs_log.jsonl to a "
+                      "self-contained progress.html you can open in a browser")
+    p_graph.add_argument("--out", default=None,
+                         help="output HTML path (default: progress.html)")
+    p_graph.add_argument("--open", action="store_true",
+                         help="open the dashboard in a browser when done")
     args = parser.parse_args()
     print(f"btd6_bot build {BUILD}")
     global DEBUG
@@ -4749,7 +4771,7 @@ def main():
     {"locate": cmd_locate, "watch": cmd_watch,
      "play": cmd_play, "scan": cmd_scan, "farm": cmd_farm,
      "solve": cmd_solve, "deploy": cmd_deploy, "campaign": cmd_campaign,
-     "learn": cmd_learn}[args.command](args)
+     "learn": cmd_learn, "graph": cmd_graph}[args.command](args)
 
 
 if __name__ == "__main__":

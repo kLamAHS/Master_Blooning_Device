@@ -118,6 +118,24 @@ once; after that your daily loop is just steps 6–8.
     python mk.py learn monkey_meadow            # add --mode chimps for that rung
     ```
 
+10b. **Visualize progress** — turn the training log into a dashboard you can
+    open in a browser (no game, no dependencies, no server):
+
+    ```
+    python mk.py graph            # writes progress.html
+    python mk.py graph --open     # ...and opens it
+    ```
+
+    It reads `runs_log.jsonl` and `progress.json` and draws, per map + mode:
+    a hero number (deepest round reached) and KPI tiles, **progress over
+    episodes** (each run's deepest round, the running personal best, wins,
+    the target line — the "is it learning?" picture), **where runs end** (a
+    histogram of the round each run reached), **outcomes** (victory / defeat /
+    lost track / crashed), the **best run's** lives and cash by round, and the
+    **campaign ladder** from `progress.json`. Charts have hover tooltips, a
+    table view, and light/dark themes. The page is self-contained — the same
+    generator is `python tools/plot_progress.py`.
+
 11. **When the research spreadsheet gets a new version**, regenerate the
     knowledge base (needs `pip install openpyxl`):
 
@@ -133,6 +151,7 @@ once; after that your daily loop is just steps 6–8.
     python campaign.py selftest
     python tools/test_cash_floor.py                     # cash-misread guard
     python tools/test_placement_avoid.py                # never-stack-towers guard
+    python tools/test_plot_progress.py                  # progress-dashboard math
     python tools/simulate_solve.py --seeds 5 --ablate   # end-to-end sim
     python tools/simulate_solve.py --deploy --seeds 5   # deploy path
     ```
