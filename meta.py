@@ -1240,14 +1240,26 @@ class MetaBrain:
         self.last_strategy = strat
         return genome
 
+    def _one_life(self):
+        """CHIMPS and Impoppable give a single life, so ONE leaked bloon ends
+        the run: surviving the opening rounds outranks economy there."""
+        return self.mode == "chimps" or self.difficulty == "impoppable"
+
     def _role_slots(self, n, hero=False):
-        """Roles for n tower slots. With a hero anchoring, the hero IS
-        the opener -- a separate cheap opener would just split cash away
-        from the carry's first tiers (the second-boomerang trap)."""
+        """Roles for n tower slots. On forgiving rungs, with a hero anchoring
+        the hero IS the opener -- a separate cheap opener would just split
+        cash away from the carry's first tiers (the second-boomerang trap).
+        But on a ONE-LIFE rung a hero covers only ~3% of track by its own
+        small range and, if it also drains the whole starting budget, the
+        run leaks rounds 6-9 it can never take back -- so a cheap popping
+        defender still leads even with a hero (the carry saves up behind it)."""
         if n <= 0:
             return []
         if hero:
-            slots = ["carry", "amplifier", "control", "free"]
+            if self._one_life():
+                slots = ["opener", "carry", "amplifier", "control", "free"]
+            else:
+                slots = ["carry", "amplifier", "control", "free"]
             return slots[:n] + ["free"] * max(0, n - 4)
         slots = ["opener", "carry", "amplifier", "control"]
         if n == 1:
@@ -1335,20 +1347,51 @@ class MetaBrain:
             if e["do"] == "place" and e["ref"] in min_by:
                 e["round"] = min(e["round"], min_by[e["ref"]])
                 place_round[e["ref"]] = e["round"]
-        # No-leak opener: the single most important anchor (hero, else the
-        # opener, else the carry) must be DOWN by the start round. CHIMPS
-        # begins at round 6 with one life -- an anchor the income curve
-        # would park at round 8 leaks rounds 6-7 it can never recover.
+        # No-leak opener. The most important anchor(s) must be DOWN by the
+        # start round -- an anchor the income curve would park at round 8
+        # leaks rounds 6-7 it can never recover.
         places = [e for e in entries if e["do"] == "place"]
-        anchor = None
-        for want in ("hero", "opener", "carry"):
-            anchor = next((e for e in places
-                           if _role_of_name(e.get("name")) == want), None)
-            if anchor:
-                break
-        if anchor is None and places:
-            anchor = min(places, key=lambda e: (e["round"], e["prio"]))
-        if anchor is not None:
+        if places and self._one_life():
+            # One life: a lone anchor -- especially a hero that drains the
+            # whole budget and then covers ~3% of track -- leaks the opening
+            # (observed: 205/205 CHIMPS runs died r6-9 with one tower down).
+            # So fit as many CHEAP popping defenders as the starting budget
+            # holds, preferring real DPS over the hero, all pinned to round 6.
+            budget = self.income(self.start_round)      # e.g. $650 at r6
+            prefer = {"opener": 0, "carry": 1, "control": 2,
+                      "amplifier": 3, "hero": 4, "free": 5}
+
+            def _anchor_key(e):
+                return (prefer.get(_role_of_name(e.get("name")), 5),
+                        e.get("est") or 500)
+
+            def _pull(e):
+                e["round"] = min(e["round"], self.start_round)
+                e["_anchor"] = True
+                place_round[e["ref"]] = e["round"]
+
+            spent = pulled = 0
+            for e in sorted(places, key=_anchor_key):
+                cost = e.get("est") or 500
+                if spent + cost <= budget:      # fits the opening wallet
+                    _pull(e)
+                    spent += cost
+                    pulled += 1
+            if pulled == 0:                     # nothing affordable fit --
+                _pull(min(places,               # still never leak round 6
+                          key=lambda e: e.get("est") or 500))
+        elif places:
+            # Forgiving rungs: the single most important anchor (hero, else
+            # the opener, else the carry) leads; a few early leaks are fine
+            # and a second cheap tower would only starve the carry.
+            anchor = None
+            for want in ("hero", "opener", "carry"):
+                anchor = next((e for e in places
+                               if _role_of_name(e.get("name")) == want), None)
+                if anchor:
+                    break
+            if anchor is None:
+                anchor = min(places, key=lambda e: (e["round"], e["prio"]))
             anchor["round"] = min(anchor["round"], self.start_round)
             anchor["_anchor"] = True
             place_round[anchor["ref"]] = anchor["round"]
@@ -1410,7 +1453,11 @@ class MetaBrain:
         # and then start upgrading. The hero and opener anchor, the carry
         # base follows, then the carry's first tiers -- support bases and
         # everything else joins the plan AFTER the carry has teeth.
-        place_plan = {"hero": (0, 1.0), "opener": (0, 2.0),
+        # The cheap opener defender is scheduled BEFORE the hero so it lands
+        # first with the starting cash -- the hero (which drains ~$600 and
+        # covers little track) must never pre-empt the tower that actually
+        # holds round 6.
+        place_plan = {"opener": (0, 1.0), "hero": (0, 2.0),
                       "carry": (0, 3.0), "amplifier": (1, 9.0),
                       "control": (1, 13.0), "free": (2, 17.0)}
         # A tower whose BASE answers a threat (ninja = camo, bomb = lead)

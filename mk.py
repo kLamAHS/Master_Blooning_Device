@@ -1516,6 +1516,33 @@ def looks_defeated(screen):
     return float((orange > 0).mean()) > 0.08
 
 
+VICTORY_GEOM = {
+    # The VICTORY screen: a wide orange "VICTORY" ribbon banner ABOVE where
+    # the DEFEAT lettering sits, and a green NEXT button below the stats card
+    # (the defeat screen shows a golden-yellow RESTART button there instead).
+    "banner": [0.30, 0.10, 0.40, 0.16],   # orange ribbon (y clear of DEFEAT)
+    "next": [0.40, 0.83, 0.20, 0.10],     # green NEXT button, lower-centre
+}
+
+
+def looks_victorious(screen):
+    """Is the VICTORY screen up? Two independent cues must fire: a GREEN NEXT
+    button in the lower-centre (where the loss screen puts a golden RESTART,
+    so the button colour is the clean discriminator) AND the orange VICTORY
+    ribbon across the top. It also refuses if the DEFEAT screen is up, so a
+    frame that briefly shows both can never be scored as a win. Callers gate
+    this on the final round, so a mid-run popup can't end a run early."""
+    nxt = screen.grab(VICTORY_GEOM["next"])
+    if _green_fraction(nxt) < 0.15:           # no green NEXT -> not a win
+        return False
+    banner = screen.grab(VICTORY_GEOM["banner"])
+    hsv = cv2.cvtColor(banner, cv2.COLOR_BGR2HSV)
+    orange = cv2.inRange(hsv, (3, 120, 120), (24, 255, 255))
+    if float((orange > 0).mean()) < 0.06:     # no orange VICTORY ribbon
+        return False
+    return not looks_defeated(screen)
+
+
 # The defeat screen comes in two layouts -- Home/Restart and, more often,
 # Home/Restart/Review Map -- which put the RESTART button in different
 # places, so a single calibrated point misses one of them (and on the
@@ -3319,6 +3346,12 @@ def run_episode(screen, cfg, genome, final_round, abort_lives=50,
 
         endgame = (play_out and last_round is not None
                    and last_round >= final_round)
+        if endgame and looks_victorious(screen):
+            time.sleep(0.4)
+            if looks_victorious(screen):      # confirmed on two samples
+                dbg("VICTORY screen recognized visually")
+                outcome = "survived"
+                break
         if misreads == 12:                    # HUD covered a while
             if looks_defeated(screen):
                 dbg("DEFEAT screen recognized (via dark counter)")

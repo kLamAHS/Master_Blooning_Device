@@ -152,6 +152,7 @@ once; after that your daily loop is just steps 6–8.
     python tools/test_cash_floor.py                     # cash-misread guard
     python tools/test_placement_avoid.py                # never-stack-towers guard
     python tools/test_plot_progress.py                  # progress-dashboard math
+    python tools/test_opener.py                         # one-life no-leak opener
     python tools/simulate_solve.py --seeds 5 --ablate   # end-to-end sim
     python tools/simulate_solve.py --deploy --seeds 5   # deploy path
     ```
@@ -523,9 +524,22 @@ python mk.py solve monkey_meadow
   around the least-tried tower families, because when everything known
   keeps dying the same way the problem is the core, not the details.
 - **Winning means winning.** `solve` plays *through* the final round —
-  survival is declared only when the victory screen covers the HUD (or
-  the final round has sat finished for minutes), so a round-100 BAD
+  survival is declared when the **VICTORY screen is recognized** (its green
+  NEXT button, where the loss screen shows a golden RESTART, plus the orange
+  VICTORY ribbon; double-sampled and gated on the final round so a mid-run
+  popup can't fake it), or, as a fallback, when the HUD stays covered through
+  a clear / the final round has sat finished for minutes. A round-100 BAD
   that leaks still counts as the defeat it is.
+- **A one-life opener that actually holds.** On CHIMPS / Impoppable a single
+  leak ends the run, so the plan no longer leads with a lone hero: a hero
+  covers only ~3% of track by its own small range and, buying first, drains
+  the whole $650 so nothing else can be afforded (a real training log showed
+  205/205 runs dying at rounds 6–9 with **one** tower down). The one-life
+  opener now fits several **cheap popping defenders** into the starting
+  budget at the start round — preferring real DPS over the hero, which
+  schedules a couple rounds later behind the defense — while the expensive
+  carry saves up. Forgiving rungs keep the hero-as-opener behavior.
+  (`tools/test_opener.py`.)
 - **The whole game is scheduled.** Threat coverage now spans the full
   ladder: camo (r24), lead (r28), MOAB prep (r40), ceramic cleanup
   (r63+), DDT answers (r90-99, MIB/Sabotage/Impale class), and a BAD
