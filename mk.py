@@ -1004,18 +1004,32 @@ def read_cash(screen, cfg):
     return _read_cash_box(screen, box)
 
 
-def read_cash_confirmed(screen, cfg):
-    """Two reads that must corroborate. Equal reads confirm the value;
-    affix pairs like 950/50 or 600/6005 are contradictions, not
-    confirmation. Return None unless both reads agree exactly. Used where
-    a single bad read does lasting damage (watermarks, price recording)."""
+def read_cash_confirmed(screen, cfg, max_plausible=None):
+    """Corroborated cash read for decisions a single bad read would harm
+    (watermarks, price recording). The fast path is unchanged -- two reads
+    that agree exactly confirm the value. If they DISAGREE (fast-forward
+    cash animation ticking between reads is the usual cause), a third read
+    breaks the tie by majority instead of giving up. Affix pairs like
+    950/50 or 600/6005 are contradictions, not confirmation.
+
+    `max_plausible`, when the caller passes a ceiling (e.g. the income
+    model's cap for the round), rejects any read above it: a clipped
+    leading digit ('$2,851' -> '851') reads fluently but low while an
+    inflated box reads high -- both are dropped rather than trusted."""
+    def ok(v):
+        return v is not None and (max_plausible is None or v <= max_plausible)
+
     a = read_cash(screen, cfg)
     time.sleep(0.15)
     b = read_cash(screen, cfg)
-    if a is None or b is None:
-        return a if a == b else None
-    if a == b:
-        return a
+    if a == b:                       # agree (incl. both None): fast path
+        return a if ok(a) else None
+    # Disagreement: a third read decides by majority.
+    time.sleep(0.12)
+    c = read_cash(screen, cfg)
+    for v in (a, b, c):
+        if ok(v) and [a, b, c].count(v) >= 2:
+            return v
     return None
 
 
@@ -2626,10 +2640,17 @@ def run_episode(screen, cfg, genome, final_round, abort_lives=50,
         hero/carry is even placed."""
         nonlocal place_i
         start_round = read_round_stable(screen, cfg, tries=3) or 1
+        # Openers we can't place THIS pass (unaffordable now, or a transient
+        # miss) are set aside, not allowed to block the rest: a free hero
+        # must never be stranded behind a carry we can't yet afford -- that
+        # leaks the very opening rounds CHIMPS never forgives. Set-aside
+        # items stay queued; the main loop buys them once cash arrives.
+        skipped = set()
         while True:
             idx = next((j for j, it in enumerate(queue)
                         if it.get("do") == "place"
-                        and it.get("round", 0) <= start_round), None)
+                        and it.get("round", 0) <= start_round
+                        and id(it) not in skipped), None)
             if idx is None:
                 break
             item = queue[idx]
@@ -2637,7 +2658,8 @@ def run_episode(screen, cfg, genome, final_round, abort_lives=50,
             base = PRICES.get(price_key(ttype))
             cash = read_cash(screen, cfg)
             if base and cash is not None and cash < base:
-                break
+                skipped.add(id(item))          # can't afford yet: try others
+                continue
             st, landed = act_place(
                 screen, cfg,
                 {**item, "timeout": 10,
@@ -2648,7 +2670,9 @@ def run_episode(screen, cfg, genome, final_round, abort_lives=50,
                           f"{item['at']} -- skipping")
                     landed_by_ref[item.get("ref", place_i)] = None
                     queue.pop(idx)
-                break
+                    continue
+                skipped.add(id(item))          # transient miss: leave queued
+                continue
             landed_by_ref[item.get("ref", place_i)] = landed
             towers[tuple(landed)] = {"tower": item["tower"], "at": landed,
                                      "path": [0, 0, 0],
