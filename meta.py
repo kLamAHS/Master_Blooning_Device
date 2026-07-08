@@ -968,6 +968,22 @@ class MetaBrain:
             if in_buff:
                 cands = [rng.choice(in_buff)
                          for _ in range(min(40, len(in_buff)))] + cands[:30]
+        elif style in ("upstream", "downstream") and carry_spot is not None:
+            # A slow/debuff tower wants to be UPSTREAM by track PROGRESS -- but
+            # on a wrapping map (Monkey Meadow's figure-eight) the path loops
+            # back past the cluster, so a spot spatially NEAR the cluster can
+            # cover an upstream segment too, slowing bloons the cluster is
+            # about to hit. Seed near-cluster candidates so the scorer can pick
+            # them; the progress `fit` term still keeps only the ones that are
+            # actually upstream, and the proximity bonus prefers the close one
+            # (the user's looping-map note -- glue placed spatially close IS
+            # upstream here, and buffs the cluster's own kill zone).
+            near_cluster = [p for p in base
+                            if _dist(p, carry_spot) <= 1.6 * BUFF_CLUSTER_R]
+            if near_cluster:
+                cands = [rng.choice(near_cluster)
+                         for _ in range(min(30, len(near_cluster)))] \
+                    + cands[:30]
         elif anchor and track is not None and track.ok:
             # Anchors (the carry first, then the opener/hero) want the map's
             # highest-COVERAGE spot: a multi-lane chokepoint where the snaking
@@ -1138,6 +1154,18 @@ class MetaBrain:
                         fit = (1.0 if 0.0 <= gap <= 0.18 else
                                0.4 if -0.06 <= gap < 0.0 else 0.05)
                         s = exp * fit
+                        # Among the progress-valid upstream spots, prefer the
+                        # one spatially CLOSEST to the cluster. On a wrapping
+                        # map the track loops back past the carry, so a nearby
+                        # upstream spot slows bloons the cluster is about to hit
+                        # -- worth far more than the same slow on a lane across
+                        # the map (the user's looping-map note). On a linear
+                        # map no upstream spot is close, so this stays ~1 for
+                        # all and doesn't distort the progress ranking.
+                        if carry_spot is not None:
+                            s *= 1.0 + 0.6 * max(
+                                0.0, 1.0 - _dist(c, carry_spot)
+                                / BUFF_CLUSTER_R)
                 elif carry_spot is not None:
                     # Direction unknown: co-locate with the carry so the
                     # debuff at least overlaps its kill zone.
@@ -1184,6 +1212,13 @@ class MetaBrain:
                 sp = track.span(c, r)
                 late = sp[1] if (sp and track.oriented) else 0.5
                 s = exp * (0.3 + late)
+                # Same wrapping-map bias as upstream: a cleanup tower spatially
+                # near the cluster catches what leaks the kill zone right where
+                # the loop brings it back, so prefer the close spot among the
+                # late-track candidates.
+                if carry_spot is not None:
+                    s *= 1.0 + 0.4 * max(
+                        0.0, 1.0 - _dist(c, carry_spot) / BUFF_CLUSTER_R)
             elif style == "offside":
                 s = 1.0 / (1.0 + 40.0 * track.exposure(c, 0.06))
             else:                                    # coverage

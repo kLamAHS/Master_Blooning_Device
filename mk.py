@@ -376,25 +376,45 @@ def preprocess_round_crop(img):
     return cv2.bitwise_not(thresh)
 
 
-def parse_round(text):
-    """'13/40' -> 13. Returns None when the text doesn't look like a round."""
+def parse_round(text, total=None):
+    """'13/40' -> 13. Returns None when the text doesn't look like a round.
+
+    `total` (the map's final round, e.g. 100) rescues the common failure that
+    makes a perfectly VISIBLE counter read as "dark": the '/' between the
+    current round and the total is faint, so tesseract drops it or reads it as
+    a digit and '34/100' fuses into '34100' / '341100'. That parses to a >200
+    number -> None -> the bot thinks the HUD went dark and stops advancing its
+    plan (the field complaint: it can't prep for late game because it "lost"
+    the counter). When the fused digits end with the known total, strip it
+    (and one stray separator glyph) and re-read the head as the current round."""
     text = text.strip()
     if "/" in text:
         text = text.split("/", 1)[0]
     digits = "".join(ch for ch in text if ch.isdigit())
-    if digits and 1 <= int(digits) <= 200:
+    if not digits:
+        return None
+    if 1 <= int(digits) <= 200:
         return int(digits)
+    if total is not None:
+        ts = str(int(total))
+        if len(digits) > len(ts) and digits.endswith(ts):
+            head = digits[:-len(ts)]
+            for cand in (head, head[:-1]):     # allow one misread '/' glyph
+                if cand and 1 <= int(cand) <= 200:
+                    return int(cand)
     return None
 
 
-def read_round(screen, cfg):
-    """Returns (parsed_round_or_None, raw_text, crop_img, processed_img)."""
+def read_round(screen, cfg, total=None):
+    """Returns (parsed_round_or_None, raw_text, crop_img, processed_img).
+    `total` is the map's final round (e.g. 100); it lets parse_round recover a
+    counter whose '/' faded and fused 'current/total' into one long number."""
     crop = screen.grab(cfg["round_box"])
     processed = preprocess_round_crop(crop)
     text = pytesseract.image_to_string(
         processed,
         config="--psm 7 -c tessedit_char_whitelist=0123456789/").strip()
-    return parse_round(text), text, crop, processed
+    return parse_round(text, total=total), text, crop, processed
 
 
 # Freeplay pushes past a beaten mode, so its round counter is a bare number
@@ -441,12 +461,24 @@ PRICES_SRC = {}                  # key -> "buy" | "seen" | "short" (session)
 LOCKED_PATH = Path(__file__).parent / "locked.json"
 LOCKED = json.loads(LOCKED_PATH.read_text()) if LOCKED_PATH.exists() else {}
 
+# When you've unlocked every upgrade with XP, the auto-lock detector is pure
+# downside: a single tier that fails to buy for some OTHER reason (a misread
+# price, a panel that didn't open, a cash hiccup) gets mis-recorded as
+# XP-locked and the bot then refuses that path forever. `--no-locks` turns the
+# whole mechanism off -- nothing is ever treated as locked and nothing new is
+# ever recorded -- for accounts that have everything unlocked.
+IGNORE_LOCKS = False
+
 
 def is_locked(ttype, path_i, tier):
+    if IGNORE_LOCKS:
+        return False
     return bool(LOCKED.get(price_key(ttype, path_i, tier)))
 
 
 def mark_locked(ttype, path_i, tier):
+    if IGNORE_LOCKS:
+        return
     key = price_key(ttype, path_i, tier)
     if not LOCKED.get(key):
         LOCKED[key] = True
@@ -571,13 +603,15 @@ def _round_box_from_ocr(screen):
     return None
 
 
-def read_round_stable(screen, cfg, tries=4):
+def read_round_stable(screen, cfg, tries=4, total=None):
     """Return a round value only if two consecutive reads agree -- a
     misaligned crop produces flickery garbage that never repeats reliably,
-    so this filters out the lucky-junk reads that fooled earlier versions."""
+    so this filters out the lucky-junk reads that fooled earlier versions.
+    `total` (the HUD's "/100") is forwarded so a faded separator doesn't make
+    a visible counter unreadable (see parse_round)."""
     prev = None
     for _ in range(tries):
-        value, *_ = read_round(screen, cfg)
+        value, *_ = read_round(screen, cfg, total=total)
         if value is not None and value == prev:
             return value
         prev = value
@@ -2164,6 +2198,11 @@ def act_upgrade(screen, cfg, action, tower=None, timeout=8):
             if info:
                 state, seen_price = info
                 if state == "xp":
+                    if IGNORE_LOCKS:
+                        # Everything is unlocked, so an 'xp' row can only be a
+                        # MISREAD -- don't block the path, just retry it.
+                        status = "unread"
+                        break
                     status = "locked"          # already recorded by reader
                     break
                 if state == "short":
@@ -2237,11 +2276,22 @@ def act_upgrade(screen, cfg, action, tower=None, timeout=8):
                     status = broke_status(after if after is not None else cash,
                                            info[1] if info else known)
                     break
-                # No visual info and an affordable press moved nothing:
-                # the safety net -- treat as locked and stop pressing.
-                if tower:
-                    mark_locked(ttype, i, tier)
-                status = "locked"
+                # No visual info and an affordable press moved nothing: the
+                # safety net. Normally that IS an XP lock -- record it and stop
+                # touching the path. But with --no-locks the account has
+                # everything unlocked, so a no-move press is a transient hiccup
+                # (a cash misread, a dropped keypress), NOT a lock: report it as
+                # broke so the caller retries later instead of blocking the path
+                # for the whole run (the "randomly blocks it for no reason"
+                # complaint).
+                if IGNORE_LOCKS:
+                    status = broke_status(
+                        after if after is not None else cash,
+                        info[1] if info else known)
+                else:
+                    if tower:
+                        mark_locked(ttype, i, tier)
+                    status = "locked"
                 break
             # Multi-tier buys: refresh this row so the NEXT tier's state
             # (new price / new XP wall) is read before another press.
@@ -3070,7 +3120,8 @@ def run_episode(screen, cfg, genome, final_round, abort_lives=50,
         we were on before buying; on hard/CHIMPS that can leak before the
         hero/carry is even placed."""
         nonlocal place_i
-        start_round = read_round_stable(screen, cfg, tries=3) or 1
+        start_round = read_round_stable(
+            screen, cfg, tries=3, total=None if FREEPLAY else 100) or 1
         # Openers we can't place THIS pass (unaffordable now, or a transient
         # miss) are set aside, not allowed to block the rest: a free hero
         # must never be stranded behind a carry we can't yet afford -- that
@@ -3187,7 +3238,12 @@ def run_episode(screen, cfg, genome, final_round, abort_lives=50,
     while True:
         unpause_if_needed(screen, cfg)        # cheap; a paused game shows
         recalibrate_cash_if_stuck()           # broken box -> re-find, not freeze
-        value, *_ = read_round(screen, cfg)   # a frozen-but-visible counter
+        # Pass the HUD total (BTD6 shows "round/100" for standard & CHIMPS) so
+        # a faded '/' that fuses "34/100" into "34100" is recovered instead of
+        # reading as a dark counter and freezing the plan. Freeplay's counter
+        # is a bare number past 100, so no total there.
+        value, *_ = read_round(screen, cfg,
+                               total=None if FREEPLAY else 100)
         prev_lives = lives
         lives = read_lives(screen, cfg)
         if lives is not None and lives > 0:
@@ -4995,6 +5051,9 @@ def main():
     sub.add_parser("watch", help="debug the round-counter OCR")
     p_play = sub.add_parser("play", help="execute a gameplan")
     p_play.add_argument("plan", help="path to a plan .json file")
+    p_play.add_argument("--no-locks", action="store_true", dest="no_locks",
+                        help="you've unlocked every upgrade with XP: never "
+                             "treat a tier as XP-locked")
     p_play.add_argument("-q", "--quiet", action="store_true",
                         help="suppress per-decision debug output")
     p_scan = sub.add_parser(
@@ -5054,6 +5113,9 @@ def main():
                         dest="no_abilities",
                         help="don't press ability hotkeys on threat "
                              "rounds")
+    p_farm.add_argument("--no-locks", action="store_true", dest="no_locks",
+                        help="you've unlocked every upgrade with XP: never "
+                             "treat a tier as XP-locked")
     p_farm.add_argument("-q", "--quiet", action="store_true",
                         help="suppress per-decision debug output")
     p_solve = sub.add_parser(
@@ -5104,6 +5166,10 @@ def main():
                               "rounds")
     p_solve.add_argument("--pool", choices=["classic", "full"],
                          default="full")
+    p_solve.add_argument("--no-locks", action="store_true", dest="no_locks",
+                         help="you've unlocked every upgrade with XP: never "
+                              "treat a tier as XP-locked (stops a stray buy "
+                              "failure from blocking a path for the run)")
     p_solve.add_argument("-q", "--quiet", action="store_true",
                          help="suppress per-decision debug output")
     p_deploy = sub.add_parser(
@@ -5146,6 +5212,9 @@ def main():
                                "rounds")
     p_deploy.add_argument("--pool", choices=["classic", "full"],
                           default="full")
+    p_deploy.add_argument("--no-locks", action="store_true", dest="no_locks",
+                          help="you've unlocked every upgrade with XP: never "
+                               "treat a tier as XP-locked")
     p_deploy.add_argument("-q", "--quiet", action="store_true",
                           help="suppress per-decision debug output")
     sub.add_parser(
@@ -5178,8 +5247,12 @@ def main():
                          help="open the dashboard in a browser when done")
     args = parser.parse_args()
     print(f"btd6_bot build {BUILD}")
-    global DEBUG
+    global DEBUG, IGNORE_LOCKS
     DEBUG = not getattr(args, "quiet", False)
+    IGNORE_LOCKS = getattr(args, "no_locks", False)
+    if IGNORE_LOCKS:
+        print("      (--no-locks: XP-lock detection OFF -- every upgrade "
+              "treated as unlocked)")
     {"locate": cmd_locate, "watch": cmd_watch,
      "play": cmd_play, "scan": cmd_scan, "farm": cmd_farm,
      "solve": cmd_solve, "deploy": cmd_deploy, "campaign": cmd_campaign,
