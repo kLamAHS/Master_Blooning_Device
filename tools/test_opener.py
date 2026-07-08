@@ -170,6 +170,45 @@ def main():
     check(f"the one-life opener gets early teeth (prio-0 upgrade by r9) "
           f"({early_teeth}/{opener_seen})", early_teeth >= 0.8 * opener_seen)
 
+    # --- opener build ROTATION: a line that keeps leaking the opening must
+    #     not be retried forever -- the bot should try a different one -------
+    def leak_row(main_path, final_round=8):
+        path = [0, 0, 0]
+        path[main_path] = 2
+        return {"map": "m", "difficulty": "hard", "mode": "solve",
+                "game_mode": "chimps", "target_round": 100, "start_round": 6,
+                "final_round": final_round, "outcome": "defeat",
+                "towers": [{"tower": "dart", "name": "dart#0(opener)",
+                            "at": [0.4, 0.5], "path": path}]}
+
+    def opener_main_dist(br, n=30):
+        rng2 = random.Random(1)
+        from collections import Counter
+        return Counter(br._pick_build(rng2, "dart", follow_template=True)[0]
+                       for _ in range(n))
+
+    base = brain(mode="chimps", start=6)
+    top_main = opener_main_dist(base).most_common(1)[0][0]      # dart's default
+    rot = brain(mode="chimps", start=6)
+    for _ in range(4):
+        rot.observe(leak_row(top_main), quiet=True)             # it keeps leaking
+    dist = opener_main_dist(rot)
+    check(f"opener rotates OFF a build line that keeps leaking "
+          f"(default main {top_main}; after 4 leaks -> {dict(dist)})",
+          dist.get(top_main, 0) <= 0.5 * sum(dist.values()))
+    # leak the next line too -> it moves on again, never back to the first
+    second = dist.most_common(1)[0][0]
+    for _ in range(4):
+        rot.observe(leak_row(second), quiet=True)
+    dist2 = opener_main_dist(rot)
+    check(f"a second leaking line is also abandoned "
+          f"(-> {dict(dist2)})",
+          dist2.most_common(1)[0][0] not in (top_main, second))
+    # a fresh brain with NO leak history is unchanged (still the meta default)
+    check("no leak history -> opener build is unchanged (the meta default)",
+          opener_main_dist(brain(mode="chimps", start=6)).most_common(1)[0][0]
+          == top_main)
+
     print()
     if _fails:
         print(f"FAILED {len(_fails)} case(s): {', '.join(_fails)}")

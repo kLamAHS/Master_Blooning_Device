@@ -1302,13 +1302,55 @@ class MetaBrain:
             return (rank.get(style, 1), i)
         return sorted(range(len(picks)), key=key)
 
+    def _opener_build_bias(self, ttype):
+        """A per-build-line multiplier that keeps the one-life opener from
+        retrying a line that keeps LEAKING the opening rounds. The opener
+        follows its build template every single run, so without this the
+        highest-weighted line is chosen forever even when its EARLY tiers
+        barely pop (dart's top line is 2-0-5 -> Crossbow, a great carry whose
+        0-0-2 opening hardly holds round 6) -- the field complaint: "it keeps
+        trying dart bottom-path tier 2 and leaking, then goes back to it."
+
+        Derived from THIS rung's own history: an early-leak defeat blames the
+        opener's line. A line that has leaked repeatedly and never held is
+        pushed down; a line never auditioned is lifted -- so the opener rotates
+        (dart 2-0-5 -> a Quick/Sharp-Shots line that actually holds) instead of
+        repeating the loss, and settles once a line survives."""
+        leaks, tries = {}, {}
+        for row in self.history:
+            op = next((t for t in row.get("towers", [])
+                       if _role_of_name(t.get("name")) == "opener"
+                       and (t.get("tower") or "").lower() == ttype), None)
+            if op is None:
+                continue
+            path = op.get("path") or [0, 0, 0]
+            if max(path) <= 0:
+                continue
+            m = path.index(max(path))
+            tries[m] = tries.get(m, 0) + 1
+            start = int(row.get("start_round") or self.start_round)
+            fr = row.get("final_round")
+            if row.get("outcome") == "defeat" and fr is not None \
+                    and fr <= start + EARLY_WINDOW:
+                leaks[m] = leaks.get(m, 0) + 1
+
+        def bias(main):
+            lk, tr = leaks.get(main, 0), tries.get(main, 0)
+            if tr == 0:
+                return 1.5                  # untried line: worth auditioning
+            if lk >= 2 and tr - lk == 0:
+                return 1.0 / (1.0 + lk)     # always leaked here -> rotate off it
+            return 1.0                      # held at least once: posterior decides
+        return bias
+
     def _pick_build(self, rng, ttype, follow_template=False):
         """(main, cross) for a tower: meta build templates re-weighted by
         the learned per-path posterior; explore = any legal combo.
         follow_template skips the random-explore branch so a scaling anchor
         (the one-life opener) always builds toward a real tier-5 carry line
         -- tack -> Tack Zone, dart -> Crossbow -- instead of a throwaway
-        random path."""
+        random path. For that opener it ALSO rotates off build lines that have
+        repeatedly leaked the opening (see _opener_build_bias)."""
         if not follow_template and rng.random() < self.explore:
             main = rng.randrange(3)
             cross = rng.choice([p for p in range(3) if p != main])
@@ -1318,6 +1360,7 @@ class MetaBrain:
             main = rng.randrange(3)
             cross = rng.choice([p for p in range(3) if p != main])
             return main, cross, "no-template"
+        leak_bias = self._opener_build_bias(ttype) if follow_template else None
         best, best_w = None, -1.0
         for b in builds:
             pa, pb = self.p_post.get((ttype, b["main"]), [1.0, 1.0])
@@ -1327,6 +1370,8 @@ class MetaBrain:
                 ga = ga * GLOBAL_PATH_CAP / tot
                 gb = gb * GLOBAL_PATH_CAP / tot
             w = b.get("weight", 0.5) * (0.5 + _beta(rng, pa + ga, pb + gb))
+            if leak_bias is not None:
+                w *= leak_bias(b["main"])
             if w > best_w:
                 best, best_w = b, w
         return best["main"], best["cross"], best.get("label", "meta")
