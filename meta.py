@@ -105,6 +105,15 @@ ROUGH_COST = {
 # round walk past a single life un-killed (observed: glue-only CHIMPS openers
 # dying at round 6), so they're filtered out of the one-life opener slot.
 _SLOW_ONLY = {"glue", "ice"}
+# The only towers that reliably HOLD round 6 on a one-life rung's starting
+# wallet: a cheap base that already pops a GROUP, plus first tiers cheap
+# enough to fit $650. dart/tack/boomerang qualify (and all scale -- dart ->
+# Crossbow, tack -> Tack Zone, boomerang -> MOAB Press). A base-price cap is
+# NOT enough on its own: wizard/druid have a cheap ~$270 base but $325 tiers,
+# so they strand at 0-0-1 and leak the single life (the field failure), and a
+# base sniper single-targets. So the one-life opener draws from THIS set, not
+# a price threshold that the real (cheaper-than-listed) bases slip under.
+_OPENER_KILLERS = ("dart", "tack", "boomerang")
 
 # The hero isn't in the knowledge base's tower table (which hero is
 # equipped is chosen in the menu, invisible to the bot), so placement
@@ -1421,37 +1430,25 @@ class MetaBrain:
                     # the whole $650 and leave no room to upgrade or add a
                     # second tower.
                     #
-                    # Budget off cash IN HAND pre-wave -- the wallet entering
-                    # the start round -- so only dart/tack/boomerang qualify:
-                    # cheap group-clearers whose first two tiers both fit $650
-                    # (a real 0-0-2 by round 6). Pricier bases (wizard/druid/
-                    # engineer, and support like alchemist) strand at 0-0-1 or
-                    # do no early damage, and leak the one life.
-                    #
-                    # Use the FIXED prior (earned_by), NOT self.income(): the
-                    # starting wallet is a game constant ($650 at r6), but
-                    # self.income() switches to the LEARNED curve once telemetry
-                    # exists, and that curve extrapolated below its data range
-                    # (r < 6) returns garbage -- observed ~260, which drops the
-                    # cap to $156, empties the scaler list, and falls back to a
-                    # pool that re-admits the wrong openers. earned_by pins it.
-                    cap = 0.6 * earned_by(max(1, self.start_round - 1), self.mode)
-
-                    def _oc(t, _p=price_of):
-                        return (_p(t) if _p else None) or ROUGH_COST.get(t, 600)
-
-                    def _style(t):
-                        return (self.towers.get(t, {}).get("placement")
-                                or {}).get("style", "coverage")
-                    # cheap + scales + KILLS GROUPS (on-track AoE/multi-shot).
-                    # Exclude pure slow (glue/ice) and OFFSIDE single-target
-                    # (a base sniper has infinite range but pops one bloon at a
-                    # time -- it can't clear a round-6 group before it leaks).
-                    scalers = [t for t in pool
-                               if t not in _SLOW_ONLY
-                               and _style(t) not in ("offside", "buddy")
-                               and self.towers.get(t, {}).get("builds")
-                               and _oc(t) <= cap]
+                    # Draw the opener from the proven round-6 holders
+                    # (_OPENER_KILLERS): a cheap group-clearing base whose first
+                    # tiers fit the $650 wallet. A base-price cap is unreliable
+                    # here -- the real wizard/druid base ($270) slips under it
+                    # but its $325 tiers strand it at 0-0-1 -- so restrict to the
+                    # set outright, intersected with what's actually available.
+                    scalers = [t for t in _OPENER_KILLERS
+                               if t in pool
+                               and self.towers.get(t, {}).get("builds")]
+                    # Dart is the most reliable one-life opener: cheap enough to
+                    # reach a real 0-0-2 pre-wave AND longer-ranged than tack
+                    # (0.081 vs 0.059), so it actually covers the entry instead
+                    # of clipping 1% of the track. It was the only opener that
+                    # cleared round 6 in the field. Prefer it outright; tack/
+                    # boomerang (which strand at 0-0-1) only stand in if dart is
+                    # unavailable -- and they still shine as the CARRY (Tack
+                    # Zone / MOAB Press), which is a separate slot.
+                    if "dart" in scalers:
+                        scalers = ["dart"]
                     cands = scalers or [t for t in cands
                                         if t not in _SLOW_ONLY] or cands
             ttype = self._pick_tower(rng, cands, [t for t, _ in picks],
