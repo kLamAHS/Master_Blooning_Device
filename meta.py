@@ -1605,7 +1605,7 @@ class MetaBrain:
         if rng.random() < p_evolve:
             genome = self._evolved_genome(rng, n_towers, pools, is_locked,
                                           large_towers, tower_pool, elites,
-                                          track, hero)
+                                          track, hero, price_of=price_of)
             if genome:
                 return genome
         return self._fresh_genome(rng, n_towers, pools, is_locked,
@@ -2069,9 +2069,34 @@ class MetaBrain:
 
     # --------------------------------------------------------- evolution
 
+    @staticmethod
+    def _base_cost_of(price_of, ttype):
+        """A tower's place cost for scheduling: the accurate learned/seed price
+        when the executor supplies one, else the rough medium constant."""
+        if price_of:
+            known = price_of(ttype)
+            if known:
+                return known
+        return ROUGH_COST.get(ttype, 600)
+
+    @staticmethod
+    def _tier_cost_of(price_of, ttype, p_i, tier):
+        """An upgrade tier's cost for scheduling: the accurate learned/seed
+        price per (tower, path, tier) when available, else the flat per-tier
+        estimate. Accurate tiers make the schedule's cumulative-spend pacing
+        track what the game can actually afford."""
+        if price_of:
+            try:
+                known = price_of(ttype, p_i, tier)
+            except TypeError:
+                known = None
+            if known:
+                return known
+        return TIER_EST.get(tier, 800)
+
     def _evolved_genome(self, rng, n_towers, pools, is_locked,
                         large_towers, tower_pool, elites, track=None,
-                        hero=False):
+                        hero=False, price_of=None):
         """Mutate (and sometimes cross over) the best layouts found so
         far. This is where genuinely emergent tactics come from: the
         parents are the bot's own discoveries, and mutations are free to
@@ -2159,13 +2184,13 @@ class MetaBrain:
             mutations.append(f"drop:{weakest['tower']}")
 
         entries = []
-        towers.sort(key=lambda t: ROUGH_COST.get(t["tower"], 600))
+        towers.sort(key=lambda t: self._base_cost_of(price_of, t["tower"]))
         for order, t in enumerate(towers):
             entries.append({"do": "place", "tower": t["tower"],
                             "at": list(t["at"]), "ref": order,
                             "name": f"{t['tower']}#{order}(evolved)",
                             "prio": 0, "deadline": 1.0,
-                            "est": ROUGH_COST.get(t["tower"], 600)})
+                            "est": self._base_cost_of(price_of, t["tower"])})
             if t["tower"] == "hero":
                 continue          # heroes level up on their own: no buys
             path = t.get("path") or [0, 0, 0]
@@ -2189,7 +2214,8 @@ class MetaBrain:
                         "deadline": self._deadline(t["tower"], main, p_i,
                                                    tier, None)
                         + rng.uniform(-4, 4),
-                        "est": TIER_EST.get(tier, 800)})
+                        "est": self._tier_cost_of(price_of, t["tower"],
+                                                  p_i, tier)})
         genome = self._schedule(entries)
         self.last_strategy = {"kind": label, "explore": self.explore,
                               "placement": ("track"
