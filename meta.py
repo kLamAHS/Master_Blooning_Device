@@ -1421,15 +1421,21 @@ class MetaBrain:
                     # the whole $650 and leave no room to upgrade or add a
                     # second tower.
                     #
-                    # Budget off cash IN HAND pre-wave -- income(start_round-1),
-                    # ~$650 -- NOT income(start_round) which counts round-6 pops
-                    # you have not made yet ($813) and inflates the cap to $488,
-                    # letting in wizard/druid/engineer. Those have a pricey base
-                    # AND $325 second tiers, so they strand at 0-0-1 and leak the
-                    # one life. At the real $390 cap only dart/tack/boomerang
-                    # qualify -- cheap group-clearers whose first two tiers both
-                    # fit the opening wallet (a real 0-0-2 by round 6).
-                    cap = 0.6 * self.income(max(1, self.start_round - 1))
+                    # Budget off cash IN HAND pre-wave -- the wallet entering
+                    # the start round -- so only dart/tack/boomerang qualify:
+                    # cheap group-clearers whose first two tiers both fit $650
+                    # (a real 0-0-2 by round 6). Pricier bases (wizard/druid/
+                    # engineer, and support like alchemist) strand at 0-0-1 or
+                    # do no early damage, and leak the one life.
+                    #
+                    # Use the FIXED prior (earned_by), NOT self.income(): the
+                    # starting wallet is a game constant ($650 at r6), but
+                    # self.income() switches to the LEARNED curve once telemetry
+                    # exists, and that curve extrapolated below its data range
+                    # (r < 6) returns garbage -- observed ~260, which drops the
+                    # cap to $156, empties the scaler list, and falls back to a
+                    # pool that re-admits the wrong openers. earned_by pins it.
+                    cap = 0.6 * earned_by(max(1, self.start_round - 1), self.mode)
 
                     def _oc(t, _p=price_of):
                         return (_p(t) if _p else None) or ROUGH_COST.get(t, 600)
@@ -1443,7 +1449,7 @@ class MetaBrain:
                     # time -- it can't clear a round-6 group before it leaks).
                     scalers = [t for t in pool
                                if t not in _SLOW_ONLY
-                               and _style(t) != "offside"
+                               and _style(t) not in ("offside", "buddy")
                                and self.towers.get(t, {}).get("builds")
                                and _oc(t) <= cap]
                     cands = scalers or [t for t in cands
@@ -1525,10 +1531,11 @@ class MetaBrain:
             # Cash IN HAND before the start round plays -- the cumulative by
             # the END of the previous round (income(r) counts money earned
             # DURING round r from pops, which you do not have pre-wave: at r6
-            # income(6)=813 but the wallet holds 650). Budgeting the opener at
-            # the real starting cash is what keeps a second tower from
-            # sneaking in and leaving the anchor bare.
-            budget = self.income(max(1, self.start_round - 1))   # ~$650 at r6
+            # income(6)=813 but the wallet holds 650). Use the FIXED prior
+            # (earned_by), NOT self.income(): the starting wallet is a game
+            # constant, but the learned income curve extrapolated below its
+            # data range (r < 6) is garbage and would mis-size the opener.
+            budget = earned_by(max(1, self.start_round - 1), self.mode)  # ~$650
             prefer = {"opener": 0, "carry": 1, "control": 2,
                       "amplifier": 3, "hero": 4, "free": 5}
 
