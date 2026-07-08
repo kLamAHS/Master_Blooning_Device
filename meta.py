@@ -119,11 +119,12 @@ _OPENER_KILLERS = ("dart", "tack", "boomerang")
 # reliably clears round 6 cold. The rest are rotated in as the leak memory
 # demotes whatever keeps failing (see MetaBrain._opener_tower_bias), and are
 # also auditioned at the explore rate so they get tried before dart fails.
-# tack and ice are here by player preference; ice is pure-slow AND pricey, so
-# it sits below the cheap poppers (dart/tack/boomerang) -- the rotation reaches
-# it, but doesn't gamble the cold-start run on it.
-_OPENER_ROSTER = ("dart", "tack", "ice", "boomerang")
-_OPENER_PREF = {"dart": 1.0, "tack": 0.85, "ice": 0.65, "boomerang": 0.6}
+# These are all POPPERS that hold the opening on their own. Ice is deliberately
+# NOT here: it is pure-slow, so it never opens -- it comes in LATER as a Super
+# Brittle support behind a tack/carry (the Tack Zone + Super Brittle combo),
+# handled by the partner/synergy path, not as a round-6 anchor.
+_OPENER_ROSTER = ("dart", "tack", "boomerang")
+_OPENER_PREF = {"dart": 1.0, "tack": 0.85, "boomerang": 0.6}
 
 # The hero isn't in the knowledge base's tower table (which hero is
 # equipped is chosen in the menu, invisible to the bot), so placement

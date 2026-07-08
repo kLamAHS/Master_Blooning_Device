@@ -232,18 +232,20 @@ def main():
 
     check("cold start opens with dart (the reliable round-6 holder)",
           opener_tower(brain(mode="chimps", start=6)) == "dart")
+    check("ice is NOT an opener (it's a Super Brittle support, added later)",
+          "ice" not in _OPENER_ROSTER)
     rt = brain(mode="chimps", start=6)
     for _ in range(3):
         rt.observe(tower_leak_row("dart", 2), quiet=True)
     for _ in range(3):
         rt.observe(tower_leak_row("dart", 1), quiet=True)
-    check("dart leaking on two lines rotates the opener to another tower",
+    check("dart leaking on two lines rotates the opener to another popper",
           opener_tower(rt) != "dart")
     for _ in range(3):
         rt.observe(tower_leak_row("tack", 2), quiet=True)
     for _ in range(3):
         rt.observe(tower_leak_row("tack", 0), quiet=True)
-    check("dart AND tack leaking rotates the opener onward (to ice)",
+    check("dart AND tack leaking rotates the opener onward (to boomerang)",
           opener_tower(rt) not in ("dart", "tack"))
     # a tower that HELD the opening is not abandoned over earlier leaks
     held = brain(mode="chimps", start=6)

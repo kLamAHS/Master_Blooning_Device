@@ -139,20 +139,22 @@
    "role": "debuff/control",
    "status": "High meta support",
    "crosspath_note": "Embrittle/Super Brittle or Impale",
-   "partners": [],
+   "partners": [
+    "tack"
+   ],
    "avoid_for": "BAD slow",
    "notes": "Turns projectile spam into late-game DPS.",
    "builds": [
     {
      "main": 0,
      "cross": 1,
-     "weight": 0.55,
+     "weight": 0.6,
      "label": "Embrittlement / Super Brittle (5-2-0)"
     },
     {
      "main": 2,
      "cross": 1,
-     "weight": 0.45,
+     "weight": 0.4,
      "label": "Icicle Impale (0-2-5)"
     }
    ],
