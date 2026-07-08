@@ -913,6 +913,23 @@ class MetaBrain:
             if in_buff:
                 cands = [rng.choice(in_buff)
                          for _ in range(min(40, len(in_buff)))] + cands[:30]
+        elif anchor and track is not None and track.ok:
+            # Anchors (the carry first, then the opener/hero) want the map's
+            # highest-COVERAGE spot: a multi-lane chokepoint where the snaking
+            # track passes one point several times, so one tower hits bloons on
+            # several passes. A random 70-sample usually misses it, so seed the
+            # genuine top-exposure spots directly. A later anchor -- the opener,
+            # placed after the carry -- prefers the top spots that ALSO sit near
+            # the carry, so the two damage towers land in ONE support's buff
+            # disc with multi-lane coverage instead of splitting to opposite
+            # ends of the map (the boomerang-in-the-corner complaint).
+            ranked = sorted(base, key=lambda p: -track.exposure(p, r))
+            seed = ranked[:30]
+            if carry_spot is not None:
+                near = [p for p in ranked[:150]
+                        if _dist(p, carry_spot) <= BUFF_CLUSTER_R]
+                seed = near[:20] + seed
+            cands = seed + cands[:25]
         cands = _spread(cands, taken, SEP_LARGE if large else SEP,
                         pull=carry_spot if style == "buddy" else None)
         # Keep towers that shoot bloons ON the track: drop candidates that
@@ -928,15 +945,17 @@ class MetaBrain:
             on_track = [c for c in cands if track.exposure(c, r) >= 0.005]
             if len(on_track) >= 2:
                 cands = on_track
-        if style == "coverage" and not anchor and carry_spot is not None \
-                and len(cands) > 3:
-            # Cluster FLOOR (not just the +50% nudge below, which exposure
+        if style == "coverage" and carry_spot is not None and len(cands) > 3 \
+                and (not anchor or (not cluster and self._one_life())):
+            # Cluster FLOOR (not just the nudge below, which exposure
             # differences drown out): when enough on-track spots sit inside
-            # the carry's buff disc, RESTRICT the free DPS to them, then the
-            # scorer picks the best-coverage spot AMONG the cluster. This is
-            # what actually keeps damage tight enough for one village + alch
-            # to buff it all; it falls back to open scoring only if the disc
-            # has too few track spots (so it never lands off the track).
+            # the carry's buff disc, RESTRICT the damage tower to them, then
+            # the scorer picks the best-coverage EARLY spot AMONG the cluster.
+            # This is what actually keeps damage tight enough for one village +
+            # alch to buff it all. Applies to free DPS AND the one-life opener/
+            # hero (which the carry, placed first, sits at an early multi-lane
+            # spot, so near-carry spots are early too). Falls back to open
+            # scoring if the disc has too few track spots -- never off-track.
             clustered = [c for c in cands
                          if _dist(c, carry_spot) <= BUFF_CLUSTER_R
                          and track.exposure(c, r) >= 0.005]
@@ -1055,29 +1074,35 @@ class MetaBrain:
                     sp = track.span(c, r)
                     if sp:
                         # All else equal, kill bloons EARLY: damage near
-                        # the entry leaves room for error; a defense
-                        # camped at the exit pops with zero margin.
-                        s *= 1.25 - 0.50 * sp[1]
+                        # the entry leaves room for error; a defense camped
+                        # at the exit pops with zero margin. Bias on sp[0],
+                        # the EARLIEST bloon the spot can hit -- NOT the mean
+                        # (sp[1]), which would punish a prime multi-lane spot
+                        # (the track snaking back past one point) just because
+                        # its range also touches a later lane. A spot that
+                        # engages bloons early AND covers several lanes -- the
+                        # best real estate on a wrappy map -- must score high.
+                        s *= 1.25 - 0.50 * sp[0]
                         # A one-life survival anchor (opener/hero) is far
                         # more exit-sensitive: placed near the end it has no
                         # lane left to catch a leak, so ONE bloon ends the
-                        # run. Bias it HARD toward the entry half so the
-                        # whole track works for it and a marginal early
-                        # defense still holds round 6.
+                        # run. Bias it HARD toward engaging early.
                         if one_life_anchor:
-                            s *= max(0.12, 1.0 - 1.3 * sp[1])
-                # A FREE damage tower should CLUSTER with the carry, not go
-                # solo to its own best lane spot: one village + alchemist can
-                # only buff towers inside its range, so a tight buffed group
-                # out-damages the same towers scattered and unbuffed. Reward
-                # proximity to the carry within a support tower's reach.
-                # Exposure stays the base term, so a clustered spot must still
-                # see the track (the on-track floor already dropped dead ones)
-                # -- this decides WHICH good spot, pulling it into buff range.
-                if not anchor and carry_spot is not None:
+                            s *= max(0.35, 1.0 - 1.0 * sp[0])
+                # A damage tower should CLUSTER with the carry, not go solo to
+                # its own best lane spot: one village + alchemist can only buff
+                # towers inside its range, so a tight buffed group out-damages
+                # the same towers scattered and unbuffed. Reward proximity to
+                # the carry within a support tower's reach. This applies to free
+                # DPS AND to the one-life OPENER -- the two damage towers should
+                # share the carry's buffs and multi-lane spot, not sit at
+                # opposite ends of the map (the boomerang-in-the-corner
+                # complaint). Exposure stays the base term, so a clustered spot
+                # still has to see the track; this decides WHICH good spot.
+                if (not anchor or one_life_anchor) and carry_spot is not None:
                     d = _dist(c, carry_spot)
                     if d <= BUFF_CLUSTER_R:
-                        s *= 1.0 + 0.5 * (1.0 - d / BUFF_CLUSTER_R)
+                        s *= 1.0 + 0.7 * (1.0 - d / BUFF_CLUSTER_R)
             # Learned-region posterior nudges the score. For most towers it
             # only swings +/-20% via a Thompson draw (a wider swing once
             # drowned out short-range towers' small exposure differences). The
