@@ -209,6 +209,52 @@ def main():
           opener_main_dist(brain(mode="chimps", start=6)).most_common(1)[0][0]
           == top_main)
 
+    # --- opener TOWER rotation: when a whole tower's lines keep leaking, try
+    #     a different tower (dart -> tack -> ice), never gamble the cold start
+    from meta import _OPENER_ROSTER                       # noqa: E402
+
+    def tower_leak_row(tower, main, final_round=8):
+        path = [0, 0, 0]
+        path[main] = 2
+        return {"map": "m", "difficulty": "hard", "mode": "solve",
+                "game_mode": "chimps", "target_round": 100, "start_round": 6,
+                "final_round": final_round, "outcome": "defeat",
+                "towers": [{"tower": tower, "name": f"{tower}#0(opener)",
+                            "at": [0.4, 0.5], "path": path}]}
+
+    def opener_tower(br):
+        rng2 = random.Random(1)
+        roster = [t for t in _OPENER_ROSTER
+                  if t in K["towers"] and K["towers"][t].get("builds")]
+        from collections import Counter
+        return Counter(br._pick_opener(rng2, roster)
+                       for _ in range(30)).most_common(1)[0][0]
+
+    check("cold start opens with dart (the reliable round-6 holder)",
+          opener_tower(brain(mode="chimps", start=6)) == "dart")
+    rt = brain(mode="chimps", start=6)
+    for _ in range(3):
+        rt.observe(tower_leak_row("dart", 2), quiet=True)
+    for _ in range(3):
+        rt.observe(tower_leak_row("dart", 1), quiet=True)
+    check("dart leaking on two lines rotates the opener to another tower",
+          opener_tower(rt) != "dart")
+    for _ in range(3):
+        rt.observe(tower_leak_row("tack", 2), quiet=True)
+    for _ in range(3):
+        rt.observe(tower_leak_row("tack", 0), quiet=True)
+    check("dart AND tack leaking rotates the opener onward (to ice)",
+          opener_tower(rt) not in ("dart", "tack"))
+    # a tower that HELD the opening is not abandoned over earlier leaks
+    held = brain(mode="chimps", start=6)
+    for _ in range(3):
+        held.observe(tower_leak_row("dart", 2), quiet=True)
+    for _ in range(3):
+        held.observe(tower_leak_row("dart", 1), quiet=True)
+    held.observe(tower_leak_row("dart", 2, final_round=45), quiet=True)  # held
+    check("a tower that once HELD stays the opener (not abandoned)",
+          opener_tower(held) == "dart")
+
     print()
     if _fails:
         print(f"FAILED {len(_fails)} case(s): {', '.join(_fails)}")

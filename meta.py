@@ -115,6 +115,16 @@ _SLOW_ONLY = {"glue", "ice"}
 # a price threshold that the real (cheaper-than-listed) bases slip under.
 _OPENER_KILLERS = ("dart", "tack", "boomerang")
 
+# One-life openers to AUDITION, in default-preference order. Dart leads: it
+# reliably clears round 6 cold. The rest are rotated in as the leak memory
+# demotes whatever keeps failing (see MetaBrain._opener_tower_bias), and are
+# also auditioned at the explore rate so they get tried before dart fails.
+# tack and ice are here by player preference; ice is pure-slow AND pricey, so
+# it sits below the cheap poppers (dart/tack/boomerang) -- the rotation reaches
+# it, but doesn't gamble the cold-start run on it.
+_OPENER_ROSTER = ("dart", "tack", "ice", "boomerang")
+_OPENER_PREF = {"dart": 1.0, "tack": 0.85, "ice": 0.65, "boomerang": 0.6}
+
 # The hero isn't in the knowledge base's tower table (which hero is
 # equipped is chosen in the menu, invisible to the bot), so placement
 # uses this profile: short-range coverage suits Sauda -- the sheet's
@@ -1343,6 +1353,57 @@ class MetaBrain:
             return 1.0                      # held at least once: posterior decides
         return bias
 
+    def _opener_tower_bias(self):
+        """Per-tower multiplier that rotates the one-life opener off a whole
+        TOWER whose lines keep leaking, onto a different one (dart -> tack ->
+        ice -> ...). It only kicks in once >=2 DISTINCT build lines of a tower
+        have leaked with none holding -- so the build rotation (a different
+        line of the SAME tower, see _opener_build_bias) is exhausted first, and
+        only then does the tower itself change. A tower that has ever held the
+        opening stays viable (bias 1.0), so a sometimes-winner isn't abandoned
+        over one bad night."""
+        leaked_lines, held = {}, set()
+        for row in self.history:
+            op = next((t for t in row.get("towers", [])
+                       if _role_of_name(t.get("name")) == "opener"), None)
+            if op is None:
+                continue
+            tt = (op.get("tower") or "").lower()
+            if not tt:
+                continue
+            path = op.get("path") or [0, 0, 0]
+            m = path.index(max(path)) if max(path) > 0 else -1
+            start = int(row.get("start_round") or self.start_round)
+            fr = row.get("final_round")
+            if row.get("outcome") == "defeat" and fr is not None \
+                    and fr <= start + EARLY_WINDOW:
+                leaked_lines.setdefault(tt, set()).add(m)
+            else:
+                held.add(tt)
+
+        def bias(tt):
+            if tt in held:
+                return 1.0
+            n = len(leaked_lines.get(tt, ()))
+            return 1.0 / (1.0 + n) if n >= 2 else 1.0
+        return bias
+
+    def _pick_opener(self, rng, roster):
+        """The one-life opener tower: the highest-preference roster tower the
+        leak memory hasn't demoted, with an explore-rate chance to audition a
+        different one so tack/ice (and the rest) get tried, not just dart."""
+        bias = self._opener_tower_bias()
+        scored = [(max(0.02, _OPENER_PREF.get(t, 0.5) * bias(t)), t)
+                  for t in roster]
+        if rng.random() < self.explore:
+            total = sum(w for w, _ in scored)
+            pick, acc = rng.random() * total, 0.0
+            for w, t in scored:
+                acc += w
+                if pick <= acc:
+                    return t
+        return max(scored, key=lambda wt: (wt[0], -roster.index(wt[1])))[1]
+
     def _pick_build(self, rng, ttype, follow_template=False):
         """(main, cross) for a tower: meta build templates re-weighted by
         the learned per-path posterior; explore = any legal combo.
@@ -1659,21 +1720,24 @@ class MetaBrain:
                     # here -- the real wizard/druid base ($270) slips under it
                     # but its $325 tiers strand it at 0-0-1 -- so restrict to the
                     # set outright, intersected with what's actually available.
-                    scalers = [t for t in _OPENER_KILLERS
-                               if t in pool
-                               and self.towers.get(t, {}).get("builds")]
-                    # Dart is the most reliable one-life opener: cheap enough to
-                    # reach a real 0-0-2 pre-wave AND longer-ranged than tack
-                    # (0.081 vs 0.059), so it actually covers the entry instead
-                    # of clipping 1% of the track. It was the only opener that
-                    # cleared round 6 in the field. Prefer it outright; tack/
-                    # boomerang (which strand at 0-0-1) only stand in if dart is
-                    # unavailable -- and they still shine as the CARRY (Tack
-                    # Zone / MOAB Press), which is a separate slot.
-                    if "dart" in scalers:
-                        scalers = ["dart"]
-                    cands = scalers or [t for t in cands
-                                        if t not in _SLOW_ONLY] or cands
+                    # Audition the opener ROSTER (dart, tack, ice, boomerang),
+                    # rotating off whatever keeps leaking. Dart still leads on a
+                    # cold start -- it reliably clears round 6 -- but once its
+                    # lines have all leaked the memory promotes the next tower,
+                    # and the explore rate auditions tack/ice regardless, so the
+                    # bot actually tries the other good openers instead of
+                    # retrying dart forever (the player's request).
+                    roster = [t for t in _OPENER_ROSTER
+                              if t in pool
+                              and self.towers.get(t, {}).get("builds")]
+                    if roster:
+                        cands = [self._pick_opener(rng, roster)]
+                    else:
+                        scalers = [t for t in _OPENER_KILLERS
+                                   if t in pool
+                                   and self.towers.get(t, {}).get("builds")]
+                        cands = scalers or [t for t in cands
+                                            if t not in _SLOW_ONLY] or cands
             ttype = self._pick_tower(rng, cands, [t for t, _ in picks],
                                      novelty=novelty,
                                      deep_slot=role == "carry")
