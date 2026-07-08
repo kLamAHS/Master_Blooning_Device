@@ -867,22 +867,35 @@ class MetaBrain:
         r = prof.get("range") or 0.06
         if style == "buddy":
             # A buffer exists to stand next to the carry, which sits on a
-            # near/mid TRACK spot -- but a LARGE buffer (village) drawing
-            # only from the `roomy` interior can never reach it (on a real
-            # mask near-track spots are never roomy). Draw buddies from the
-            # track rings: the large ones from (near|mid) that are ALSO
-            # roomy (so the executor's roomy-snap is a no-op and they stay
-            # near the carry), the small ones from near|mid|roomy (so an
-            # alchemist can also reach a carry that itself sits in roomy).
+            # near/mid TRACK spot. A LARGE buffer (village) is the subtle
+            # case: the game only lets it land on a ROOMY cell, so if the
+            # scorer picks a near-carry spot that ISN'T roomy the executor's
+            # placement snaps it to the nearest roomy point -- routinely a far
+            # corner (the "village in the top-right, out of range" bug). So a
+            # large buddy may ONLY draw from spots that are BOTH near/mid AND
+            # roomy: then the spot it scores is the spot it lands on, and it
+            # stays in buff range of the cluster. If no near-track cell is
+            # roomy on this mask, fall back to all roomy (still scored by
+            # carry proximity, so it takes the CLOSEST roomy spot, never a
+            # corner). Small buddies (alchemist) draw from near|mid|roomy so
+            # they can also reach a carry that itself sits in roomy.
             near = pools.get("near") or []
             mid = pools.get("mid") or []
             roomy = pools.get("roomy") or []
-            seen, base = set(), []
-            for p in near + mid + roomy:
-                if tuple(p) not in seen:
-                    seen.add(tuple(p))
-                    base.append(p)
-            base = base or pools.get("all") or []
+            if large:
+                # near/mid coords are round(_,3); roomy are raw points -- both
+                # derive from the same grid, so a rounded set aligns them.
+                rset = {(round(p[0], 3), round(p[1], 3)) for p in roomy}
+                base = [p for p in near + mid
+                        if (round(p[0], 3), round(p[1], 3)) in rset]
+                base = base or roomy or pools.get("all") or []
+            else:
+                seen, base = set(), []
+                for p in near + mid + roomy:
+                    if tuple(p) not in seen:
+                        seen.add(tuple(p))
+                        base.append(p)
+                base = base or pools.get("all") or []
         elif large:
             base = pools.get("roomy") or pools.get("all") or []
         else:
@@ -903,6 +916,14 @@ class MetaBrain:
             if nearby:
                 cands = [rng.choice(nearby)
                          for _ in range(min(30, len(nearby)))] + cands[:20]
+            elif carry_spot is not None:
+                # Nothing sits inside buff range -- the map has no roomy cell
+                # close to the cluster (large village on a tight mask). Rather
+                # than let the random sample strand it in a corner, seed the
+                # base spots CLOSEST to the carry so the scorer takes the best
+                # reachable one instead of the farthest.
+                cands = sorted(base, key=lambda p: _dist(p, carry_spot))[:20] \
+                    + cands[:20]
         elif style == "coverage" and not anchor and carry_spot is not None:
             # A free DPS tower clusters with the carry (shared support buffs),
             # so guarantee the sample includes spots inside the buff disc -- a
@@ -989,6 +1010,22 @@ class MetaBrain:
             if roomy:
                 def roomy_near(c, _r=roomy):
                     return any(_dist(c, rp) <= 0.066 for rp in _r)
+                # Buffable FLOOR (not just the +25% nudge below, which the
+                # exposure gap drowns out): the carry's real DPS is what the
+                # village + alchemist MULTIPLY, and a big buffer can only reach
+                # it from an OPEN cell within range. Deep in the track tangle
+                # the top-exposure spots have no roomy cell nearby, so an
+                # un-nudged carry sits where support can never buff it and the
+                # village then strands in a far corner (the user's complaint).
+                # When enough of the exposure-gated candidates ARE buffable,
+                # restrict to them and let exposure pick the best AMONG them: a
+                # small raw-coverage give-up for a carry the whole support
+                # network actually amplifies. Falls back to open scoring when
+                # too few qualify, so a map with no room near the line still
+                # places the carry on its best lane spot.
+                buffable = [c for c in cands if roomy_near(c)]
+                if len(buffable) >= 3:
+                    cands = buffable
         if cands and rng.random() < self.explore \
                 and not (anchor and self._one_life() and not cluster):
             # Explore, but only AMONG the on-track candidates above. The old
@@ -1003,10 +1040,28 @@ class MetaBrain:
             # exactly the bad lane coverage that leaks the single life. The
             # carry still explores/clusters so its support can reach it.
             self._last_spot_src = "explore"
-            if style == "buddy" and carry_spot is not None:
-                in_range = [c for c in cands
-                            if _dist(c, carry_spot) <= r * 0.9]
-                return list(rng.choice(in_range or cands))
+            if style == "buddy":
+                # A buffer anchors to whoever it exists to buff: the carry if
+                # one is placed, else the nearest teammate. Explore only among
+                # spots that reach that anchor; if none do (a big village on a
+                # tight mask), explore among the CLOSEST few open spots -- never
+                # a random draw over the whole map, which is exactly what flung
+                # the village to a far corner (the user's complaint).
+                anchor_pt = carry_spot
+                if anchor_pt is None:
+                    mates_pts = [s for _, s in placed if s]
+                    if mates_pts:
+                        anchor_pt = min(
+                            mates_pts,
+                            key=lambda m: min(_dist(c, m) for c in cands))
+                if anchor_pt is not None:
+                    in_range = [c for c in cands
+                                if _dist(c, anchor_pt) <= r * 0.9]
+                    if in_range:
+                        return list(rng.choice(in_range))
+                    near = sorted(cands,
+                                  key=lambda c: _dist(c, anchor_pt))[:5]
+                    return list(rng.choice(near))
             return list(rng.choice(cands))
 
         # The carry (found above) anchors the geometry for debuffers and
@@ -1051,7 +1106,19 @@ class MetaBrain:
                     # to "wherever it sees the most track", the old bug.
                     d = _dist(c, carry_spot)
                     covers = 1.0 if d <= r * 0.9 else 0.0
-                    prox = max(0.0, 1.0 - d / (r * 0.9))
+                    # Proximity that never floors to zero. A big buffer
+                    # (village) often CANNOT reach a carry that sits deep in
+                    # the track tangle -- the nearest roomy cell can be well
+                    # outside buff range -- so the old `max(0, 1 - d/(r*.9))`
+                    # went flat at zero for every candidate and the score
+                    # collapsed to 0.05*exp, parking the village on the
+                    # highest-exposure ROOMY cell: a far corner (the bug the
+                    # user flagged). This tail keeps rewarding closeness past
+                    # the buff radius, so when nothing covers the carry the
+                    # buffer still takes the CLOSEST open spot -- beside the
+                    # cluster, where it buffs what it can -- instead of drifting
+                    # away. Inside the radius it still climbs toward 1.0.
+                    prox = 1.0 / (1.0 + (d / (r * 0.9)) ** 2)
                     ov = 0.0
                     if carry_span and track.oriented:
                         sp = track.span(c, r)
