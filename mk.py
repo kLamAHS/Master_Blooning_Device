@@ -3179,6 +3179,7 @@ def run_episode(screen, cfg, genome, final_round, abort_lives=50,
     blind_since = None            # when the counter went continuously dark
     hud_dark_since = None         # when the WHOLE HUD (lives too) went dark
     last_blind_recovery = 0.0     # throttle for clear/recalibrate attempts
+    blind_building = [False]      # keep-building-while-blind latch (log once)
     outcome = "hud_lost"
     while True:
         unpause_if_needed(screen, cfg)        # cheap; a paused game shows
@@ -3470,7 +3471,20 @@ def run_episode(screen, cfg, genome, final_round, abort_lives=50,
                 return nb
 
             cash_now = sane_cash()
-            rush = time.time() < emergency_until[0]
+            # Blind-but-alive: the counter is stuck so last_round is frozen,
+            # and the round-gated schedule would FREEZE the whole build for the
+            # blind stretch -- the field failure was reading cleanly to ~r27,
+            # going blind, and reaching round 50 with only ~12 buys made and a
+            # bare board that the MOAB rounds walk through. So while blind keep
+            # BUILDING on the provable cash floor: drop the round gate and buy
+            # any affordable pending defense in schedule order, so the board
+            # grows through the blind stretch instead of stalling.
+            blind_build = (misreads >= 8 and lives is not None and lives > 0)
+            if blind_build and not blind_building[0]:
+                dbg("counter blind but alive -- building on the cash floor, "
+                    "not freezing the plan")
+            blind_building[0] = blind_build
+            rush = time.time() < emergency_until[0] or blind_build
             try:
                 idx = choose_buy(queue, last_round, cash_now, _cost_of,
                                  time.time(), emergency=rush,
