@@ -183,6 +183,34 @@ def earned_by(r, mode="standard"):
     return 650 + 25 * r + 11 * r * r
 
 
+def round_supported_by_cash(claimed_round, cash, spent, mode, tol=0.4):
+    """Sanity-check a (re-synced) round number against the money on hand.
+
+    In CHIMPS you can only be at round r if you have EARNED the cumulative
+    pop-cash for it -- and earned = cash-in-hand + everything spent. So a big
+    forward jump in the counter that claims a round whose required earnings
+    tower over what we can account for is a COUNTER misread, not real
+    progress. The field failure: a blind stretch re-synced the counter
+    27 -> 50 while the wallet had only climbed to ~$1k; the phantom round then
+    inflated the income floor and froze the buy plan into a coast-to-death.
+
+    Returns True when the claim is consistent (earned >= tol * curve) OR the
+    check doesn't apply (non-CHIMPS, unknown cash, degenerate curve) -- i.e.
+    it only ever VETOES a jump the money provably can't support, and defaults
+    to trusting the counter otherwise. `tol` is deliberately loose (0.4) so a
+    real catch-up jump, or a modest curve/ spend-tracking error, still passes;
+    only an egregious mismatch (the 21%-of-curve field case) is rejected."""
+    if mode != "chimps" or cash is None:
+        return True
+    try:
+        need = earned_by(claimed_round - 1, mode)
+    except Exception:
+        return True
+    if need <= 0:
+        return True
+    return (cash + max(0, spent or 0)) >= tol * need
+
+
 def choose_buy(queue, cur_round, cash, cost_of, now, emergency=False,
                gate_ok=None):
     """The economy policy: which pending buy may spend money right now?
@@ -844,7 +872,7 @@ class MetaBrain:
         return _beta(rng, ba, bb)
 
     def _spot_for(self, rng, ttype, pools, taken, placed, track,
-                  large=False, anchor=False, cluster=False):
+                  large=False, anchor=False, cluster=False, role=None):
         """Style-aware placement. `placed` is [(ttype, spot), ...] already
         assigned in this layout. Scores candidates by what the tower
         actually wants -- track coverage for DPS, just-upstream coverage
@@ -865,6 +893,12 @@ class MetaBrain:
             or (HERO_PLACEMENT if ttype == "hero" else {})
         style = prof.get("style", "coverage")
         r = prof.get("range") or 0.06
+        # An AMPLIFIER (an Overclock engineer) buffs the tower it stands next
+        # to, so it must cluster on the carry, not scatter to its own lane at
+        # the bottom of the map, out of range of everyone (the field
+        # complaint). It keeps its coverage profile (so it still wants track),
+        # but is force-clustered like a free DPS tower even when it explores.
+        amplify = role == "amplifier" and style == "coverage"
         if style == "buddy":
             # A buffer exists to stand next to the carry, which sits on a
             # near/mid TRACK spot. A LARGE buffer (village) is the subtle
@@ -982,6 +1016,15 @@ class MetaBrain:
                          and track.exposure(c, r) >= 0.005]
             if len(clustered) >= 3:
                 cands = clustered
+            elif amplify:
+                # An amplifier MUST stay adjacent to buff -- when too few
+                # on-track spots sit inside the disc, don't fall back to open
+                # scatter (which dropped the engineer at the far bottom); keep
+                # the closest on-track spots to the carry so it clusters no
+                # matter how tight the geometry.
+                on = [c for c in cands if track.exposure(c, r) >= 0.005] \
+                    or cands
+                cands = sorted(on, key=lambda c: _dist(c, carry_spot))[:5]
         roomy_near = None
         one_life_anchor = anchor and not cluster and self._one_life()
         if anchor and len(cands) > 2 and not one_life_anchor:
@@ -1062,6 +1105,14 @@ class MetaBrain:
                     near = sorted(cands,
                                   key=lambda c: _dist(c, anchor_pt))[:5]
                     return list(rng.choice(near))
+            if amplify and carry_spot is not None:
+                # An amplifier explores WHICH clustered spot, never whether to
+                # cluster: keep it within the carry's buff disc (or the closest
+                # few), so exploration can't fling it off to its own lane.
+                near = [c for c in cands
+                        if _dist(c, carry_spot) <= BUFF_CLUSTER_R] \
+                    or sorted(cands, key=lambda c: _dist(c, carry_spot))[:5]
+                return list(rng.choice(near))
             return list(rng.choice(cands))
 
         # The carry (found above) anchors the geometry for debuffers and
@@ -1701,7 +1752,7 @@ class MetaBrain:
             spot = self._spot_for(rng, ttype, pools, taken, placed_ctx,
                                   track, large=ttype in large_towers,
                                   anchor=role in ("hero", "opener", "carry"),
-                                  cluster=role == "carry")
+                                  cluster=role == "carry", role=role)
             if spot is None:
                 continue
             spots[i] = spot

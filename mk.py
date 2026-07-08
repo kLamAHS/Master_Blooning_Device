@@ -2939,7 +2939,7 @@ def run_episode(screen, cfg, genome, final_round, abort_lives=50,
         f"lives={read_lives(screen, cfg)}")
 
     try:
-        from meta import choose_buy, earned_by
+        from meta import choose_buy, earned_by, round_supported_by_cash
     except ImportError:                       # no brain: old greedy rule
         def choose_buy(q, _round, _cash, _cost, now, emergency=False,
                        gate_ok=None):
@@ -2948,6 +2948,9 @@ def run_episode(screen, cfg, genome, final_round, abort_lives=50,
 
         def earned_by(_r, _mode="standard"):  # no income model available
             return 0
+
+        def round_supported_by_cash(*_a, **_k):   # no curve: never veto
+            return True
 
     queue = list(genome)
     landed_by_ref, towers = {}, {}
@@ -3209,9 +3212,23 @@ def run_episode(screen, cfg, genome, final_round, abort_lives=50,
                 # (a one-frame garbage read won't repeat) and it is within a
                 # bounded forward jump under the mode cap, so the bot catches
                 # back up instead of declaring hud_lost on a readable counter.
-                dbg(f"counter re-synced after {misreads} misses: "
-                    f"round {last_round} -> {value}")
-                accepted = value
+                #
+                # But a BIG jump is cross-checked against the wallet: in CHIMPS
+                # you can only be at round r if you've earned its cumulative
+                # pop-cash, so a jump the money provably can't support is a
+                # COUNTER misread, not real progress (the field failure:
+                # 27 -> 50 on ~$1k, which then inflated the income floor and
+                # coasted the run to death). Reject it and keep the old round.
+                if value - last_round >= 8 and not round_supported_by_cash(
+                        value, read_cash_confirmed(screen, cfg),
+                        cash_floor.spent, mode):
+                    dbg(f"counter read {value} rejected: the cash on hand "
+                        f"can't support round {value} in CHIMPS -- likely a "
+                        f"misread, holding round {last_round}")
+                else:
+                    dbg(f"counter re-synced after {misreads} misses: "
+                        f"round {last_round} -> {value}")
+                    accepted = value
             prev_read = value
         if accepted is None:
             if detect_panel_side(screen):
