@@ -152,6 +152,7 @@ once; after that your daily loop is just steps 6–8.
     python tools/test_cash_floor.py                     # cash-misread guard
     python tools/test_placement_avoid.py                # never-stack-towers guard
     python tools/test_plot_progress.py                  # progress-dashboard math
+    python tools/test_opener.py                         # one-life no-leak opener
     python tools/simulate_solve.py --seeds 5 --ablate   # end-to-end sim
     python tools/simulate_solve.py --deploy --seeds 5   # deploy path
     ```
@@ -308,6 +309,28 @@ to confuse the colors). It takes a couple of minutes and produces:
 
 The red-tint check is a heuristic, so a stray dot or two near map edges is
 normal — the GA doesn't care, since bad spots just evolve away.
+
+### `measure-ranges` — teach the brain each tower's real range
+
+The brain reasons about **lane coverage** from each tower's range, but the
+built-in ranges are rough (it modelled a tack shooter as covering ~2% of the
+track, so its placements looked blind). This measures the real thing off the
+**in-game range circle** — the same red tint `scan` reads: it hovers each
+tower's ghost over the track (where the circle turns red) and sizes the red
+disc.
+
+```
+python mk.py measure-ranges                 # all common towers
+python mk.py measure-ranges --tower tack    # just one, to re-check
+```
+
+Load the map (round **not** started), walk away. It writes
+`measured_ranges.json`, which the brain loads to override the defaults, and an
+annotated `debug/range_<tower>.png` per tower — glance at those; the green
+circle should trace the tower's real range. One pass per resolution is enough
+(ranges are in screen fractions). Towers it can't size (couldn't find an
+on-track hover spot, or the ghost was unaffordable) are skipped and keep the
+default.
 
 Where does that leave `locate`? It's only needed for hand-written baseline
 plans (your control experiment that proves the clicking pipeline works) and
@@ -523,9 +546,37 @@ python mk.py solve monkey_meadow
   around the least-tried tower families, because when everything known
   keeps dying the same way the problem is the core, not the details.
 - **Winning means winning.** `solve` plays *through* the final round —
-  survival is declared only when the victory screen covers the HUD (or
-  the final round has sat finished for minutes), so a round-100 BAD
+  survival is declared when the **VICTORY screen is recognized** (its green
+  NEXT button, where the loss screen shows a golden RESTART, plus the orange
+  VICTORY ribbon; double-sampled and gated on the final round so a mid-run
+  popup can't fake it), or, as a fallback, when the HUD stays covered through
+  a clear / the final round has sat finished for minutes. A round-100 BAD
   that leaks still counts as the defeat it is.
+- **A one-life opener that actually holds.** On CHIMPS / Impoppable a single
+  leak ends the run, so the plan no longer leads with a lone hero: a hero
+  covers only ~3% of track by its own small range and, buying first, drains
+  the whole $650 so nothing else can be afforded (a real training log showed
+  205/205 runs dying at rounds 6–9 with **one** tower down). The one-life
+  opener now:
+  - **fits several cheap popping defenders** into the starting budget at the
+    start round — preferring real DPS over the hero, which schedules a couple
+    rounds later behind the defense;
+  - is a **cheap tower that SCALES into a tier-4/5 carry** (tack → Tack Zone,
+    dart → Crossbow, boomerang → MOAB Press), drawn from on-track AoE / multi-
+    shot group-clearers — never pure crowd-control (glue/ice only slow), never
+    a pricey $500 ninja that eats the whole $650 and leaves nothing to upgrade,
+    never an off-track single-target sniper that can't clear a round-6 group.
+    Its build follows that carry template instead of a random path, so the
+    early upgrades are an investment, not throwaway;
+  - gets **early teeth** — its first two main-path tiers are pinned to land
+    *before* the plan sinks cash into the hero and the expensive carry base,
+    because a base tower can't pop round 6;
+  - takes the **highest-coverage lane spot deterministically** (the survival
+    anchors never scatter to a random spot on a one-life run, so they sit on
+    the tightest track loop; the carry still clusters so its support reaches
+    it).
+
+  Forgiving rungs keep the hero-as-opener behavior. (`tools/test_opener.py`.)
 - **The whole game is scheduled.** Threat coverage now spans the full
   ladder: camo (r24), lead (r28), MOAB prep (r40), ceramic cleanup
   (r63+), DDT answers (r90-99, MIB/Sabotage/Impale class), and a BAD

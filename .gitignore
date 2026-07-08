@@ -12,3 +12,4 @@ progress.json
 crash_log.txt
 debug/
 progress.html
+measured_ranges.json

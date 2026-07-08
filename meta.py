@@ -33,6 +33,10 @@ except ImportError:
 
 KNOWLEDGE_PATH = Path(__file__).parent / "meta_knowledge.json"
 RUNS_PATH = Path(__file__).parent / "runs_log.jsonl"
+# Real tower ranges measured off the in-game range circle (mk.py
+# measure-ranges). When present they override the rough hardcoded ranges, so
+# coverage is reasoned about with true numbers, not guesses.
+MEASURED_RANGES_PATH = Path(__file__).parent / "measured_ranges.json"
 
 # How many episodes' worth of pseudo-evidence the meta prior is worth.
 # After ~PRIOR_STRENGTH real episodes featuring a tower, the bot's own
@@ -96,6 +100,12 @@ ROUGH_COST = {
     "spike": 1000, "village": 1200, "super": 2500,
 }
 
+# Pure crowd-control towers: they SLOW/freeze bloons but barely pop them.
+# Fine for the "control" role, but a one-life opener built on them lets the
+# round walk past a single life un-killed (observed: glue-only CHIMPS openers
+# dying at round 6), so they're filtered out of the one-life opener slot.
+_SLOW_ONLY = {"glue", "ice"}
+
 # The hero isn't in the knowledge base's tower table (which hero is
 # equipped is chosen in the menu, invisible to the bot), so placement
 # uses this profile: short-range coverage suits Sauda -- the sheet's
@@ -108,28 +118,51 @@ HERO_PLACEMENT = {"range": 0.045, "style": "coverage"}
 TIER_EST = {1: 300, 2: 700, 3: 1800, 4: 4500, 5: 14000}
 
 
-# CHIMPS income is pops-only: no end-of-round bonus, no farms possible.
-# Rough cumulative-cash anchors (rounds 6-100, start cash included) --
-# a deliberately conservative PRIOR that the learned income curve
-# (learner.IncomeCurve, fed by each episode's cash/spend telemetry)
-# replaces as soon as real data exists. Off-by-some just shifts a buy a
-# round or two; the executor still waits for real cash.
-CHIMPS_INCOME_ANCHORS = [
-    (6, 650), (10, 1700), (15, 3300), (20, 5300), (25, 7700),
-    (30, 10600), (35, 14000), (40, 18500), (45, 23500), (50, 29500),
-    (55, 37000), (60, 46000), (65, 57000), (70, 71000), (75, 88000),
-    (80, 110000), (85, 140000), (90, 180000), (95, 240000),
-    (100, 330000),
+# CHIMPS income is pops-only: no end-of-round bonus, no farms possible, and
+# every bloon MUST be popped (one leak ends the run) -- so if you are still
+# alive at round r you have earned EXACTLY the cumulative pop cash for that
+# round. That makes the cash-by-round curve a near-exact predictor, not a
+# rough prior: cumulative(r-1) - (everything spent) is a hard lower bound on
+# current cash, which the cash guard uses to reject "severely off" low OCR
+# reads (see cashguard.CashFloor). Values are the standard CHIMPS round set's
+# cumulative cash (start cash 650 included), per-round for 6..100, from
+# topper64.co.uk/nk/btd6/income/chimps. The (5, 650) base is the wallet
+# entering round 6. The learned IncomeCurve still overrides this once real
+# telemetry exists (a map/hero can pop a little faster or slower).
+CHIMPS_CUM_CASH = [
+    (5, 650), (6, 813), (7, 995), (8, 1195), (9, 1394), (10, 1708),
+    (11, 1897), (12, 2089), (13, 2371), (14, 2630), (15, 2896),
+    (16, 3164), (17, 3329), (18, 3687), (19, 3947), (20, 4133),
+    (21, 4484), (22, 4782), (23, 5059), (24, 5226), (25, 5561),
+    (26, 5894), (27, 6556), (28, 6822), (29, 7211), (30, 7548),
+    (31, 8085), (32, 8712), (33, 8917), (34, 9829), (35, 10979),
+    (36, 11875), (37, 13214), (38, 14491), (39, 16250), (40, 16771),
+    (41, 18952), (42, 19611), (43, 20889), (44, 22183), (45, 24605),
+    (46, 25321), (47, 26958), (48, 29801), (49, 34559), (50, 37575),
+    (51, 38673.5), (52, 40269), (53, 41193.5), (54, 43391), (55, 45874),
+    (56, 47160.5), (57, 49019.5), (58, 51317.5), (59, 53476.5),
+    (60, 54399), (61, 55631), (62, 57017.4), (63, 59843.4),
+    (64, 60693.2), (65, 63764.8), (66, 64769), (67, 65792.6),
+    (68, 66570.4), (69, 67961.4), (70, 70580.2), (71, 72083.2),
+    (72, 73587.2), (73, 74979.8), (74, 78023.8), (75, 80691.2),
+    (76, 82007.2), (77, 84547.4), (78, 89409.4), (79, 96118.4),
+    (80, 97518.6), (81, 102884.6), (82, 107641.6), (83, 112390.6),
+    (84, 119434.6), (85, 122060), (86, 123008.5), (87, 125635.9),
+    (88, 128949.9), (89, 131120.9), (90, 131460.2), (91, 135651.2),
+    (92, 140188.6), (93, 142135.2), (94, 149802.3), (95, 153520.3),
+    (96, 163475.9), (97, 164893.1), (98, 174546.9), (99, 177374.8),
+    (100, 178909.4),
 ]
 
 
 def earned_by(r, mode="standard"):
-    """Very rough cumulative cash available by round r (start cash plus
-    pop income and, outside CHIMPS, end-of-round bonuses; no farms).
-    Only used to PACE the buy plan -- the executor still waits for real
-    cash."""
+    """Cumulative cash available by round r (start cash plus pop income and,
+    outside CHIMPS, end-of-round bonuses; no farms). In CHIMPS this is the
+    exact standard-round-set curve -- accurate enough to catch OCR misreads,
+    not just pace the plan. Interpolates within the table and extrapolates
+    past round 100 with the final slope (still strictly increasing)."""
     if mode == "chimps":
-        pts = CHIMPS_INCOME_ANCHORS
+        pts = CHIMPS_CUM_CASH
         if r <= pts[0][0]:
             return pts[0][1]
         for (r0, c0), (r1, c1) in zip(pts, pts[1:]):
@@ -271,6 +304,11 @@ def _buddy_linked(at, ttype, layout, k):
 # minute of retries discovering the game wouldn't allow it.
 SEP = 0.028
 SEP_LARGE = 0.045
+# How close a free DPS tower should sit to the carry to share support buffs.
+# ~an alchemist's range (measured 0.115): towers inside it get the village
+# and alch buffs, so the free damage clusters here instead of scattering to
+# its own lane spot and going unbuffed.
+BUFF_CLUSTER_R = 0.115
 
 
 def _spread(cands, taken, sep, pull=None):
@@ -413,6 +451,20 @@ class MetaBrain:
         self.evolve = evolve
         self.k = knowledge or _load_json(KNOWLEDGE_PATH)
         self.towers = self.k["towers"]
+        # Measured ranges (mk.py measure-ranges) override the rough defaults so
+        # coverage scoring uses each tower's TRUE range circle, not a guess.
+        if MEASURED_RANGES_PATH.exists():
+            try:
+                measured = json.loads(MEASURED_RANGES_PATH.read_text())
+            except (OSError, ValueError):
+                measured = {}
+            for t, r in (measured or {}).items():
+                if not (isinstance(r, (int, float)) and 0.005 < r < 0.30):
+                    continue
+                if t in self.towers:
+                    self.towers[t].setdefault("placement", {})["range"] = r
+                elif t == "hero":     # the equipped hero's real reach, used by
+                    HERO_PLACEMENT["range"] = r    # every hero placement
         self.roles = self.k["roles"]
         # A knowledge file from before the late-game kinds still gets
         # ceramic/ddt/bad answers -- regenerating the file overrides.
@@ -669,10 +721,19 @@ class MetaBrain:
         rung has fewer than three of its own, near-winning layouts from
         the map's other rungs seed the pool (discounted -- they beat an
         easier game)."""
-        rows = [(self._reward(r), i, r) for i, r in enumerate(self.history)
-                if self.usable(r)]
-        rows.sort(key=lambda x: (-x[0], -x[1]))   # best first, recent first
-        out = [(rw, r) for rw, _, r in rows[:top]]
+        def _cov(r):
+            # How many of this rung's threats the layout already answers.
+            # A tiebreaker AFTER reward: among layouts that reached the same
+            # round, the one that already covers camo/lead/MOAB/... is the
+            # better champion -- it needs less coverage-repair when replayed,
+            # and it's what the report should surface as "best".
+            g = self.coverage_gaps(r.get("towers", []))
+            return sum(1 for x in g.values() if x["covered"])
+        rows = [(self._reward(r), _cov(r), i, r)
+                for i, r in enumerate(self.history) if self.usable(r)]
+        # best reward first, then most-covered, then most recent
+        rows.sort(key=lambda x: (-x[0], -x[1], -x[2]))
+        out = [(rw, r) for rw, _cov_n, _, r in rows[:top]]
         if len(out) < 3 and self.seed_rows:
             out += [(rw * 0.8, r) for rw, r in
                     self.seed_rows[:top - len(out)]]
@@ -833,6 +894,16 @@ class MetaBrain:
             if nearby:
                 cands = [rng.choice(nearby)
                          for _ in range(min(30, len(nearby)))] + cands[:20]
+        elif style == "coverage" and not anchor and carry_spot is not None:
+            # A free DPS tower clusters with the carry (shared support buffs),
+            # so guarantee the sample includes spots inside the buff disc -- a
+            # raw draw of 70 easily misses that small region and the tower
+            # then scatters to its own lane, unbuffed (the field complaint).
+            in_buff = [p for p in base
+                       if _dist(p, carry_spot) <= BUFF_CLUSTER_R]
+            if in_buff:
+                cands = [rng.choice(in_buff)
+                         for _ in range(min(40, len(in_buff)))] + cands[:30]
         cands = _spread(cands, taken, SEP_LARGE if large else SEP,
                         pull=carry_spot if style == "buddy" else None)
         # Keep towers that shoot bloons ON the track: drop candidates that
@@ -848,12 +919,38 @@ class MetaBrain:
             on_track = [c for c in cands if track.exposure(c, r) >= 0.005]
             if len(on_track) >= 2:
                 cands = on_track
+        if style == "coverage" and not anchor and carry_spot is not None \
+                and len(cands) > 3:
+            # Cluster FLOOR (not just the +50% nudge below, which exposure
+            # differences drown out): when enough on-track spots sit inside
+            # the carry's buff disc, RESTRICT the free DPS to them, then the
+            # scorer picks the best-coverage spot AMONG the cluster. This is
+            # what actually keeps damage tight enough for one village + alch
+            # to buff it all; it falls back to open scoring only if the disc
+            # has too few track spots (so it never lands off the track).
+            clustered = [c for c in cands
+                         if _dist(c, carry_spot) <= BUFF_CLUSTER_R
+                         and track.exposure(c, r) >= 0.005]
+            if len(clustered) >= 3:
+                cands = clustered
         roomy_near = None
-        if anchor and len(cands) > 2:
+        one_life_anchor = anchor and not cluster and self._one_life()
+        if anchor and len(cands) > 2 and not one_life_anchor:
             # Exposure floor: keep only the top ~40% by track coverage, so an
             # anchor (hero/opener/carry) always sees a lot of track.
             ranked = sorted(cands, key=lambda c: -track.exposure(c, r))
             cands = ranked[:max(2, int(len(ranked) * 0.4))]
+        elif one_life_anchor and len(cands) > 4:
+            # A one-life survival anchor (opener/hero) must not be HARD-gated
+            # to the max-coverage spot, because on this map those sit in the
+            # back half of the track -- placed there the opener has almost no
+            # lane left to catch a leak and one bloon ends the run (measured:
+            # 54% of openers landed past 0.6, a quarter near the exit). Keep a
+            # generous on-track pool (top ~70% by coverage) and let the strong
+            # kill-early bias below choose an EARLY spot among them, so the
+            # whole track works for the tower that has to hold the single life.
+            ranked = sorted(cands, key=lambda c: -track.exposure(c, r))
+            cands = ranked[:max(4, int(len(ranked) * 0.7))]
         if cluster:
             # ONLY the carry gets nudged toward a spot a support tower can
             # cluster on -- a roomy, village-placeable spot within buff range.
@@ -864,13 +961,19 @@ class MetaBrain:
             if roomy:
                 def roomy_near(c, _r=roomy):
                     return any(_dist(c, rp) <= 0.066 for rp in _r)
-        if cands and rng.random() < self.explore:
+        if cands and rng.random() < self.explore \
+                and not (anchor and self._one_life() and not cluster):
             # Explore, but only AMONG the on-track candidates above. The old
             # branch sampled raw buildable spots here and frequently placed
             # towers with no track in range; exploration should vary WHICH
             # good spot, not whether the tower can see the track at all. A
             # buffer explores only among spots that still cover the carry, so
-            # exploration never breaks the link it exists to make.
+            # exploration never breaks the link it exists to make. On a
+            # ONE-LIFE rung the survival anchors (opener + hero, i.e. anchors
+            # that don't cluster) never explore their spot -- they always take
+            # the highest-coverage lane spot, because a scattered opener is
+            # exactly the bad lane coverage that leaks the single life. The
+            # carry still explores/clusters so its support can reach it.
             self._last_spot_src = "explore"
             if style == "buddy" and carry_spot is not None:
                 in_range = [c for c in cands
@@ -946,6 +1049,26 @@ class MetaBrain:
                         # the entry leaves room for error; a defense
                         # camped at the exit pops with zero margin.
                         s *= 1.25 - 0.50 * sp[1]
+                        # A one-life survival anchor (opener/hero) is far
+                        # more exit-sensitive: placed near the end it has no
+                        # lane left to catch a leak, so ONE bloon ends the
+                        # run. Bias it HARD toward the entry half so the
+                        # whole track works for it and a marginal early
+                        # defense still holds round 6.
+                        if one_life_anchor:
+                            s *= max(0.12, 1.0 - 1.3 * sp[1])
+                # A FREE damage tower should CLUSTER with the carry, not go
+                # solo to its own best lane spot: one village + alchemist can
+                # only buff towers inside its range, so a tight buffed group
+                # out-damages the same towers scattered and unbuffed. Reward
+                # proximity to the carry within a support tower's reach.
+                # Exposure stays the base term, so a clustered spot must still
+                # see the track (the on-track floor already dropped dead ones)
+                # -- this decides WHICH good spot, pulling it into buff range.
+                if not anchor and carry_spot is not None:
+                    d = _dist(c, carry_spot)
+                    if d <= BUFF_CLUSTER_R:
+                        s *= 1.0 + 0.5 * (1.0 - d / BUFF_CLUSTER_R)
             # Learned-region posterior nudges the score. For most towers it
             # only swings +/-20% via a Thompson draw (a wider swing once
             # drowned out short-range towers' small exposure differences). The
@@ -992,10 +1115,14 @@ class MetaBrain:
             return (rank.get(style, 1), i)
         return sorted(range(len(picks)), key=key)
 
-    def _pick_build(self, rng, ttype):
+    def _pick_build(self, rng, ttype, follow_template=False):
         """(main, cross) for a tower: meta build templates re-weighted by
-        the learned per-path posterior; explore = any legal combo."""
-        if rng.random() < self.explore:
+        the learned per-path posterior; explore = any legal combo.
+        follow_template skips the random-explore branch so a scaling anchor
+        (the one-life opener) always builds toward a real tier-5 carry line
+        -- tack -> Tack Zone, dart -> Crossbow -- instead of a throwaway
+        random path."""
+        if not follow_template and rng.random() < self.explore:
             main = rng.randrange(3)
             cross = rng.choice([p for p in range(3) if p != main])
             return main, cross, "explore"
@@ -1240,14 +1367,26 @@ class MetaBrain:
         self.last_strategy = strat
         return genome
 
+    def _one_life(self):
+        """CHIMPS and Impoppable give a single life, so ONE leaked bloon ends
+        the run: surviving the opening rounds outranks economy there."""
+        return self.mode == "chimps" or self.difficulty == "impoppable"
+
     def _role_slots(self, n, hero=False):
-        """Roles for n tower slots. With a hero anchoring, the hero IS
-        the opener -- a separate cheap opener would just split cash away
-        from the carry's first tiers (the second-boomerang trap)."""
+        """Roles for n tower slots. On forgiving rungs, with a hero anchoring
+        the hero IS the opener -- a separate cheap opener would just split
+        cash away from the carry's first tiers (the second-boomerang trap).
+        But on a ONE-LIFE rung a hero covers only ~3% of track by its own
+        small range and, if it also drains the whole starting budget, the
+        run leaks rounds 6-9 it can never take back -- so a cheap popping
+        defender still leads even with a hero (the carry saves up behind it)."""
         if n <= 0:
             return []
         if hero:
-            slots = ["carry", "amplifier", "control", "free"]
+            if self._one_life():
+                slots = ["opener", "carry", "amplifier", "control", "free"]
+            else:
+                slots = ["carry", "amplifier", "control", "free"]
             return slots[:n] + ["free"] * max(0, n - 4)
         slots = ["opener", "carry", "amplifier", "control"]
         if n == 1:
@@ -1271,6 +1410,44 @@ class MetaBrain:
             else:
                 cands = [t for t in self.roles.get(role, [])
                          if t in pool] or pool
+                if role == "opener" and self._one_life():
+                    # A one-life opener should be a CHEAP tower that also
+                    # SCALES into a tier-5 carry (tack -> Tack Zone, dart ->
+                    # Crossbow, boomerang -> MOAB Press): it holds round 6 AND
+                    # becomes the mid-game core, so its early upgrades are an
+                    # investment, not throwaway. Draw from cheap, build-
+                    # templated KILLERS -- never pure crowd-control (glue/ice
+                    # only slow), never the pricey ones ($500 ninja) that eat
+                    # the whole $650 and leave no room to upgrade or add a
+                    # second tower.
+                    #
+                    # Budget off cash IN HAND pre-wave -- income(start_round-1),
+                    # ~$650 -- NOT income(start_round) which counts round-6 pops
+                    # you have not made yet ($813) and inflates the cap to $488,
+                    # letting in wizard/druid/engineer. Those have a pricey base
+                    # AND $325 second tiers, so they strand at 0-0-1 and leak the
+                    # one life. At the real $390 cap only dart/tack/boomerang
+                    # qualify -- cheap group-clearers whose first two tiers both
+                    # fit the opening wallet (a real 0-0-2 by round 6).
+                    cap = 0.6 * self.income(max(1, self.start_round - 1))
+
+                    def _oc(t, _p=price_of):
+                        return (_p(t) if _p else None) or ROUGH_COST.get(t, 600)
+
+                    def _style(t):
+                        return (self.towers.get(t, {}).get("placement")
+                                or {}).get("style", "coverage")
+                    # cheap + scales + KILLS GROUPS (on-track AoE/multi-shot).
+                    # Exclude pure slow (glue/ice) and OFFSIDE single-target
+                    # (a base sniper has infinite range but pops one bloon at a
+                    # time -- it can't clear a round-6 group before it leaks).
+                    scalers = [t for t in pool
+                               if t not in _SLOW_ONLY
+                               and _style(t) != "offside"
+                               and self.towers.get(t, {}).get("builds")
+                               and _oc(t) <= cap]
+                    cands = scalers or [t for t in cands
+                                        if t not in _SLOW_ONLY] or cands
             ttype = self._pick_tower(rng, cands, [t for t, _ in picks],
                                      novelty=novelty,
                                      deep_slot=role == "carry")
@@ -1335,20 +1512,74 @@ class MetaBrain:
             if e["do"] == "place" and e["ref"] in min_by:
                 e["round"] = min(e["round"], min_by[e["ref"]])
                 place_round[e["ref"]] = e["round"]
-        # No-leak opener: the single most important anchor (hero, else the
-        # opener, else the carry) must be DOWN by the start round. CHIMPS
-        # begins at round 6 with one life -- an anchor the income curve
-        # would park at round 8 leaks rounds 6-7 it can never recover.
+        # No-leak opener. The most important anchor(s) must be DOWN by the
+        # start round -- an anchor the income curve would park at round 8
+        # leaks rounds 6-7 it can never recover.
         places = [e for e in entries if e["do"] == "place"]
-        anchor = None
-        for want in ("hero", "opener", "carry"):
-            anchor = next((e for e in places
-                           if _role_of_name(e.get("name")) == want), None)
-            if anchor:
-                break
-        if anchor is None and places:
-            anchor = min(places, key=lambda e: (e["round"], e["prio"]))
-        if anchor is not None:
+        if places and self._one_life():
+            # One life: a lone anchor -- especially a hero that drains the
+            # whole budget and then covers ~3% of track -- leaks the opening
+            # (observed: 205/205 CHIMPS runs died r6-9 with one tower down).
+            # So fit as many CHEAP popping defenders as the starting budget
+            # holds, preferring real DPS over the hero, all pinned to round 6.
+            # Cash IN HAND before the start round plays -- the cumulative by
+            # the END of the previous round (income(r) counts money earned
+            # DURING round r from pops, which you do not have pre-wave: at r6
+            # income(6)=813 but the wallet holds 650). Budgeting the opener at
+            # the real starting cash is what keeps a second tower from
+            # sneaking in and leaving the anchor bare.
+            budget = self.income(max(1, self.start_round - 1))   # ~$650 at r6
+            prefer = {"opener": 0, "carry": 1, "control": 2,
+                      "amplifier": 3, "hero": 4, "free": 5}
+
+            def _anchor_key(e):
+                return (prefer.get(_role_of_name(e.get("name")), 5),
+                        e.get("est") or 500)
+
+            def _pull(e):
+                e["round"] = min(e["round"], self.start_round)
+                e["_anchor"] = True
+                place_round[e["ref"]] = e["round"]
+
+            ordered = sorted(places, key=_anchor_key)
+            primary = ordered[0] if ordered else None
+            # Reserve the PRIMARY anchor's first two main-path tiers. A single
+            # upgraded popper (a 0-0-2 dart/tack) holds round 6 far better than
+            # two BARE towers that split the wallet and each leak -- the field
+            # failure: 37/40 one-life runs died r6-9 with bare openers. The
+            # executor buys these teeth pre-start (the pre-round phase has no
+            # clock), so a second tower is pulled only if it fits WITHOUT
+            # eating the opener's teeth.
+            teeth = 0
+            if primary is not None:
+                tcosts = sorted(
+                    (u.get("est") or 300 for u in entries
+                     if u["do"] == "upgrade"
+                     and u["ref"] == primary["ref"]))
+                teeth = sum(tcosts[:2])
+            spent = pulled = 0
+            for e in ordered:
+                cost = e.get("est") or 500
+                room = budget - (teeth if e is not primary else 0)
+                if spent + cost <= room:        # fits, teeth budget intact
+                    _pull(e)
+                    spent += cost
+                    pulled += 1
+            if pulled == 0:                     # nothing affordable fit --
+                _pull(min(places,               # still never leak round 6
+                          key=lambda e: e.get("est") or 500))
+        elif places:
+            # Forgiving rungs: the single most important anchor (hero, else
+            # the opener, else the carry) leads; a few early leaks are fine
+            # and a second cheap tower would only starve the carry.
+            anchor = None
+            for want in ("hero", "opener", "carry"):
+                anchor = next((e for e in places
+                               if _role_of_name(e.get("name")) == want), None)
+                if anchor:
+                    break
+            if anchor is None:
+                anchor = min(places, key=lambda e: (e["round"], e["prio"]))
             anchor["round"] = min(anchor["round"], self.start_round)
             anchor["_anchor"] = True
             place_round[anchor["ref"]] = anchor["round"]
@@ -1382,10 +1613,12 @@ class MetaBrain:
             taken.append(spot)
             placed_ctx.append((ttype, spot))
         placed = []      # (ref, ttype, spot, main, cross, label)
-        for ref, (ttype, _role) in enumerate(picks):
+        for ref, (ttype, role) in enumerate(picks):
             if ref not in spots:
                 continue
-            main, cross, label = self._pick_build(rng, ttype)
+            main, cross, label = self._pick_build(
+                rng, ttype,
+                follow_template=(role == "opener" and self._one_life()))
             placed.append((ref, ttype, spots[ref], main, cross, label))
 
         def base_cost(ttype):
@@ -1410,7 +1643,11 @@ class MetaBrain:
         # and then start upgrading. The hero and opener anchor, the carry
         # base follows, then the carry's first tiers -- support bases and
         # everything else joins the plan AFTER the carry has teeth.
-        place_plan = {"hero": (0, 1.0), "opener": (0, 2.0),
+        # The cheap opener defender is scheduled BEFORE the hero so it lands
+        # first with the starting cash -- the hero (which drains ~$600 and
+        # covers little track) must never pre-empt the tower that actually
+        # holds round 6.
+        place_plan = {"opener": (0, 1.0), "hero": (0, 2.0),
                       "carry": (0, 3.0), "amplifier": (1, 9.0),
                       "control": (1, 13.0), "free": (2, 17.0)}
         # A tower whose BASE answers a threat (ninja = camo, bomb = lead)
@@ -1502,17 +1739,31 @@ class MetaBrain:
                     is_need = tier <= self._need_tier(need, p_i)
                     early_carry = (role == "carry" and p_i == main
                                    and tier <= 3)
+                    # One-life opener teeth: a base tower can't pop round 6,
+                    # so the opener's first two main-path tiers come even
+                    # BEFORE the carry's -- an upgraded popper is what holds
+                    # the single life while the carry saves up.
+                    early_opener = (role == "opener" and self._one_life()
+                                    and p_i == main and tier <= 2)
+                    early_anchor = early_carry or early_opener
                     dl = self._deadline(ttype, main, p_i, tier, need)
-                    if early_carry:
+                    if early_opener:
+                        # BEFORE the hero (place deadline 2) and the carry
+                        # BASE (3): the opener's teeth must accumulate in the
+                        # income-paced walk before the plan sinks $600 into the
+                        # hero and reserves $2500 for the carry, or its first
+                        # tier lands ~round 18 and round 6 is held by a base.
+                        dl = 1.0 + 0.3 * tier
+                    elif early_carry:
                         # The carry's first tiers outrank every support
                         # BASE: upgrade the tower you have before buying
                         # three more. Tight noise -- these must not
                         # leapfrog the opener/carry bases themselves.
                         dl = 2.0 + 3.0 * tier
-                    noise = 1.0 if early_carry else 4.0
+                    noise = 1.0 if early_anchor else 4.0
                     entry = {
                         "do": "upgrade", "ref": order, "path": vec,
-                        "prio": 0 if (is_need or early_carry)
+                        "prio": 0 if (is_need or early_anchor)
                         else (1 if p_i == main else 2),
                         "deadline": dl + rng.uniform(-noise, noise),
                         "est": tier_cost(ttype, p_i, tier)}
@@ -2358,8 +2609,12 @@ def _selftest():
     # absolute levels legitimately exceed the standard quadratic, which
     # is a pacing heuristic, not a pop-income model.
     assert all(earned_by(r, "chimps") <= earned_by(r)
-               for r in range(6, 46)), \
+               for r in range(6, 45)), \
         "chimps income prior must undercut the standard curve early"
+    # r45+ the real CHIMPS pop income (BFB/ceramic waves) overtakes the
+    # standard quadratic, which is a pacing heuristic, not a pop model.
+    assert earned_by(45, "chimps") > earned_by(45), \
+        "chimps overtakes the standard curve once the big waves start"
     assert all(earned_by(r, "chimps") < earned_by(r + 1, "chimps")
                for r in range(6, 110)), \
         "chimps income prior must be strictly increasing"

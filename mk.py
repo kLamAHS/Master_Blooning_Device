@@ -718,12 +718,25 @@ def _plausible_cash_shape(box):
     widens its search window from the SAVED box, so one rogue tall
     'character' compounds session over session (0.055 -> 0.0845 ->
     0.1676 -> 0.3249 in the field) unless implausible shapes are
-    refused both when produced and when loaded."""
+    refused both when produced and when loaded.
+
+    The width cap is deliberately GENEROUS (0.22): a legit 6-digit run
+    on a wide HUD measures ~0.148 (field: [0.2029, 0.0416, 0.1479,
+    0.0651]), and a runaway 'junk $1' box measured ~0.151 -- the two are
+    a hair apart, so width CANNOT discriminate good from broken. A cap
+    tuned tight enough to reject the junk box (e.g. 0.13) also rejects
+    the real counter, which blinds the economy for the whole run. So we
+    only reject GROSSLY oversized boxes here (the 0.32 runaway tail) and
+    let the stuck-detector (cash_floor.stuck() -> recalibrate) catch a
+    box that is plausibly shaped but reads garbage."""
     if not box:
         return False
     x, y, w, h = box
     return (0.015 <= h <= 0.10          # digit strip, not a map chunk
-            and w <= 0.35               # never wider than the HUD zone
+            and w <= 0.22               # a 6-digit run is ~0.11-0.15 wide;
+            #                             only reject the gross runaway tail
+            #                             (0.32+); the stuck-detector, not
+            #                             width, catches a garbage-reading box
             and 1.0 <= w / h <= 12.0    # wide strip (fractions, so a
             and y + h <= 0.16)          # 2-digit run is ~1.15) / top HUD
 
@@ -1514,6 +1527,33 @@ def looks_defeated(screen):
     hsv = cv2.cvtColor(title, cv2.COLOR_BGR2HSV)
     orange = cv2.inRange(hsv, (3, 120, 120), (24, 255, 255))
     return float((orange > 0).mean()) > 0.08
+
+
+VICTORY_GEOM = {
+    # The VICTORY screen: a wide orange "VICTORY" ribbon banner ABOVE where
+    # the DEFEAT lettering sits, and a green NEXT button below the stats card
+    # (the defeat screen shows a golden-yellow RESTART button there instead).
+    "banner": [0.30, 0.10, 0.40, 0.16],   # orange ribbon (y clear of DEFEAT)
+    "next": [0.40, 0.83, 0.20, 0.10],     # green NEXT button, lower-centre
+}
+
+
+def looks_victorious(screen):
+    """Is the VICTORY screen up? Two independent cues must fire: a GREEN NEXT
+    button in the lower-centre (where the loss screen puts a golden RESTART,
+    so the button colour is the clean discriminator) AND the orange VICTORY
+    ribbon across the top. It also refuses if the DEFEAT screen is up, so a
+    frame that briefly shows both can never be scored as a win. Callers gate
+    this on the final round, so a mid-run popup can't end a run early."""
+    nxt = screen.grab(VICTORY_GEOM["next"])
+    if _green_fraction(nxt) < 0.15:           # no green NEXT -> not a win
+        return False
+    banner = screen.grab(VICTORY_GEOM["banner"])
+    hsv = cv2.cvtColor(banner, cv2.COLOR_BGR2HSV)
+    orange = cv2.inRange(hsv, (3, 120, 120), (24, 255, 255))
+    if float((orange > 0).mean()) < 0.06:     # no orange VICTORY ribbon
+        return False
+    return not looks_defeated(screen)
 
 
 # The defeat screen comes in two layouts -- Home/Restart and, more often,
@@ -2334,6 +2374,79 @@ def ring_red_shift(cur, clean, cx, cy, r_in, r_out):
     return float(np.median(shift_px))
 
 
+def measure_tower_range(screen, cfg, tower, debug_dir=None):
+    """Measure a tower's ACTUAL range as a fraction of screen width, by
+    hovering its ghost over an UNPLACEABLE spot -- where BTD6 paints the whole
+    range circle RED -- and walking a thin ring outward until that red tint
+    ends. That radius is the range. Reuses the very red-shift detector the
+    scanner uses for placeability, so it needs no new calibration idea; the
+    result replaces the rough hardcoded `range` the brain guesses coverage
+    from (a tack modelled at 1.9% of track is why placements looked blind).
+    Returns the range fraction, or None if no red circle could be sized (the
+    ghost never appeared, or no on-track hover spot was found)."""
+    r_in = max(6, int(0.020 * screen.h))          # scan's placeability ring
+    r_out = max(r_in + 4, int(0.050 * screen.h))
+    clean = screen.grab()
+    pyautogui.moveTo(*screen.to_pixels(0.45, 0.50))
+    time.sleep(0.2)
+    press_key(TOWER_HOTKEYS[tower])                # pick up the ghost
+    time.sleep(0.45)
+    cx0, cy0 = int(0.45 * screen.w), int(0.50 * screen.h)
+    held = screen.grab()
+    if np.abs(held[cy0 - r_out:cy0 + r_out, cx0 - r_out:cx0 + r_out].astype(int)
+              - clean[cy0 - r_out:cy0 + r_out, cx0 - r_out:cx0 + r_out]
+              .astype(int)).mean() < 2.0:
+        click("right")
+        return None                                # no ghost (unaffordable?)
+
+    # Find the reddest (most clearly on-track) hover spot: the range circle is
+    # only red where the cursor itself sits on an unplaceable cell.
+    best = None
+    for hx in (0.34, 0.42, 0.50, 0.26, 0.58, 0.38, 0.46, 0.30):
+        for hy in (0.50, 0.42, 0.58, 0.35, 0.66):
+            pyautogui.moveTo(*screen.to_pixels(hx, hy))
+            time.sleep(0.10)
+            cur = screen.grab()
+            cx, cy = int(hx * screen.w), int(hy * screen.h)
+            red = ring_red_shift(cur, clean, cx, cy, r_in, r_out)
+            if best is None or red > best[0]:
+                best = (red, hx, hy)
+    red0, hx, hy = best
+    if red0 < 10.0:                                # never landed on the track
+        click("right")
+        return None
+    pyautogui.moveTo(*screen.to_pixels(hx, hy))
+    time.sleep(0.15)
+    cur = screen.grab()
+    click("right")                                 # done: drop the ghost
+    cx, cy = int(hx * screen.w), int(hy * screen.h)
+
+    # Radial red profile: thin rings from just outside the monkey body out to a
+    # quarter-screen. The red tint fills the circle, so it stays high to the
+    # edge and then falls off -- the farthest ring still clearly red is R.
+    step = max(2, int(0.0035 * screen.w))
+    prof = []
+    r = max(6, int(0.016 * screen.h))
+    while r < int(0.26 * screen.w):
+        prof.append((r, ring_red_shift(cur, clean, cx, cy,
+                                       max(2, r - step), r + step)))
+        r += step
+    peak = max((v for _, v in prof), default=0.0)
+    if peak < 10.0:
+        return None
+    thr = max(6.0, 0.45 * peak)                    # half the fill's red shift
+    strong = [rr for rr, v in prof if v >= thr]
+    if not strong:
+        return None
+    R = max(strong)
+    if debug_dir is not None:
+        shot = cur.copy()
+        cv2.circle(shot, (cx, cy), R, (0, 255, 0), 2)
+        cv2.circle(shot, (cx, cy), 3, (0, 255, 0), -1)
+        cv2.imwrite(str(Path(debug_dir) / f"range_{tower}.png"), shot)
+    return round(R / screen.w, 4)
+
+
 def cmd_scan(args):
     """Machine-generated placement knowledge: no human hovering required.
     Hold a tower ghost, sweep the cursor over a grid, and ask the game
@@ -2464,6 +2577,65 @@ def cmd_scan(args):
     print("Green = safe interior spots (use these for plans). Orange = "
           "valid but hugging an edge. If it disagrees with the map, tune "
           "\"scan_red_shift\" in config.json and rescan.")
+
+
+MEASURED_RANGES_PATH = Path(__file__).parent / "measured_ranges.json"
+
+
+def cmd_measure_ranges(args):
+    """Measure each tower's TRUE range from the in-game range circle and save
+    it, so the brain reasons about lane coverage with real numbers instead of
+    the rough hardcoded guesses (a tack it thought covered ~2% of track). Load
+    the map (round NOT started) and walk away; each tower's ghost is hovered
+    over the track, where its range circle turns red, and the red disc is
+    measured. Writes measured_ranges.json (merged), which meta.py loads."""
+    cfg = load_config()
+    screen, hwnd = make_screen(cfg)
+    debug_dir = Path(__file__).parent / "debug"
+    debug_dir.mkdir(exist_ok=True)
+    if args.tower:
+        towers = [args.tower.lower()]
+    else:
+        # "hero" measures whichever hero is EQUIPPED (its range circle is the
+        # same red overlay) -- so a Sauda opener is sized from her real reach,
+        # not the default guess. It's placed via its own hotkey like any tower.
+        towers = [t for t in ("dart", "tack", "boomerang", "sniper", "ninja",
+                              "bomb", "glue", "ice", "wizard", "druid",
+                              "alchemist", "engineer", "mortar", "super",
+                              "village", "hero") if t in TOWER_HOTKEYS]
+    print("Measuring tower ranges from the in-game range circle. Load the map "
+          "(round NOT started) and don't touch the mouse.")
+    print("Starting in 4 seconds...")
+    focus_game_window(hwnd)
+    time.sleep(4)
+    out = {}
+    for tower in towers:
+        try:
+            r = measure_tower_range(screen, cfg, tower, debug_dir)
+        except Exception:
+            _log_crash(f"measure-range {tower}")
+            r = None
+        try:
+            clear_ui(screen, cfg)
+        except Exception:
+            pass
+        if r:
+            out[tower] = r
+        print(f"   {tower:10} range = "
+              f"{('%.4f (%.0f%% of screen width)' % (r, 100 * r)) if r else 'FAILED -- see debug/range_*.png'}")
+    existing = {}
+    if MEASURED_RANGES_PATH.exists():
+        try:
+            existing = json.loads(MEASURED_RANGES_PATH.read_text())
+        except Exception:
+            existing = {}
+    existing.update(out)
+    MEASURED_RANGES_PATH.write_text(json.dumps(existing, indent=1) + "\n")
+    print(f"\nSaved {len(out)}/{len(towers)} ranges to "
+          f"{MEASURED_RANGES_PATH.name}. The brain now sizes coverage with "
+          f"these. Check debug/range_<tower>.png -- the green circle should "
+          f"trace the real range; if it's off, rerun a single tower with "
+          f"`measure-ranges --tower <name>`.")
 
 
 MASK_POINTS = []     # strict points from the loaded mask; retries use these
@@ -2829,10 +3001,29 @@ def run_episode(screen, cfg, genome, final_round, abort_lives=50,
             v, confirm_fn=lambda: read_cash_confirmed(screen, cfg),
             round_hint=last_round)
         if v is not None and out is not None and out != v:
-            dbg(f"sane_cash: read ${v} << floor "
-                f"${int(cash_floor.value) if cash_floor.value is not None else out}"
-                f", using ${out}")
+            # `out` is the higher of the spend-tracked floor and the CHIMPS
+            # earned-minus-spent estimate; either way it's cash we can PROVE
+            # we have, so a read below it is a clipped/garbled OCR misread.
+            dbg(f"sane_cash: read ${v} is below the ${out} we can prove we "
+                f"have by round {last_round} (earned minus spend) -- "
+                f"using ${out}, not reading it as broke")
         return out
+
+    def recalibrate_cash_if_stuck():
+        """A cash box that has drifted onto junk reads a CONSTANT low value
+        (the field bug: a '$1' at round 27 while cash is really in the
+        thousands), which the floor then substitutes on every buy -- the whole
+        plan freezes behind a phantom-low wallet until the run is lost. When
+        sane_cash has substituted many times running with no good read, the
+        BOX is broken, not the game: re-find the counter from scratch off the
+        coin/heart HUD landmark and re-seed the floor from the fresh read."""
+        if not cash_floor.stuck():
+            return
+        dbg("cash reads stuck low -- recalibrating the counter from the "
+            "HUD landmark")
+        preflight_cash_box(screen, cfg, recalibrate=True)
+        cash_floor.reset_stuck()
+        confirm_floor()
 
     def set_watermark(price=None):
         """Record the cash level of a money-failure. Being broke for a
@@ -2920,9 +3111,60 @@ def run_episode(screen, cfg, genome, final_round, abort_lives=50,
             queue.pop(idx)
             record_spend(PRICES.get(price_key(ttype)) or item.get("est") or 0)
             clear_ui(screen, cfg)
+        return start_round
+
+    def upgrade_prestart_openers(start_round):
+        """Spend the leftover opening cash UPGRADING the just-placed towers
+        before the round starts. A bare 0-0-0 tower leaks round 6 on one
+        life -- the wave hits before its first tier can be bought mid-round
+        -- but the pre-round phase has NO clock, so buy each opener's due
+        tiers now and start the round with teeth already out. Only tiers the
+        plan already scheduled for the start round are pulled (the opener's
+        early_opener teeth); the carry's pricey upgrades are gated later, so
+        this never drains the wallet, it just front-loads the cheap defence
+        that has to hold round 6."""
+        guard = 0
+        while guard < 12:
+            guard += 1
+            idx = next((j for j, it in enumerate(queue)
+                        if it.get("do") == "upgrade"
+                        and it.get("round", 0) <= start_round
+                        and it.get("ref") in landed_by_ref
+                        and landed_by_ref.get(it["ref"]) is not None), None)
+            if idx is None:
+                break
+            item = queue[idx]
+            landed = landed_by_ref[item["ref"]]
+            entry = towers.get(tuple(landed))
+            if entry is None:
+                queue.pop(idx)
+                continue
+            ttype = entry["tower"].lower()
+            pi = item["path"].index(1) if 1 in item["path"] else 0
+            tier = entry["path"][pi] + 1
+            if is_locked(ttype, pi, tier):
+                queue.pop(idx)
+                continue
+            known = PRICES.get(price_key(ttype, pi, tier))
+            cash = sane_cash()
+            if known is not None and cash is not None and cash < known:
+                break          # can't afford the cheapest due tier: start now
+            st = act_upgrade(
+                screen, cfg,
+                {**item, "at": landed, "sane_cash": sane_cash}, entry)
+            if st == "bought":
+                queue.pop(idx)
+                record_spend(PRICES.get(price_key(ttype, pi, tier))
+                             or item.get("est") or 0)
+                confirm_floor()
+            elif st in ("locked", "closed"):
+                queue.pop(idx)
+            else:
+                break          # broke / no_select: stop, get the round going
 
     confirm_floor()                # seed the floor from starting cash before
-    place_prestart_openers()       # any pre-start buy lowers it
+    _start_round = place_prestart_openers()   # any pre-start buy lowers it
+    upgrade_prestart_openers(_start_round)     # give the opener teeth pre-wave
     clean = screen.grab() if flow_sensor else None
     press_key("space")
     time.sleep(0.3)
@@ -2935,18 +3177,39 @@ def run_episode(screen, cfg, genome, final_round, abort_lives=50,
     dumped_defeat_check = False
     misreads = 0
     blind_since = None            # when the counter went continuously dark
+    hud_dark_since = None         # when the WHOLE HUD (lives too) went dark
     last_blind_recovery = 0.0     # throttle for clear/recalibrate attempts
     outcome = "hud_lost"
     while True:
         unpause_if_needed(screen, cfg)        # cheap; a paused game shows
+        recalibrate_cash_if_stuck()           # broken box -> re-find, not freeze
         value, *_ = read_round(screen, cfg)   # a frozen-but-visible counter
         prev_lives = lives
         lives = read_lives(screen, cfg)
+        if lives is not None and lives > 0:
+            hud_dark_since = None      # a live lives count: HUD isn't dark
         accepted = None
         if value is not None:
             if value == last_round:
                 accepted = value
             elif plausible(value, last_round) and value == prev_read:
+                accepted = value
+            elif (misreads >= 6 and value == prev_read
+                  and last_round is not None
+                  and last_round < value <= last_round + 40
+                  and value <= (200 if FREEPLAY else 100)):
+                # Re-sync after a blind stretch. BTD6 rounds auto-chain, so
+                # while the counter was unreadable (a long buy-spree in the
+                # tower panels, an overlay) the game kept advancing. A read
+                # past last+3 is then NOT a misread but the true, larger
+                # round -- rejecting it forever (as the tight plausible()
+                # jump does) is exactly what made a live round-27 game read
+                # as a lost HUD. Accept it once two consecutive frames agree
+                # (a one-frame garbage read won't repeat) and it is within a
+                # bounded forward jump under the mode cap, so the bot catches
+                # back up instead of declaring hud_lost on a readable counter.
+                dbg(f"counter re-synced after {misreads} misses: "
+                    f"round {last_round} -> {value}")
                 accepted = value
             prev_read = value
         if accepted is None:
@@ -2959,6 +3222,7 @@ def run_episode(screen, cfg, genome, final_round, abort_lives=50,
         else:
             misreads = 0
             blind_since = None                # counter is readable again
+            hud_dark_since = None             # ...so the HUD is not dark
             if accepted != last_round:
                 last_round = accepted
                 # Cash grows a digit or two over a run; re-widen the box if
@@ -3105,6 +3369,105 @@ def run_episode(screen, cfg, genome, final_round, abort_lives=50,
                 lnd = landed_by_ref.get(g["ref"])
                 ent = towers.get(tuple(lnd)) if lnd else None
                 return bool(ent) and max(ent["path"]) >= g["tier"]
+
+            def do_batched_upgrade(item, entry, landed, pi, tier,
+                                   ttype, tname):
+                """Buy every DUE tier for THIS tower in ONE panel session:
+                open once, buy the whole affordable run, close once --
+                instead of open/buy/close per queued tier (act_upgrade
+                already buys a multi-count path vector in one panel; the
+                queue just split every tier into its own item). A reservation
+                for the priciest OTHER due buy keeps a tower's cheap tiers
+                from starving the carry we are saving toward, so this never
+                spends money choose_buy would not have released this round;
+                worst case it degrades to the single selected tier (no
+                regression). Returns how many tiers were bought."""
+                now = time.time()
+                reserve = max(
+                    [_cost_of(it) or 0 for it in queue
+                     if it.get("ref") != item["ref"]
+                     and it.get("round", 0) <= (last_round or 0)],
+                    default=0)
+                cashb = sane_cash()
+                budget = None if cashb is None else max(0, cashb - reserve)
+                proj = list(entry["path"])
+                vec = [0, 0, 0]
+                members = []                       # (queue_item, path_i)
+                spent_known = 0
+                ordered = [item] + [
+                    it for it in queue
+                    if it is not item and it.get("ref") == item["ref"]
+                    and it.get("do") == "upgrade"]
+                for it in ordered:
+                    p = it["path"].index(1) if 1 in it["path"] else 0
+                    t = proj[p] + 1
+                    if is_locked(ttype, p, t) \
+                            or p in entry.get("closed_paths", []):
+                        continue
+                    if it is not item and it.get("_wake", 0) > now:
+                        continue
+                    price = PRICES.get(price_key(ttype, p, t))
+                    if it is not item and budget is not None \
+                            and price is not None \
+                            and spent_known + price > budget:
+                        continue                   # would dip into reserve
+                    if price is not None:
+                        spent_known += price
+                    vec[p] += 1
+                    proj[p] += 1
+                    members.append((it, p))
+                before = list(entry["path"])
+                st = act_upgrade(
+                    screen, cfg,
+                    {**item, "at": landed, "path": vec,
+                     "sane_cash": sane_cash}, entry)
+                bought = [entry["path"][k] - before[k] for k in range(3)]
+                nb = sum(bought)
+                giveup = 4 if st in ("no_select", "unread") else 6
+                need = list(bought)
+                for it, p in members:
+                    if need[p] > 0:                # this tier landed
+                        need[p] -= 1
+                        try:
+                            queue.remove(it)
+                        except ValueError:
+                            pass
+                    else:                          # didn't land: keep it
+                        t = entry["path"][p] + 1
+                        if p in entry.get("closed_paths", []) \
+                                or is_locked(ttype, p, t):
+                            try:
+                                queue.remove(it)   # path closed / XP-locked
+                            except ValueError:
+                                pass
+                        else:
+                            it["_fails"] = it.get("_fails", 0) + 1
+                            it["_wake"] = time.time() + (
+                                min(10 * 2 ** (it["_fails"] - 1), 60)
+                                if st == "broke" else 10)
+                            if it["_fails"] >= giveup:
+                                try:
+                                    queue.remove(it)
+                                except ValueError:
+                                    pass
+                if nb > 0:
+                    broke_at[0] = None
+                    for k in range(3):
+                        for t in range(before[k] + 1, entry["path"][k] + 1):
+                            record_spend(
+                                PRICES.get(price_key(ttype, k, t))
+                                or item.get("est") or 0)
+                    confirm_floor()
+                    if nb > 1:
+                        dbg(f"{tname}: bought {nb} tiers in one panel "
+                            f"{bought}")
+                    else:
+                        dbg(f"{tname} path{pi + 1} t{tier}: bought")
+                else:
+                    dbg(f"{tname} path{pi + 1} t{tier}: {st}")
+                    if st == "broke":
+                        set_watermark(PRICES.get(price_key(ttype, pi, tier)))
+                return nb
 
             cash_now = sane_cash()
             rush = time.time() < emergency_until[0]
@@ -3287,38 +3650,22 @@ def run_episode(screen, cfg, genome, final_round, abort_lives=50,
                             dbg(msg)
                         item["_wake"] = time.time() + 5
                     else:
-                        st = act_upgrade(
-                            screen, cfg,
-                            {**item, "at": landed,
-                             "sane_cash": sane_cash}, entry)
-                        dbg(f"{tname} path{pi + 1} t{tier}: {st}")
-                        if st == "bought":
-                            queue.pop(idx)
-                            broke_at[0] = None
+                        # One panel session buys every DUE tier for this
+                        # tower (open/buy.../close), not one tier per open.
+                        # The helper pops the tiers that landed, sleeps or
+                        # drops the rest, and books the spend.
+                        if do_batched_upgrade(item, entry, landed, pi, tier,
+                                              ttype, tname) > 0:
                             attempts = 0
-                            record_spend(
-                                PRICES.get(price_key(ttype, pi, tier))
-                                or item.get("est") or 0)
-                            confirm_floor()
-                        elif st in ("locked", "closed"):
-                            queue.pop(idx)     # recorded; done with it
-                        elif st == "broke":
-                            set_watermark(
-                                PRICES.get(price_key(ttype, pi, tier)))
-                            item["_fails"] = item.get("_fails", 0) + 1
-                            item["_wake"] = time.time() + min(
-                                10 * 2 ** (item["_fails"] - 1), 60)
-                            if item["_fails"] >= 6:
-                                queue.pop(idx)
-                        else:                  # no_select / unread
-                            item["_fails"] = item.get("_fails", 0) + 1
-                            item["_wake"] = time.time() + 10
-                            if item["_fails"] >= 4:
-                                print(f"   giving up on an upgrade ({st})")
-                                queue.pop(idx)
 
         endgame = (play_out and last_round is not None
                    and last_round >= final_round)
+        if endgame and looks_victorious(screen):
+            time.sleep(0.4)
+            if looks_victorious(screen):      # confirmed on two samples
+                dbg("VICTORY screen recognized visually")
+                outcome = "survived"
+                break
         if misreads == 12:                    # HUD covered a while
             if looks_defeated(screen):
                 dbg("DEFEAT screen recognized (via dark counter)")
@@ -3418,7 +3765,35 @@ def run_episode(screen, cfg, genome, final_round, abort_lives=50,
                         and lives is None and not looks_defeated(screen):
                     dbg("whole HUD covered at the final round -- victory")
                     outcome = "survived"
-                break                 # else: genuinely unknown/dead state
+                    break
+                # A one-life game that was alive a moment ago must NOT be
+                # thrown away on a transient dark HUD: an ability/effect can
+                # blank both the counter and the lives digit for a few
+                # frames. Give the dark spell time to clear -- keep healing
+                # the HUD -- and only conclude hud_lost if the WHOLE HUD
+                # stays unreadable for a stretch. A real leak-out shows the
+                # defeat screen (caught above), so unreadable-lives here is
+                # a misread, not a loss. (Multi-life runs keep the old
+                # immediate exit: a leak to 0 there is unambiguous.)
+                if one_life and not looks_defeated(screen):
+                    hud_dark_since = hud_dark_since or time.time()
+                    if time.time() - hud_dark_since < 45:
+                        if time.time() - last_blind_recovery > 12:
+                            last_blind_recovery = time.time()
+                            dbg("whole HUD dark but was alive -- healing, "
+                                "not giving up yet")
+                            clear_ui(screen, cfg)
+                            try:
+                                preflight_round_box(screen, cfg,
+                                                    recalibrate=True)
+                            except Exception:
+                                pass
+                    else:
+                        dbg("whole HUD dark 45s with no defeat screen -- "
+                            "window lost")
+                        break
+                else:
+                    break             # genuinely unknown/dead state
         if not queue and not observing:
             observing = True
             print("   build complete -- observing until survive/abort")
@@ -4757,6 +5132,12 @@ def main():
                          dest="final_round",
                          help="round that counts as survival (default: "
                               "the rung's final round)")
+    p_range = sub.add_parser(
+        "measure-ranges", help="measure each tower's TRUE range from the "
+                               "in-game range circle -> measured_ranges.json "
+                               "(load the map, round not started, walk away)")
+    p_range.add_argument("--tower", default=None,
+                         help="measure just this tower (default: all)")
     p_graph = sub.add_parser(
         "graph", help="render training progress from runs_log.jsonl to a "
                       "self-contained progress.html you can open in a browser")
@@ -4771,7 +5152,8 @@ def main():
     {"locate": cmd_locate, "watch": cmd_watch,
      "play": cmd_play, "scan": cmd_scan, "farm": cmd_farm,
      "solve": cmd_solve, "deploy": cmd_deploy, "campaign": cmd_campaign,
-     "learn": cmd_learn, "graph": cmd_graph}[args.command](args)
+     "learn": cmd_learn, "graph": cmd_graph,
+     "measure-ranges": cmd_measure_ranges}[args.command](args)
 
 
 if __name__ == "__main__":
