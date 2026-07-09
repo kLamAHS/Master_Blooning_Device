@@ -3081,6 +3081,11 @@ def run_episode(screen, cfg, genome, final_round, abort_lives=50,
 
     queue = list(genome)
     landed_by_ref, towers = {}, {}
+    # ref -> a human tower tag ("druid#2(carry)"), from the genome's place
+    # entries, so an upgrade buy (whose queue item carries only ref+path) can
+    # still name its tower in the saving logs even before it is placed.
+    ref_name = {g["ref"]: (g.get("name") or g.get("tower", "?"))
+                for g in genome if g.get("do") == "place" and "ref" in g}
     # Spots a probe caught a monkey sitting on (a tower we didn't track, or
     # one whose real position drifted from where we recorded it). Grown by
     # act_place and fed back into every placement so no buy keeps clicking a
@@ -3501,16 +3506,19 @@ def run_episode(screen, cfg, genome, final_round, abort_lives=50,
                 return known or it.get("est")
 
             def _saving_desc(it):
-                """Human tag for a pending buy: a placement reads as the tower
-                name ('tack#1(carry)'), an upgrade as 'druid#2(carry) path3 t4'
-                -- the same shape as the per-item saving logs, so the
-                reservation note reads consistently."""
-                name = it.get("name") or it.get("tower", "?")
+                """Human tag for a pending buy that ALWAYS names the tower: a
+                placement reads as the tower name ('tack#1(carry)'), an upgrade
+                as 'druid#2(carry) path3 t4'. Upgrade queue items carry only
+                ref+path, so the tower name comes from the placed entry when it
+                is down, else from the genome's ref->name map -- never a bare
+                'path3 t4' with no tower."""
                 if it.get("do") == "place":
-                    return name
+                    return it.get("name") or it.get("tower", "?")
                 pi = it["path"].index(1) if 1 in it.get("path", []) else 0
                 lnd = landed_by_ref.get(it.get("ref"))
                 ent = towers.get(tuple(lnd)) if lnd else None
+                name = (ent.get("name") if ent else None) \
+                    or ref_name.get(it.get("ref"), "?")
                 tier = (ent["path"][pi] + 1) if ent else "?"
                 return f"{name} path{pi + 1} t{tier}"
 
