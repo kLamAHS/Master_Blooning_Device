@@ -1561,9 +1561,19 @@ class MetaBrain:
         A tier that serves several stacked threats takes the EARLIEST
         deadline among the ones it satisfies -- a village owing camo t2
         (r24) and MIB t3 (r90) buys its first tiers early and only the
-        third late."""
+        third late.
+
+        For a single deep answer the tiers are STAGGERED: the top tier is
+        due `first-2` (right before the wave) and each lower tier
+        DEADLINE_STEP rounds earlier, so a tier-5 BAD line (first 100)
+        reaches t3 by ~r90 and t5 by ~r98 instead of slamming all five
+        tiers into r98. Front-loading the lower tiers means the answer is
+        actually high-tier BEFORE its wave, not stuck at tier 3 until the
+        deadline -- the r63-88 leak band that capped runs at ~round 70."""
         reqs = (needs_for_tower or {}).get(path_i) or []
-        cands = [first - 2 for req_tier, first in reqs if tier <= req_tier]
+        DEADLINE_STEP = 4
+        cands = [(first - 2) - DEADLINE_STEP * max(0, req_tier - tier)
+                 for req_tier, first in reqs if tier <= req_tier]
         if cands:
             return min(cands)
         if path_i == main:
@@ -1998,7 +2008,13 @@ class MetaBrain:
             if ttype == "hero":
                 continue          # heroes level up on their own: no buys
             need = needs.get(ref, {})
-            main_target = 5 if rng.random() < 0.10 else rng.randint(3, 4)
+            # Tier-5 ambition scales with how long the game runs: a short
+            # rung wins on tier 3-4 towers, but a full CHIMPS (target 100)
+            # needs real tier-5 carries, not two lone threat-answer t5s on
+            # an otherwise tier-3/4 team. Deeper carries only raise the
+            # late-game firepower/sustain margins (the safe direction).
+            p5 = 0.10 if self.target < 60 else 0.35
+            main_target = 5 if rng.random() < p5 else rng.randint(3, 4)
             cross_target = rng.randint(1, 2)
             want = {main: main_target, cross: cross_target}
             for p_i in need:
@@ -3005,6 +3021,14 @@ def _selftest():
                        explore=0.0, knowledge=k, runs_path="/nonexistent",
                        mode="chimps", start_round=6)
         assert bc.income(50) == earned_by(50, "chimps")
+        # _deadline staggers a deep answer's tiers: the top tier is due
+        # right before the wave (first-2) and lower tiers progressively
+        # earlier, so the answer is high-tier BEFORE its wave.
+        synth = {2: [(5, 100)]}
+        dl5 = bc._deadline("wizard", 0, 2, 5, synth)
+        dl3 = bc._deadline("wizard", 0, 2, 3, synth)
+        assert dl5 == 98, f"top tier should be due first-2: {dl5}"
+        assert dl3 < dl5, f"lower tiers must land earlier: t3={dl3} t5={dl5}"
 
         def covered_by(g, kind, by_round, cap=5):
             sol = bc.solutions[kind]
