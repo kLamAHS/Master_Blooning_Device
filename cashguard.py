@@ -126,22 +126,57 @@ class CashFloor:
         anything at or near/above the floor -- passes through unchanged, as
         does None (an unreadable frame: callers treat that as 'buy anyway').
 
+        The floor has TWO parts, and a low read is resolved against them
+        differently, because they are not equally trustworthy:
+
+          * the PROVABLE floor (a confirmed read minus tracked spend) is a
+            real lower bound -- a read below it is a genuine misread;
+          * the INCOME floor (the earned-curve estimate) is only a MODEL. It
+            inflates whenever the curve overshoots this run's real income OR
+            the ROUND is misread high -- and then it overrides a *correct*
+            read and freezes the buy plan. The field failure: a blind stretch
+            re-synced the counter 27 -> 50, the round-50 curve claimed ~$14k
+            "provable", and a correct $4411 read was replaced by it every
+            frame, so the bot "coasted rich" and died.
+
+        So a read below the income estimate but corroborated by a second,
+        independent read is TRUSTED: two live sensors outvote a model. Only a
+        read below the PROVABLE floor is substituted. (A read below the income
+        estimate that CANNOT be corroborated still falls back to it -- the
+        original clipped-misread defense for a box that has gone stale-low.)
+
         Tracks a run of consecutive substitutions: an INTERMITTENT misread
         resets it (a good read lands in between), but a box that has broken
         outright (reads a constant '$1' while cash really climbs) racks the run
         up -- see stuck(), which the caller uses to trigger a recalibration
         rather than freezing the whole plan behind a phantom-low wallet."""
-        lb = self.lower_bound(round_hint)
-        if read is not None and lb is not None and read < lb - self.margin:
-            c = confirm_fn() if confirm_fn is not None else None
-            if c is not None and c >= lb - self.margin:
-                self._sub_streak = 0        # corroborated: the box is fine
-                return c
-            self._sub_streak += 1           # box keeps reading low: suspicious
-            return int(lb)
-        if read is not None:
-            self._sub_streak = 0            # a trusted read: box is working
-        return read
+        if read is None:
+            return read
+        prov = self._floor                          # provable: confirmed-spend
+        inc = self._income_floor(round_hint)        # model estimate (soft)
+        lb = prov
+        if inc is not None:
+            lb = inc if lb is None else max(lb, inc)
+        if lb is None or read >= lb - self.margin:
+            self._sub_streak = 0                    # trusted read
+            return read
+        c = confirm_fn() if confirm_fn is not None else None
+        if c is not None and c >= lb - self.margin:
+            self._sub_streak = 0        # confirm lands high: use it
+            return c
+        if c is not None \
+                and abs(c - read) <= max(2 * self.margin, 0.12 * max(read, 1)):
+            # Two independent reads AGREE on a value below the floor. A model
+            # estimate can't outvote two live sensors, so believe the reads --
+            # unless they fall below the PROVABLE floor, which (unlike the
+            # income curve) is a real bound and still wins.
+            if prov is None or read >= prov - self.margin:
+                self._sub_streak = 0
+                return read
+            self._sub_streak += 1
+            return int(prov)
+        self._sub_streak += 1           # uncorroborated low read: hold floor
+        return int(lb)
 
     def stuck(self, n=12):
         """True once `n` reads in a row have been substituted with no good read

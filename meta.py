@@ -105,6 +105,26 @@ ROUGH_COST = {
 # round walk past a single life un-killed (observed: glue-only CHIMPS openers
 # dying at round 6), so they're filtered out of the one-life opener slot.
 _SLOW_ONLY = {"glue", "ice"}
+# The only towers that reliably HOLD round 6 on a one-life rung's starting
+# wallet: a cheap base that already pops a GROUP, plus first tiers cheap
+# enough to fit $650. dart/tack/boomerang qualify (and all scale -- dart ->
+# Crossbow, tack -> Tack Zone, boomerang -> MOAB Press). A base-price cap is
+# NOT enough on its own: wizard/druid have a cheap ~$270 base but $325 tiers,
+# so they strand at 0-0-1 and leak the single life (the field failure), and a
+# base sniper single-targets. So the one-life opener draws from THIS set, not
+# a price threshold that the real (cheaper-than-listed) bases slip under.
+_OPENER_KILLERS = ("dart", "tack", "boomerang")
+
+# One-life openers to AUDITION, in default-preference order. Dart leads: it
+# reliably clears round 6 cold. The rest are rotated in as the leak memory
+# demotes whatever keeps failing (see MetaBrain._opener_tower_bias), and are
+# also auditioned at the explore rate so they get tried before dart fails.
+# These are all POPPERS that hold the opening on their own. Ice is deliberately
+# NOT here: it is pure-slow, so it never opens -- it comes in LATER as a Super
+# Brittle support behind a tack/carry (the Tack Zone + Super Brittle combo),
+# handled by the partner/synergy path, not as a round-6 anchor.
+_OPENER_ROSTER = ("dart", "tack", "boomerang")
+_OPENER_PREF = {"dart": 1.0, "tack": 0.85, "boomerang": 0.6}
 
 # The hero isn't in the knowledge base's tower table (which hero is
 # equipped is chosen in the menu, invisible to the bot), so placement
@@ -172,6 +192,34 @@ def earned_by(r, mode="standard"):
         r1, c1 = pts[-1]
         return c1 + (c1 - c0) / (r1 - r0) * (r - r1)
     return 650 + 25 * r + 11 * r * r
+
+
+def round_supported_by_cash(claimed_round, cash, spent, mode, tol=0.4):
+    """Sanity-check a (re-synced) round number against the money on hand.
+
+    In CHIMPS you can only be at round r if you have EARNED the cumulative
+    pop-cash for it -- and earned = cash-in-hand + everything spent. So a big
+    forward jump in the counter that claims a round whose required earnings
+    tower over what we can account for is a COUNTER misread, not real
+    progress. The field failure: a blind stretch re-synced the counter
+    27 -> 50 while the wallet had only climbed to ~$1k; the phantom round then
+    inflated the income floor and froze the buy plan into a coast-to-death.
+
+    Returns True when the claim is consistent (earned >= tol * curve) OR the
+    check doesn't apply (non-CHIMPS, unknown cash, degenerate curve) -- i.e.
+    it only ever VETOES a jump the money provably can't support, and defaults
+    to trusting the counter otherwise. `tol` is deliberately loose (0.4) so a
+    real catch-up jump, or a modest curve/ spend-tracking error, still passes;
+    only an egregious mismatch (the 21%-of-curve field case) is rejected."""
+    if mode != "chimps" or cash is None:
+        return True
+    try:
+        need = earned_by(claimed_round - 1, mode)
+    except Exception:
+        return True
+    if need <= 0:
+        return True
+    return (cash + max(0, spent or 0)) >= tol * need
 
 
 def choose_buy(queue, cur_round, cash, cost_of, now, emergency=False,
@@ -835,7 +883,7 @@ class MetaBrain:
         return _beta(rng, ba, bb)
 
     def _spot_for(self, rng, ttype, pools, taken, placed, track,
-                  large=False, anchor=False, cluster=False):
+                  large=False, anchor=False, cluster=False, role=None):
         """Style-aware placement. `placed` is [(ttype, spot), ...] already
         assigned in this layout. Scores candidates by what the tower
         actually wants -- track coverage for DPS, just-upstream coverage
@@ -856,24 +904,43 @@ class MetaBrain:
             or (HERO_PLACEMENT if ttype == "hero" else {})
         style = prof.get("style", "coverage")
         r = prof.get("range") or 0.06
+        # An AMPLIFIER (an Overclock engineer) buffs the tower it stands next
+        # to, so it must cluster on the carry, not scatter to its own lane at
+        # the bottom of the map, out of range of everyone (the field
+        # complaint). It keeps its coverage profile (so it still wants track),
+        # but is force-clustered like a free DPS tower even when it explores.
+        amplify = role == "amplifier" and style == "coverage"
         if style == "buddy":
             # A buffer exists to stand next to the carry, which sits on a
-            # near/mid TRACK spot -- but a LARGE buffer (village) drawing
-            # only from the `roomy` interior can never reach it (on a real
-            # mask near-track spots are never roomy). Draw buddies from the
-            # track rings: the large ones from (near|mid) that are ALSO
-            # roomy (so the executor's roomy-snap is a no-op and they stay
-            # near the carry), the small ones from near|mid|roomy (so an
-            # alchemist can also reach a carry that itself sits in roomy).
+            # near/mid TRACK spot. A LARGE buffer (village) is the subtle
+            # case: the game only lets it land on a ROOMY cell, so if the
+            # scorer picks a near-carry spot that ISN'T roomy the executor's
+            # placement snaps it to the nearest roomy point -- routinely a far
+            # corner (the "village in the top-right, out of range" bug). So a
+            # large buddy may ONLY draw from spots that are BOTH near/mid AND
+            # roomy: then the spot it scores is the spot it lands on, and it
+            # stays in buff range of the cluster. If no near-track cell is
+            # roomy on this mask, fall back to all roomy (still scored by
+            # carry proximity, so it takes the CLOSEST roomy spot, never a
+            # corner). Small buddies (alchemist) draw from near|mid|roomy so
+            # they can also reach a carry that itself sits in roomy.
             near = pools.get("near") or []
             mid = pools.get("mid") or []
             roomy = pools.get("roomy") or []
-            seen, base = set(), []
-            for p in near + mid + roomy:
-                if tuple(p) not in seen:
-                    seen.add(tuple(p))
-                    base.append(p)
-            base = base or pools.get("all") or []
+            if large:
+                # near/mid coords are round(_,3); roomy are raw points -- both
+                # derive from the same grid, so a rounded set aligns them.
+                rset = {(round(p[0], 3), round(p[1], 3)) for p in roomy}
+                base = [p for p in near + mid
+                        if (round(p[0], 3), round(p[1], 3)) in rset]
+                base = base or roomy or pools.get("all") or []
+            else:
+                seen, base = set(), []
+                for p in near + mid + roomy:
+                    if tuple(p) not in seen:
+                        seen.add(tuple(p))
+                        base.append(p)
+                base = base or pools.get("all") or []
         elif large:
             base = pools.get("roomy") or pools.get("all") or []
         else:
@@ -894,6 +961,14 @@ class MetaBrain:
             if nearby:
                 cands = [rng.choice(nearby)
                          for _ in range(min(30, len(nearby)))] + cands[:20]
+            elif carry_spot is not None:
+                # Nothing sits inside buff range -- the map has no roomy cell
+                # close to the cluster (large village on a tight mask). Rather
+                # than let the random sample strand it in a corner, seed the
+                # base spots CLOSEST to the carry so the scorer takes the best
+                # reachable one instead of the farthest.
+                cands = sorted(base, key=lambda p: _dist(p, carry_spot))[:20] \
+                    + cands[:20]
         elif style == "coverage" and not anchor and carry_spot is not None:
             # A free DPS tower clusters with the carry (shared support buffs),
             # so guarantee the sample includes spots inside the buff disc -- a
@@ -904,6 +979,39 @@ class MetaBrain:
             if in_buff:
                 cands = [rng.choice(in_buff)
                          for _ in range(min(40, len(in_buff)))] + cands[:30]
+        elif style in ("upstream", "downstream") and carry_spot is not None:
+            # A slow/debuff tower wants to be UPSTREAM by track PROGRESS -- but
+            # on a wrapping map (Monkey Meadow's figure-eight) the path loops
+            # back past the cluster, so a spot spatially NEAR the cluster can
+            # cover an upstream segment too, slowing bloons the cluster is
+            # about to hit. Seed near-cluster candidates so the scorer can pick
+            # them; the progress `fit` term still keeps only the ones that are
+            # actually upstream, and the proximity bonus prefers the close one
+            # (the user's looping-map note -- glue placed spatially close IS
+            # upstream here, and buffs the cluster's own kill zone).
+            near_cluster = [p for p in base
+                            if _dist(p, carry_spot) <= 1.6 * BUFF_CLUSTER_R]
+            if near_cluster:
+                cands = [rng.choice(near_cluster)
+                         for _ in range(min(30, len(near_cluster)))] \
+                    + cands[:30]
+        elif anchor and track is not None and track.ok:
+            # Anchors (the carry first, then the opener/hero) want the map's
+            # highest-COVERAGE spot: a multi-lane chokepoint where the snaking
+            # track passes one point several times, so one tower hits bloons on
+            # several passes. A random 70-sample usually misses it, so seed the
+            # genuine top-exposure spots directly. A later anchor -- the opener,
+            # placed after the carry -- prefers the top spots that ALSO sit near
+            # the carry, so the two damage towers land in ONE support's buff
+            # disc with multi-lane coverage instead of splitting to opposite
+            # ends of the map (the boomerang-in-the-corner complaint).
+            ranked = sorted(base, key=lambda p: -track.exposure(p, r))
+            seed = ranked[:30]
+            if carry_spot is not None:
+                near = [p for p in ranked[:150]
+                        if _dist(p, carry_spot) <= BUFF_CLUSTER_R]
+                seed = near[:20] + seed
+            cands = seed + cands[:25]
         cands = _spread(cands, taken, SEP_LARGE if large else SEP,
                         pull=carry_spot if style == "buddy" else None)
         # Keep towers that shoot bloons ON the track: drop candidates that
@@ -919,20 +1027,31 @@ class MetaBrain:
             on_track = [c for c in cands if track.exposure(c, r) >= 0.005]
             if len(on_track) >= 2:
                 cands = on_track
-        if style == "coverage" and not anchor and carry_spot is not None \
-                and len(cands) > 3:
-            # Cluster FLOOR (not just the +50% nudge below, which exposure
+        if style == "coverage" and carry_spot is not None and len(cands) > 3 \
+                and (not anchor or (not cluster and self._one_life())):
+            # Cluster FLOOR (not just the nudge below, which exposure
             # differences drown out): when enough on-track spots sit inside
-            # the carry's buff disc, RESTRICT the free DPS to them, then the
-            # scorer picks the best-coverage spot AMONG the cluster. This is
-            # what actually keeps damage tight enough for one village + alch
-            # to buff it all; it falls back to open scoring only if the disc
-            # has too few track spots (so it never lands off the track).
+            # the carry's buff disc, RESTRICT the damage tower to them, then
+            # the scorer picks the best-coverage EARLY spot AMONG the cluster.
+            # This is what actually keeps damage tight enough for one village +
+            # alch to buff it all. Applies to free DPS AND the one-life opener/
+            # hero (which the carry, placed first, sits at an early multi-lane
+            # spot, so near-carry spots are early too). Falls back to open
+            # scoring if the disc has too few track spots -- never off-track.
             clustered = [c for c in cands
                          if _dist(c, carry_spot) <= BUFF_CLUSTER_R
                          and track.exposure(c, r) >= 0.005]
             if len(clustered) >= 3:
                 cands = clustered
+            elif amplify:
+                # An amplifier MUST stay adjacent to buff -- when too few
+                # on-track spots sit inside the disc, don't fall back to open
+                # scatter (which dropped the engineer at the far bottom); keep
+                # the closest on-track spots to the carry so it clusters no
+                # matter how tight the geometry.
+                on = [c for c in cands if track.exposure(c, r) >= 0.005] \
+                    or cands
+                cands = sorted(on, key=lambda c: _dist(c, carry_spot))[:5]
         roomy_near = None
         one_life_anchor = anchor and not cluster and self._one_life()
         if anchor and len(cands) > 2 and not one_life_anchor:
@@ -961,6 +1080,22 @@ class MetaBrain:
             if roomy:
                 def roomy_near(c, _r=roomy):
                     return any(_dist(c, rp) <= 0.066 for rp in _r)
+                # Buffable FLOOR (not just the +25% nudge below, which the
+                # exposure gap drowns out): the carry's real DPS is what the
+                # village + alchemist MULTIPLY, and a big buffer can only reach
+                # it from an OPEN cell within range. Deep in the track tangle
+                # the top-exposure spots have no roomy cell nearby, so an
+                # un-nudged carry sits where support can never buff it and the
+                # village then strands in a far corner (the user's complaint).
+                # When enough of the exposure-gated candidates ARE buffable,
+                # restrict to them and let exposure pick the best AMONG them: a
+                # small raw-coverage give-up for a carry the whole support
+                # network actually amplifies. Falls back to open scoring when
+                # too few qualify, so a map with no room near the line still
+                # places the carry on its best lane spot.
+                buffable = [c for c in cands if roomy_near(c)]
+                if len(buffable) >= 3:
+                    cands = buffable
         if cands and rng.random() < self.explore \
                 and not (anchor and self._one_life() and not cluster):
             # Explore, but only AMONG the on-track candidates above. The old
@@ -975,10 +1110,36 @@ class MetaBrain:
             # exactly the bad lane coverage that leaks the single life. The
             # carry still explores/clusters so its support can reach it.
             self._last_spot_src = "explore"
-            if style == "buddy" and carry_spot is not None:
-                in_range = [c for c in cands
-                            if _dist(c, carry_spot) <= r * 0.9]
-                return list(rng.choice(in_range or cands))
+            if style == "buddy":
+                # A buffer anchors to whoever it exists to buff: the carry if
+                # one is placed, else the nearest teammate. Explore only among
+                # spots that reach that anchor; if none do (a big village on a
+                # tight mask), explore among the CLOSEST few open spots -- never
+                # a random draw over the whole map, which is exactly what flung
+                # the village to a far corner (the user's complaint).
+                anchor_pt = carry_spot
+                if anchor_pt is None:
+                    mates_pts = [s for _, s in placed if s]
+                    if mates_pts:
+                        anchor_pt = min(
+                            mates_pts,
+                            key=lambda m: min(_dist(c, m) for c in cands))
+                if anchor_pt is not None:
+                    in_range = [c for c in cands
+                                if _dist(c, anchor_pt) <= r * 0.9]
+                    if in_range:
+                        return list(rng.choice(in_range))
+                    near = sorted(cands,
+                                  key=lambda c: _dist(c, anchor_pt))[:5]
+                    return list(rng.choice(near))
+            if amplify and carry_spot is not None:
+                # An amplifier explores WHICH clustered spot, never whether to
+                # cluster: keep it within the carry's buff disc (or the closest
+                # few), so exploration can't fling it off to its own lane.
+                near = [c for c in cands
+                        if _dist(c, carry_spot) <= BUFF_CLUSTER_R] \
+                    or sorted(cands, key=lambda c: _dist(c, carry_spot))[:5]
+                return list(rng.choice(near))
             return list(rng.choice(cands))
 
         # The carry (found above) anchors the geometry for debuffers and
@@ -1004,6 +1165,18 @@ class MetaBrain:
                         fit = (1.0 if 0.0 <= gap <= 0.18 else
                                0.4 if -0.06 <= gap < 0.0 else 0.05)
                         s = exp * fit
+                        # Among the progress-valid upstream spots, prefer the
+                        # one spatially CLOSEST to the cluster. On a wrapping
+                        # map the track loops back past the carry, so a nearby
+                        # upstream spot slows bloons the cluster is about to hit
+                        # -- worth far more than the same slow on a lane across
+                        # the map (the user's looping-map note). On a linear
+                        # map no upstream spot is close, so this stays ~1 for
+                        # all and doesn't distort the progress ranking.
+                        if carry_spot is not None:
+                            s *= 1.0 + 0.6 * max(
+                                0.0, 1.0 - _dist(c, carry_spot)
+                                / BUFF_CLUSTER_R)
                 elif carry_spot is not None:
                     # Direction unknown: co-locate with the carry so the
                     # debuff at least overlaps its kill zone.
@@ -1023,7 +1196,19 @@ class MetaBrain:
                     # to "wherever it sees the most track", the old bug.
                     d = _dist(c, carry_spot)
                     covers = 1.0 if d <= r * 0.9 else 0.0
-                    prox = max(0.0, 1.0 - d / (r * 0.9))
+                    # Proximity that never floors to zero. A big buffer
+                    # (village) often CANNOT reach a carry that sits deep in
+                    # the track tangle -- the nearest roomy cell can be well
+                    # outside buff range -- so the old `max(0, 1 - d/(r*.9))`
+                    # went flat at zero for every candidate and the score
+                    # collapsed to 0.05*exp, parking the village on the
+                    # highest-exposure ROOMY cell: a far corner (the bug the
+                    # user flagged). This tail keeps rewarding closeness past
+                    # the buff radius, so when nothing covers the carry the
+                    # buffer still takes the CLOSEST open spot -- beside the
+                    # cluster, where it buffs what it can -- instead of drifting
+                    # away. Inside the radius it still climbs toward 1.0.
+                    prox = 1.0 / (1.0 + (d / (r * 0.9)) ** 2)
                     ov = 0.0
                     if carry_span and track.oriented:
                         sp = track.span(c, r)
@@ -1038,6 +1223,13 @@ class MetaBrain:
                 sp = track.span(c, r)
                 late = sp[1] if (sp and track.oriented) else 0.5
                 s = exp * (0.3 + late)
+                # Same wrapping-map bias as upstream: a cleanup tower spatially
+                # near the cluster catches what leaks the kill zone right where
+                # the loop brings it back, so prefer the close spot among the
+                # late-track candidates.
+                if carry_spot is not None:
+                    s *= 1.0 + 0.4 * max(
+                        0.0, 1.0 - _dist(c, carry_spot) / BUFF_CLUSTER_R)
             elif style == "offside":
                 s = 1.0 / (1.0 + 40.0 * track.exposure(c, 0.06))
             else:                                    # coverage
@@ -1046,29 +1238,35 @@ class MetaBrain:
                     sp = track.span(c, r)
                     if sp:
                         # All else equal, kill bloons EARLY: damage near
-                        # the entry leaves room for error; a defense
-                        # camped at the exit pops with zero margin.
-                        s *= 1.25 - 0.50 * sp[1]
+                        # the entry leaves room for error; a defense camped
+                        # at the exit pops with zero margin. Bias on sp[0],
+                        # the EARLIEST bloon the spot can hit -- NOT the mean
+                        # (sp[1]), which would punish a prime multi-lane spot
+                        # (the track snaking back past one point) just because
+                        # its range also touches a later lane. A spot that
+                        # engages bloons early AND covers several lanes -- the
+                        # best real estate on a wrappy map -- must score high.
+                        s *= 1.25 - 0.50 * sp[0]
                         # A one-life survival anchor (opener/hero) is far
                         # more exit-sensitive: placed near the end it has no
                         # lane left to catch a leak, so ONE bloon ends the
-                        # run. Bias it HARD toward the entry half so the
-                        # whole track works for it and a marginal early
-                        # defense still holds round 6.
+                        # run. Bias it HARD toward engaging early.
                         if one_life_anchor:
-                            s *= max(0.12, 1.0 - 1.3 * sp[1])
-                # A FREE damage tower should CLUSTER with the carry, not go
-                # solo to its own best lane spot: one village + alchemist can
-                # only buff towers inside its range, so a tight buffed group
-                # out-damages the same towers scattered and unbuffed. Reward
-                # proximity to the carry within a support tower's reach.
-                # Exposure stays the base term, so a clustered spot must still
-                # see the track (the on-track floor already dropped dead ones)
-                # -- this decides WHICH good spot, pulling it into buff range.
-                if not anchor and carry_spot is not None:
+                            s *= max(0.35, 1.0 - 1.0 * sp[0])
+                # A damage tower should CLUSTER with the carry, not go solo to
+                # its own best lane spot: one village + alchemist can only buff
+                # towers inside its range, so a tight buffed group out-damages
+                # the same towers scattered and unbuffed. Reward proximity to
+                # the carry within a support tower's reach. This applies to free
+                # DPS AND to the one-life OPENER -- the two damage towers should
+                # share the carry's buffs and multi-lane spot, not sit at
+                # opposite ends of the map (the boomerang-in-the-corner
+                # complaint). Exposure stays the base term, so a clustered spot
+                # still has to see the track; this decides WHICH good spot.
+                if (not anchor or one_life_anchor) and carry_spot is not None:
                     d = _dist(c, carry_spot)
                     if d <= BUFF_CLUSTER_R:
-                        s *= 1.0 + 0.5 * (1.0 - d / BUFF_CLUSTER_R)
+                        s *= 1.0 + 0.7 * (1.0 - d / BUFF_CLUSTER_R)
             # Learned-region posterior nudges the score. For most towers it
             # only swings +/-20% via a Thompson draw (a wider swing once
             # drowned out short-range towers' small exposure differences). The
@@ -1115,13 +1313,106 @@ class MetaBrain:
             return (rank.get(style, 1), i)
         return sorted(range(len(picks)), key=key)
 
+    def _opener_build_bias(self, ttype):
+        """A per-build-line multiplier that keeps the one-life opener from
+        retrying a line that keeps LEAKING the opening rounds. The opener
+        follows its build template every single run, so without this the
+        highest-weighted line is chosen forever even when its EARLY tiers
+        barely pop (dart's top line is 2-0-5 -> Crossbow, a great carry whose
+        0-0-2 opening hardly holds round 6) -- the field complaint: "it keeps
+        trying dart bottom-path tier 2 and leaking, then goes back to it."
+
+        Derived from THIS rung's own history: an early-leak defeat blames the
+        opener's line. A line that has leaked repeatedly and never held is
+        pushed down; a line never auditioned is lifted -- so the opener rotates
+        (dart 2-0-5 -> a Quick/Sharp-Shots line that actually holds) instead of
+        repeating the loss, and settles once a line survives."""
+        leaks, tries = {}, {}
+        for row in self.history:
+            op = next((t for t in row.get("towers", [])
+                       if _role_of_name(t.get("name")) == "opener"
+                       and (t.get("tower") or "").lower() == ttype), None)
+            if op is None:
+                continue
+            path = op.get("path") or [0, 0, 0]
+            if max(path) <= 0:
+                continue
+            m = path.index(max(path))
+            tries[m] = tries.get(m, 0) + 1
+            start = int(row.get("start_round") or self.start_round)
+            fr = row.get("final_round")
+            if row.get("outcome") == "defeat" and fr is not None \
+                    and fr <= start + EARLY_WINDOW:
+                leaks[m] = leaks.get(m, 0) + 1
+
+        def bias(main):
+            lk, tr = leaks.get(main, 0), tries.get(main, 0)
+            if tr == 0:
+                return 1.5                  # untried line: worth auditioning
+            if lk >= 2 and tr - lk == 0:
+                return 1.0 / (1.0 + lk)     # always leaked here -> rotate off it
+            return 1.0                      # held at least once: posterior decides
+        return bias
+
+    def _opener_tower_bias(self):
+        """Per-tower multiplier that rotates the one-life opener off a whole
+        TOWER whose lines keep leaking, onto a different one (dart -> tack ->
+        ice -> ...). It only kicks in once >=2 DISTINCT build lines of a tower
+        have leaked with none holding -- so the build rotation (a different
+        line of the SAME tower, see _opener_build_bias) is exhausted first, and
+        only then does the tower itself change. A tower that has ever held the
+        opening stays viable (bias 1.0), so a sometimes-winner isn't abandoned
+        over one bad night."""
+        leaked_lines, held = {}, set()
+        for row in self.history:
+            op = next((t for t in row.get("towers", [])
+                       if _role_of_name(t.get("name")) == "opener"), None)
+            if op is None:
+                continue
+            tt = (op.get("tower") or "").lower()
+            if not tt:
+                continue
+            path = op.get("path") or [0, 0, 0]
+            m = path.index(max(path)) if max(path) > 0 else -1
+            start = int(row.get("start_round") or self.start_round)
+            fr = row.get("final_round")
+            if row.get("outcome") == "defeat" and fr is not None \
+                    and fr <= start + EARLY_WINDOW:
+                leaked_lines.setdefault(tt, set()).add(m)
+            else:
+                held.add(tt)
+
+        def bias(tt):
+            if tt in held:
+                return 1.0
+            n = len(leaked_lines.get(tt, ()))
+            return 1.0 / (1.0 + n) if n >= 2 else 1.0
+        return bias
+
+    def _pick_opener(self, rng, roster):
+        """The one-life opener tower: the highest-preference roster tower the
+        leak memory hasn't demoted, with an explore-rate chance to audition a
+        different one so tack/ice (and the rest) get tried, not just dart."""
+        bias = self._opener_tower_bias()
+        scored = [(max(0.02, _OPENER_PREF.get(t, 0.5) * bias(t)), t)
+                  for t in roster]
+        if rng.random() < self.explore:
+            total = sum(w for w, _ in scored)
+            pick, acc = rng.random() * total, 0.0
+            for w, t in scored:
+                acc += w
+                if pick <= acc:
+                    return t
+        return max(scored, key=lambda wt: (wt[0], -roster.index(wt[1])))[1]
+
     def _pick_build(self, rng, ttype, follow_template=False):
         """(main, cross) for a tower: meta build templates re-weighted by
         the learned per-path posterior; explore = any legal combo.
         follow_template skips the random-explore branch so a scaling anchor
         (the one-life opener) always builds toward a real tier-5 carry line
         -- tack -> Tack Zone, dart -> Crossbow -- instead of a throwaway
-        random path."""
+        random path. For that opener it ALSO rotates off build lines that have
+        repeatedly leaked the opening (see _opener_build_bias)."""
         if not follow_template and rng.random() < self.explore:
             main = rng.randrange(3)
             cross = rng.choice([p for p in range(3) if p != main])
@@ -1131,6 +1422,7 @@ class MetaBrain:
             main = rng.randrange(3)
             cross = rng.choice([p for p in range(3) if p != main])
             return main, cross, "no-template"
+        leak_bias = self._opener_build_bias(ttype) if follow_template else None
         best, best_w = None, -1.0
         for b in builds:
             pa, pb = self.p_post.get((ttype, b["main"]), [1.0, 1.0])
@@ -1140,6 +1432,8 @@ class MetaBrain:
                 ga = ga * GLOBAL_PATH_CAP / tot
                 gb = gb * GLOBAL_PATH_CAP / tot
             w = b.get("weight", 0.5) * (0.5 + _beta(rng, pa + ga, pb + gb))
+            if leak_bias is not None:
+                w *= leak_bias(b["main"])
             if w > best_w:
                 best, best_w = b, w
         return best["main"], best["cross"], best.get("label", "meta")
@@ -1267,9 +1561,19 @@ class MetaBrain:
         A tier that serves several stacked threats takes the EARLIEST
         deadline among the ones it satisfies -- a village owing camo t2
         (r24) and MIB t3 (r90) buys its first tiers early and only the
-        third late."""
+        third late.
+
+        For a single deep answer the tiers are STAGGERED: the top tier is
+        due `first-2` (right before the wave) and each lower tier
+        DEADLINE_STEP rounds earlier, so a tier-5 BAD line (first 100)
+        reaches t3 by ~r90 and t5 by ~r98 instead of slamming all five
+        tiers into r98. Front-loading the lower tiers means the answer is
+        actually high-tier BEFORE its wave, not stuck at tier 3 until the
+        deadline -- the r63-88 leak band that capped runs at ~round 70."""
         reqs = (needs_for_tower or {}).get(path_i) or []
-        cands = [first - 2 for req_tier, first in reqs if tier <= req_tier]
+        DEADLINE_STEP = 4
+        cands = [(first - 2) - DEADLINE_STEP * max(0, req_tier - tier)
+                 for req_tier, first in reqs if tier <= req_tier]
         if cands:
             return min(cands)
         if path_i == main:
@@ -1311,7 +1615,7 @@ class MetaBrain:
         if rng.random() < p_evolve:
             genome = self._evolved_genome(rng, n_towers, pools, is_locked,
                                           large_towers, tower_pool, elites,
-                                          track, hero)
+                                          track, hero, price_of=price_of)
             if genome:
                 return genome
         return self._fresh_genome(rng, n_towers, pools, is_locked,
@@ -1421,33 +1725,30 @@ class MetaBrain:
                     # the whole $650 and leave no room to upgrade or add a
                     # second tower.
                     #
-                    # Budget off cash IN HAND pre-wave -- income(start_round-1),
-                    # ~$650 -- NOT income(start_round) which counts round-6 pops
-                    # you have not made yet ($813) and inflates the cap to $488,
-                    # letting in wizard/druid/engineer. Those have a pricey base
-                    # AND $325 second tiers, so they strand at 0-0-1 and leak the
-                    # one life. At the real $390 cap only dart/tack/boomerang
-                    # qualify -- cheap group-clearers whose first two tiers both
-                    # fit the opening wallet (a real 0-0-2 by round 6).
-                    cap = 0.6 * self.income(max(1, self.start_round - 1))
-
-                    def _oc(t, _p=price_of):
-                        return (_p(t) if _p else None) or ROUGH_COST.get(t, 600)
-
-                    def _style(t):
-                        return (self.towers.get(t, {}).get("placement")
-                                or {}).get("style", "coverage")
-                    # cheap + scales + KILLS GROUPS (on-track AoE/multi-shot).
-                    # Exclude pure slow (glue/ice) and OFFSIDE single-target
-                    # (a base sniper has infinite range but pops one bloon at a
-                    # time -- it can't clear a round-6 group before it leaks).
-                    scalers = [t for t in pool
-                               if t not in _SLOW_ONLY
-                               and _style(t) != "offside"
-                               and self.towers.get(t, {}).get("builds")
-                               and _oc(t) <= cap]
-                    cands = scalers or [t for t in cands
-                                        if t not in _SLOW_ONLY] or cands
+                    # Draw the opener from the proven round-6 holders
+                    # (_OPENER_KILLERS): a cheap group-clearing base whose first
+                    # tiers fit the $650 wallet. A base-price cap is unreliable
+                    # here -- the real wizard/druid base ($270) slips under it
+                    # but its $325 tiers strand it at 0-0-1 -- so restrict to the
+                    # set outright, intersected with what's actually available.
+                    # Audition the opener ROSTER (dart, tack, ice, boomerang),
+                    # rotating off whatever keeps leaking. Dart still leads on a
+                    # cold start -- it reliably clears round 6 -- but once its
+                    # lines have all leaked the memory promotes the next tower,
+                    # and the explore rate auditions tack/ice regardless, so the
+                    # bot actually tries the other good openers instead of
+                    # retrying dart forever (the player's request).
+                    roster = [t for t in _OPENER_ROSTER
+                              if t in pool
+                              and self.towers.get(t, {}).get("builds")]
+                    if roster:
+                        cands = [self._pick_opener(rng, roster)]
+                    else:
+                        scalers = [t for t in _OPENER_KILLERS
+                                   if t in pool
+                                   and self.towers.get(t, {}).get("builds")]
+                        cands = scalers or [t for t in cands
+                                            if t not in _SLOW_ONLY] or cands
             ttype = self._pick_tower(rng, cands, [t for t, _ in picks],
                                      novelty=novelty,
                                      deep_slot=role == "carry")
@@ -1525,10 +1826,11 @@ class MetaBrain:
             # Cash IN HAND before the start round plays -- the cumulative by
             # the END of the previous round (income(r) counts money earned
             # DURING round r from pops, which you do not have pre-wave: at r6
-            # income(6)=813 but the wallet holds 650). Budgeting the opener at
-            # the real starting cash is what keeps a second tower from
-            # sneaking in and leaving the anchor bare.
-            budget = self.income(max(1, self.start_round - 1))   # ~$650 at r6
+            # income(6)=813 but the wallet holds 650). Use the FIXED prior
+            # (earned_by), NOT self.income(): the starting wallet is a game
+            # constant, but the learned income curve extrapolated below its
+            # data range (r < 6) is garbage and would mis-size the opener.
+            budget = earned_by(max(1, self.start_round - 1), self.mode)  # ~$650
             prefer = {"opener": 0, "carry": 1, "control": 2,
                       "amplifier": 3, "hero": 4, "free": 5}
 
@@ -1605,7 +1907,7 @@ class MetaBrain:
             spot = self._spot_for(rng, ttype, pools, taken, placed_ctx,
                                   track, large=ttype in large_towers,
                                   anchor=role in ("hero", "opener", "carry"),
-                                  cluster=role == "carry")
+                                  cluster=role == "carry", role=role)
             if spot is None:
                 continue
             spots[i] = spot
@@ -1706,7 +2008,13 @@ class MetaBrain:
             if ttype == "hero":
                 continue          # heroes level up on their own: no buys
             need = needs.get(ref, {})
-            main_target = 5 if rng.random() < 0.10 else rng.randint(3, 4)
+            # Tier-5 ambition scales with how long the game runs: a short
+            # rung wins on tier 3-4 towers, but a full CHIMPS (target 100)
+            # needs real tier-5 carries, not two lone threat-answer t5s on
+            # an otherwise tier-3/4 team. Deeper carries only raise the
+            # late-game firepower/sustain margins (the safe direction).
+            p5 = 0.10 if self.target < 60 else 0.35
+            main_target = 5 if rng.random() < p5 else rng.randint(3, 4)
             cross_target = rng.randint(1, 2)
             want = {main: main_target, cross: cross_target}
             for p_i in need:
@@ -1777,9 +2085,34 @@ class MetaBrain:
 
     # --------------------------------------------------------- evolution
 
+    @staticmethod
+    def _base_cost_of(price_of, ttype):
+        """A tower's place cost for scheduling: the accurate learned/seed price
+        when the executor supplies one, else the rough medium constant."""
+        if price_of:
+            known = price_of(ttype)
+            if known:
+                return known
+        return ROUGH_COST.get(ttype, 600)
+
+    @staticmethod
+    def _tier_cost_of(price_of, ttype, p_i, tier):
+        """An upgrade tier's cost for scheduling: the accurate learned/seed
+        price per (tower, path, tier) when available, else the flat per-tier
+        estimate. Accurate tiers make the schedule's cumulative-spend pacing
+        track what the game can actually afford."""
+        if price_of:
+            try:
+                known = price_of(ttype, p_i, tier)
+            except TypeError:
+                known = None
+            if known:
+                return known
+        return TIER_EST.get(tier, 800)
+
     def _evolved_genome(self, rng, n_towers, pools, is_locked,
                         large_towers, tower_pool, elites, track=None,
-                        hero=False):
+                        hero=False, price_of=None):
         """Mutate (and sometimes cross over) the best layouts found so
         far. This is where genuinely emergent tactics come from: the
         parents are the bot's own discoveries, and mutations are free to
@@ -1867,13 +2200,13 @@ class MetaBrain:
             mutations.append(f"drop:{weakest['tower']}")
 
         entries = []
-        towers.sort(key=lambda t: ROUGH_COST.get(t["tower"], 600))
+        towers.sort(key=lambda t: self._base_cost_of(price_of, t["tower"]))
         for order, t in enumerate(towers):
             entries.append({"do": "place", "tower": t["tower"],
                             "at": list(t["at"]), "ref": order,
                             "name": f"{t['tower']}#{order}(evolved)",
                             "prio": 0, "deadline": 1.0,
-                            "est": ROUGH_COST.get(t["tower"], 600)})
+                            "est": self._base_cost_of(price_of, t["tower"])})
             if t["tower"] == "hero":
                 continue          # heroes level up on their own: no buys
             path = t.get("path") or [0, 0, 0]
@@ -1897,7 +2230,8 @@ class MetaBrain:
                         "deadline": self._deadline(t["tower"], main, p_i,
                                                    tier, None)
                         + rng.uniform(-4, 4),
-                        "est": TIER_EST.get(tier, 800)})
+                        "est": self._tier_cost_of(price_of, t["tower"],
+                                                  p_i, tier)})
         genome = self._schedule(entries)
         self.last_strategy = {"kind": label, "explore": self.explore,
                               "placement": ("track"
@@ -2687,6 +3021,14 @@ def _selftest():
                        explore=0.0, knowledge=k, runs_path="/nonexistent",
                        mode="chimps", start_round=6)
         assert bc.income(50) == earned_by(50, "chimps")
+        # _deadline staggers a deep answer's tiers: the top tier is due
+        # right before the wave (first-2) and lower tiers progressively
+        # earlier, so the answer is high-tier BEFORE its wave.
+        synth = {2: [(5, 100)]}
+        dl5 = bc._deadline("wizard", 0, 2, 5, synth)
+        dl3 = bc._deadline("wizard", 0, 2, 3, synth)
+        assert dl5 == 98, f"top tier should be due first-2: {dl5}"
+        assert dl3 < dl5, f"lower tiers must land earlier: t3={dl3} t5={dl5}"
 
         def covered_by(g, kind, by_round, cap=5):
             sol = bc.solutions[kind]
@@ -2709,7 +3051,7 @@ def _selftest():
                     return True
             return False
         cstats = {"camo": 0, "lead": 0, "ceramic": 0, "ddt": 0,
-                  "bad": 0, "endgame": 0}
+                  "bad": 0, "ddt76": 0, "endgame": 0}
         for i in range(20):
             g = bc.next_genome(rng, 5, tpools, tower_pool=pool,
                                track=track, hero=True)
@@ -2721,9 +3063,15 @@ def _selftest():
             cstats["ceramic"] += covered_by(g, "ceramic", 61, cap=4)
             cstats["ddt"] += covered_by(g, "ddt", 88)
             cstats["bad"] += covered_by(g, "bad", 98)
+            # DDTs first arrive at r76 (not 90): the r76 ddt threat must pull
+            # the DDT answer's deadline in so it is scheduled BY ~r74, not
+            # discovered at r88. Locks the timing fix against regression.
+            cstats["ddt76"] += covered_by(g, "ddt", 74)
         for kind in ("camo", "lead", "ceramic", "ddt", "bad"):
             assert cstats[kind] >= 19, \
                 f"chimps genomes missing {kind} coverage: {cstats}"
+        assert cstats["ddt76"] >= 19, \
+            f"chimps DDT answer not scheduled by r74 (first DDTs): {cstats}"
         assert cstats["endgame"] >= 12, \
             f"chimps plans must schedule into the endgame: {cstats}"
 

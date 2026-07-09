@@ -139,20 +139,22 @@
    "role": "debuff/control",
    "status": "High meta support",
    "crosspath_note": "Embrittle/Super Brittle or Impale",
-   "partners": [],
+   "partners": [
+    "tack"
+   ],
    "avoid_for": "BAD slow",
    "notes": "Turns projectile spam into late-game DPS.",
    "builds": [
     {
      "main": 0,
      "cross": 1,
-     "weight": 0.55,
+     "weight": 0.6,
      "label": "Embrittlement / Super Brittle (5-2-0)"
     },
     {
      "main": 2,
      "cross": 1,
-     "weight": 0.45,
+     "weight": 0.4,
      "label": "Icicle Impale (0-2-5)"
     }
    ],
@@ -198,7 +200,7 @@
    "score": 84.0,
    "role": "MOAB stall, income outside CHIMPS",
    "status": "Strong utility",
-   "crosspath_note": "Maim/Cripple; Elite Sniper outside CHIMPS",
+   "crosspath_note": "Top path (index 0): Maim MOAB t4 / Cripple MOAB t5 -- the MOAB/DDT/BAD stall answer. Bottom path (index 2): Full Auto t4 / Elite Defender t5 -- a ramping end-of-track shredder that IS strong in CHIMPS for BAD/DDT cleanup (the old 'income Elite Sniper' caveat is the top-path money read, not this).",
    "partners": [
     "village",
     "alchemist"
@@ -209,14 +211,14 @@
     {
      "main": 0,
      "cross": 1,
-     "weight": 0.7,
+     "weight": 0.65,
      "label": "Maim / Cripple MOAB (4-2-0)"
     },
     {
      "main": 2,
      "cross": 0,
-     "weight": 0.3,
-     "label": "Full Auto line (2-0-4)"
+     "weight": 0.35,
+     "label": "Full Auto / Elite Defender (0-0-4/5)"
     }
    ],
    "placement": {
@@ -475,22 +477,22 @@
    "score": 95.0,
    "role": "buff/debuff",
    "status": "S-tier support",
-   "crosspath_note": "401/420 brew; Perishing for debuff",
+   "crosspath_note": "The team buff is the MIDDLE path (index 1): Berserker Brew t4, Permanent Brew t5. Top path (index 0) is money/convert (Lead-to-Gold, Total Transformation) -- worthless in CHIMPS; only its tier-2 Acidic Mixture Dip matters, as a lead crosspath.",
    "partners": [],
    "avoid_for": "Solo popping",
-   "notes": "Brew is one of the most universal value engines.",
+   "notes": "Brew is one of the most universal value engines -- but only from the middle path. Aim tier 5 (Permanent Brew) on long games so the buff is map-wide and permanent.",
    "builds": [
     {
-     "main": 0,
-     "cross": 1,
+     "main": 1,
+     "cross": 0,
      "weight": 0.6,
-     "label": "Berserker Brew (4-2-0)"
+     "label": "Berserker / Permanent Brew (0-4/5-0)"
     },
     {
-     "main": 0,
+     "main": 1,
      "cross": 2,
      "weight": 0.4,
-     "label": "Berserker Brew (4-0-1)"
+     "label": "Berserker Brew (0-4-1)"
     }
    ],
    "placement": {
@@ -1021,6 +1023,17 @@
    "tests": "Cleanup, anti-regrow, camo",
    "answers": "Embrittle, Glue, Necromancer, Ring of Fire, Sabotage",
    "notes": "Layer management matters."
+  },
+  {
+   "rounds": [
+    76,
+    78
+   ],
+   "threat": "First DDT wave",
+   "kind": "ddt",
+   "tests": "Camo + lead + black + speed",
+   "answers": "MIB, Ninja, Sabotage, PoD, Impale, Sniper",
+   "notes": "DDTs first arrive at 76, not 90 -- DDT-grade camo+lead coverage must be online by then. Same wave is also the dense-ceramic entry above; both kinds apply."
   },
   {
    "rounds": [

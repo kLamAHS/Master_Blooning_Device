@@ -133,6 +133,15 @@ def simulate(genome, solutions, rng, track=None, quirk_carry=None,
             return 52 + rng.randint(0, 14)
     if not answers(genome, solutions, "ceramic", 61, cap=4):
         return 63 + rng.randint(0, 15)
+    # First DDT wave: real BTD6 spawns DDTs (camo+lead+black+fast) at round 76,
+    # not 90 -- so DDT-grade camo/lead coverage must be online by then. This
+    # wall is satisfied by the SAME upgrade the moab@39 check already forces
+    # (ninja[1,4]/spike[1,4] answer both), so it is a REGRESSION GUARD that a
+    # future change can't silently let DDT scheduling slip back to r90; it adds
+    # no new difficulty today. The behavioural fix lives in the planner: the
+    # r76 ddt threat (meta_knowledge.json) pulls the DDT deadline to r74.
+    if walls.get("ddt76", True) and not answers(genome, solutions, "ddt", 76):
+        return 76 + rng.randint(0, 4)
     # r78 milestone: the denser ceramic wave demands the defense be MOSTLY
     # online by r76 -- a WHEN check (timing), distinct from the r85 total.
     if walls.get("milestone", True):
@@ -383,10 +392,13 @@ def main():
                          "(isolate the support-synergy lever)")
     ap.add_argument("--no-milestone-wall", action="store_true",
                     help="disable the r78 timing milestone wall")
+    ap.add_argument("--no-ddt76-wall", action="store_true",
+                    help="disable the r76 first-DDT timing guard wall")
     args = ap.parse_args()
     walls = {"opener": not args.no_opener_wall,
              "synergy": not args.no_synergy_wall,
-             "milestone": not args.no_milestone_wall}
+             "milestone": not args.no_milestone_wall,
+             "ddt76": not args.no_ddt76_wall}
     if args.deploy:
         total_w = total_g = solved = 0
         for seed in range(args.seeds):

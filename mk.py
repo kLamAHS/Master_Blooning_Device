@@ -376,25 +376,45 @@ def preprocess_round_crop(img):
     return cv2.bitwise_not(thresh)
 
 
-def parse_round(text):
-    """'13/40' -> 13. Returns None when the text doesn't look like a round."""
+def parse_round(text, total=None):
+    """'13/40' -> 13. Returns None when the text doesn't look like a round.
+
+    `total` (the map's final round, e.g. 100) rescues the common failure that
+    makes a perfectly VISIBLE counter read as "dark": the '/' between the
+    current round and the total is faint, so tesseract drops it or reads it as
+    a digit and '34/100' fuses into '34100' / '341100'. That parses to a >200
+    number -> None -> the bot thinks the HUD went dark and stops advancing its
+    plan (the field complaint: it can't prep for late game because it "lost"
+    the counter). When the fused digits end with the known total, strip it
+    (and one stray separator glyph) and re-read the head as the current round."""
     text = text.strip()
     if "/" in text:
         text = text.split("/", 1)[0]
     digits = "".join(ch for ch in text if ch.isdigit())
-    if digits and 1 <= int(digits) <= 200:
+    if not digits:
+        return None
+    if 1 <= int(digits) <= 200:
         return int(digits)
+    if total is not None:
+        ts = str(int(total))
+        if len(digits) > len(ts) and digits.endswith(ts):
+            head = digits[:-len(ts)]
+            for cand in (head, head[:-1]):     # allow one misread '/' glyph
+                if cand and 1 <= int(cand) <= 200:
+                    return int(cand)
     return None
 
 
-def read_round(screen, cfg):
-    """Returns (parsed_round_or_None, raw_text, crop_img, processed_img)."""
+def read_round(screen, cfg, total=None):
+    """Returns (parsed_round_or_None, raw_text, crop_img, processed_img).
+    `total` is the map's final round (e.g. 100); it lets parse_round recover a
+    counter whose '/' faded and fused 'current/total' into one long number."""
     crop = screen.grab(cfg["round_box"])
     processed = preprocess_round_crop(crop)
     text = pytesseract.image_to_string(
         processed,
         config="--psm 7 -c tessedit_char_whitelist=0123456789/").strip()
-    return parse_round(text), text, crop, processed
+    return parse_round(text, total=total), text, crop, processed
 
 
 # Freeplay pushes past a beaten mode, so its round counter is a bare number
@@ -428,10 +448,41 @@ def save_config_value(key, value):
 # estimate what a plan will need in total.
 # ---------------------------------------------------------------------------
 
-PRICES_PATH = Path(__file__).parent / "prices.json"
-PRICES = json.loads(PRICES_PATH.read_text()) if PRICES_PATH.exists() else {}
 PRICE_DIFFICULTY = "medium"      # set from the plan's mode when playing
 PRICES_SRC = {}                  # key -> "buy" | "seen" | "short" (session)
+
+# Shipped, accurate BTD6 upgrade/base costs keyed EXACTLY like PRICES
+# ("{difficulty}:{tower}[:{path}:{tier}]", e.g. "hard:dart:2:3"). Read-only and
+# kept SEPARATE from the learned prices.json: it is a FALLBACK the game can
+# never misread. Two uses -- (1) fill a price we never learned or that a panel
+# failed to read (price_of / PRICES.get below), so an affordability/spend/
+# reserve decision always has the real cost; (2) validate a live read
+# (record_price below) so a misread can't poison the book. CHIMPS shares the
+# "hard" column (1.08x).
+SEED_PRICES_PATH = Path(__file__).parent / "tower_prices.json"
+SEED_PRICES = (json.loads(SEED_PRICES_PATH.read_text())
+               if SEED_PRICES_PATH.exists() else {})
+
+
+class _PriceBook(dict):
+    """The learned price book, with the shipped seed baked into .get() as a
+    read-only fallback: every existing PRICES.get(price_key(...)) call now
+    resolves learned -> seed -> default with NO call-site change, so a price a
+    panel misread or never showed still comes back as the real BTD6 cost.
+    Writes (record_price) and json.dumps still see only the learned entries, so
+    seeds never leak into prices.json."""
+
+    def get(self, key, default=None):
+        v = dict.get(self, key)
+        if v is not None:
+            return v
+        s = SEED_PRICES.get(key)
+        return s if s is not None else default
+
+
+PRICES_PATH = Path(__file__).parent / "prices.json"
+PRICES = _PriceBook(json.loads(PRICES_PATH.read_text())
+                    if PRICES_PATH.exists() else {})
 
 # Upgrades you haven't unlocked with XP. The bot must NOT press these --
 # doing so spends your limited XP. Auto-detected (an affordable press that
@@ -441,12 +492,24 @@ PRICES_SRC = {}                  # key -> "buy" | "seen" | "short" (session)
 LOCKED_PATH = Path(__file__).parent / "locked.json"
 LOCKED = json.loads(LOCKED_PATH.read_text()) if LOCKED_PATH.exists() else {}
 
+# When you've unlocked every upgrade with XP, the auto-lock detector is pure
+# downside: a single tier that fails to buy for some OTHER reason (a misread
+# price, a panel that didn't open, a cash hiccup) gets mis-recorded as
+# XP-locked and the bot then refuses that path forever. `--no-locks` turns the
+# whole mechanism off -- nothing is ever treated as locked and nothing new is
+# ever recorded -- for accounts that have everything unlocked.
+IGNORE_LOCKS = False
+
 
 def is_locked(ttype, path_i, tier):
+    if IGNORE_LOCKS:
+        return False
     return bool(LOCKED.get(price_key(ttype, path_i, tier)))
 
 
 def mark_locked(ttype, path_i, tier):
+    if IGNORE_LOCKS:
+        return
     key = price_key(ttype, path_i, tier)
     if not LOCKED.get(key):
         LOCKED[key] = True
@@ -458,16 +521,62 @@ def price_key(*parts):
     return ":".join([PRICE_DIFFICULTY, *map(str, parts)])
 
 
+def price_of(*parts):
+    """The price to ESTIMATE with: a verified learned value if we have one,
+    else the shipped seed, else None (learned > seed > None). Spend tracking,
+    reserve, and plan math read through here (and through PRICES.get), so a
+    price the panel misread or never showed still resolves to the real BTD6
+    cost. NOT for the press/no-press gates -- see learned_price."""
+    key = price_key(*parts)
+    v = PRICES.get(key)
+    return v if v is not None else SEED_PRICES.get(key)
+
+
+def learned_price(*parts):
+    """The VERIFIED learned price ONLY (no seed fallback), for the press/no-
+    press affordability GATES. The seed is an ESTIMATE and can OVER-state the
+    real cost (a Monkey Village discount aura -- which is active in CHIMPS -- a
+    stacked discount, or a stale/high shipped entry); gating a press on that
+    over-statement would make the bot refuse to buy, and over-save for, a tier
+    the panel would actually sell it. Unlearned -> None -> the gate is skipped
+    and the tower panel verifies affordability by press-and-check, exactly as
+    before seeds existed. The seed still sharpens spend/reserve/plan math."""
+    return dict.get(PRICES, price_key(*parts))
+
+
+# A verified purchase can legitimately differ from the shipped guide -- a
+# Monkey Village discount aura (active in CHIMPS), a balance patch the guide
+# predates -- so a cash-verified 'buy' is trusted to TEACH a new price within a
+# wide sanity band (outside it, the delta is a corrupted cash read, not a real
+# cost). An UNVERIFIED OCR read (green 'seen' / red 'short') is the opposite: it
+# can never beat the guide, which by definition can't be misread, so when a
+# seed exists an unverified read is ignored -- only a real purchase updates a
+# seeded price. This is what keeps a clip/dupe/neighbor-row misread from ever
+# shadowing the accurate guide, while still letting the book learn true costs.
+SEED_BUY_LO = 0.5      # a verified buy below this * seed is a cash-misread delta
+SEED_BUY_HI = 2.0      # ...above this too; between, trust it (discount/patch)
+
+
 def record_price(key, cost, src="buy"):
-    """Persist a learned price -- with poison filters: every real BTD6
-    price is a multiple of 5, and deltas computed from corrupted cash
-    reads almost never are. Implausibly huge costs are rejected too.
-    src tags provenance: 'buy' (cash-verified) / 'seen' (green panel) /
+    """Persist a learned price. Poison filters: a real BTD6 price is a multiple
+    of 5 (a corrupted cash delta almost never is) and never absurdly huge. When
+    a shipped seed exists for this key, an UNVERIFIED read (src != 'buy') is
+    ignored -- the guide can't be misread, so only a cash-verified purchase may
+    update it, and only within a wide sanity band (outside it the delta came
+    from a bad cash read). src: 'buy' (cash-verified) / 'seen' (green panel) /
     'short' (red panel -- unverified, eligible for a re-check)."""
     if cost is None or cost <= 0 or cost > 120000:
         return
     if cost % 5 != 0:              # every real BTD6 price ends in 0 or 5
         return
+    seed = SEED_PRICES.get(key)
+    if seed:
+        if src != "buy":
+            return                 # unverified read never overrides the guide
+        if not (SEED_BUY_LO * seed <= cost <= SEED_BUY_HI * seed):
+            dbg(f"      (buy delta ${int(cost)} for {key} rejected: wildly "
+                f"off the ${seed} guide -- corrupted cash read, keeping it)")
+            return
     cost = int(cost)
     PRICES_SRC[key] = src
     if PRICES.get(key) != cost:
@@ -571,13 +680,15 @@ def _round_box_from_ocr(screen):
     return None
 
 
-def read_round_stable(screen, cfg, tries=4):
+def read_round_stable(screen, cfg, tries=4, total=None):
     """Return a round value only if two consecutive reads agree -- a
     misaligned crop produces flickery garbage that never repeats reliably,
-    so this filters out the lucky-junk reads that fooled earlier versions."""
+    so this filters out the lucky-junk reads that fooled earlier versions.
+    `total` (the HUD's "/100") is forwarded so a faded separator doesn't make
+    a visible counter unreadable (see parse_round)."""
     prev = None
     for _ in range(tries):
-        value, *_ = read_round(screen, cfg)
+        value, *_ = read_round(screen, cfg, total=total)
         if value is not None and value == prev:
             return value
         prev = value
@@ -2164,6 +2275,11 @@ def act_upgrade(screen, cfg, action, tower=None, timeout=8):
             if info:
                 state, seen_price = info
                 if state == "xp":
+                    if IGNORE_LOCKS:
+                        # Everything is unlocked, so an 'xp' row can only be a
+                        # MISREAD -- don't block the path, just retry it.
+                        status = "unread"
+                        break
                     status = "locked"          # already recorded by reader
                     break
                 if state == "short":
@@ -2181,7 +2297,7 @@ def act_upgrade(screen, cfg, action, tower=None, timeout=8):
                 if state == "unread":
                     status = "unread"          # can't be sure: don't press
                     break
-            known = PRICES.get(pkey) if pkey else None
+            known = dict.get(PRICES, pkey) if pkey else None   # gate: learned
             cash = read_cash(screen, cfg)           # raw: for the buy delta
             # Affordability is decided on the FLOOR-protected value, not the
             # raw read: a clipped '$1' misread would otherwise fake a "broke"
@@ -2237,11 +2353,22 @@ def act_upgrade(screen, cfg, action, tower=None, timeout=8):
                     status = broke_status(after if after is not None else cash,
                                            info[1] if info else known)
                     break
-                # No visual info and an affordable press moved nothing:
-                # the safety net -- treat as locked and stop pressing.
-                if tower:
-                    mark_locked(ttype, i, tier)
-                status = "locked"
+                # No visual info and an affordable press moved nothing: the
+                # safety net. Normally that IS an XP lock -- record it and stop
+                # touching the path. But with --no-locks the account has
+                # everything unlocked, so a no-move press is a transient hiccup
+                # (a cash misread, a dropped keypress), NOT a lock: report it as
+                # broke so the caller retries later instead of blocking the path
+                # for the whole run (the "randomly blocks it for no reason"
+                # complaint).
+                if IGNORE_LOCKS:
+                    status = broke_status(
+                        after if after is not None else cash,
+                        info[1] if info else known)
+                else:
+                    if tower:
+                        mark_locked(ttype, i, tier)
+                    status = "locked"
                 break
             # Multi-tier buys: refresh this row so the NEXT tier's state
             # (new price / new XP wall) is read before another press.
@@ -2939,7 +3066,7 @@ def run_episode(screen, cfg, genome, final_round, abort_lives=50,
         f"lives={read_lives(screen, cfg)}")
 
     try:
-        from meta import choose_buy, earned_by
+        from meta import choose_buy, earned_by, round_supported_by_cash
     except ImportError:                       # no brain: old greedy rule
         def choose_buy(q, _round, _cash, _cost, now, emergency=False,
                        gate_ok=None):
@@ -2949,8 +3076,16 @@ def run_episode(screen, cfg, genome, final_round, abort_lives=50,
         def earned_by(_r, _mode="standard"):  # no income model available
             return 0
 
+        def round_supported_by_cash(*_a, **_k):   # no curve: never veto
+            return True
+
     queue = list(genome)
     landed_by_ref, towers = {}, {}
+    # ref -> a human tower tag ("druid#2(carry)"), from the genome's place
+    # entries, so an upgrade buy (whose queue item carries only ref+path) can
+    # still name its tower in the saving logs even before it is placed.
+    ref_name = {g["ref"]: (g.get("name") or g.get("tower", "?"))
+                for g in genome if g.get("do") == "place" and "ref" in g}
     # Spots a probe caught a monkey sitting on (a tower we didn't track, or
     # one whose real position drifted from where we recorded it). Grown by
     # act_place and fed back into every placement so no buy keeps clicking a
@@ -3067,7 +3202,8 @@ def run_episode(screen, cfg, genome, final_round, abort_lives=50,
         we were on before buying; on hard/CHIMPS that can leak before the
         hero/carry is even placed."""
         nonlocal place_i
-        start_round = read_round_stable(screen, cfg, tries=3) or 1
+        start_round = read_round_stable(
+            screen, cfg, tries=3, total=None if FREEPLAY else 100) or 1
         # Openers we can't place THIS pass (unaffordable now, or a transient
         # miss) are set aside, not allowed to block the rest: a free hero
         # must never be stranded behind a carry we can't yet afford -- that
@@ -3083,7 +3219,7 @@ def run_episode(screen, cfg, genome, final_round, abort_lives=50,
                 break
             item = queue[idx]
             ttype = item["tower"].lower()
-            base = PRICES.get(price_key(ttype))
+            base = learned_price(ttype)        # gate: verified price only
             cash = sane_cash()
             if base and cash is not None and cash < base:
                 skipped.add(id(item))          # can't afford yet: try others
@@ -3145,7 +3281,7 @@ def run_episode(screen, cfg, genome, final_round, abort_lives=50,
             if is_locked(ttype, pi, tier):
                 queue.pop(idx)
                 continue
-            known = PRICES.get(price_key(ttype, pi, tier))
+            known = learned_price(ttype, pi, tier)   # gate: verified price only
             cash = sane_cash()
             if known is not None and cash is not None and cash < known:
                 break          # can't afford the cheapest due tier: start now
@@ -3179,11 +3315,18 @@ def run_episode(screen, cfg, genome, final_round, abort_lives=50,
     blind_since = None            # when the counter went continuously dark
     hud_dark_since = None         # when the WHOLE HUD (lives too) went dark
     last_blind_recovery = 0.0     # throttle for clear/recalibrate attempts
+    blind_building = [False]      # keep-building-while-blind latch (log once)
+    saving_toward = [None]        # last "saving toward X" note (log once)
     outcome = "hud_lost"
     while True:
         unpause_if_needed(screen, cfg)        # cheap; a paused game shows
         recalibrate_cash_if_stuck()           # broken box -> re-find, not freeze
-        value, *_ = read_round(screen, cfg)   # a frozen-but-visible counter
+        # Pass the HUD total (BTD6 shows "round/100" for standard & CHIMPS) so
+        # a faded '/' that fuses "34/100" into "34100" is recovered instead of
+        # reading as a dark counter and freezing the plan. Freeplay's counter
+        # is a bare number past 100, so no total there.
+        value, *_ = read_round(screen, cfg,
+                               total=None if FREEPLAY else 100)
         prev_lives = lives
         lives = read_lives(screen, cfg)
         if lives is not None and lives > 0:
@@ -3208,9 +3351,39 @@ def run_episode(screen, cfg, genome, final_round, abort_lives=50,
                 # (a one-frame garbage read won't repeat) and it is within a
                 # bounded forward jump under the mode cap, so the bot catches
                 # back up instead of declaring hud_lost on a readable counter.
-                dbg(f"counter re-synced after {misreads} misses: "
-                    f"round {last_round} -> {value}")
-                accepted = value
+                #
+                # But a BIG jump is cross-checked against the wallet: in CHIMPS
+                # you can only be at round r if you've earned its cumulative
+                # pop-cash, so a jump the money provably can't support is a
+                # COUNTER misread, not real progress (the field failure:
+                # 27 -> 50 on ~$1k, which then inflated the income floor and
+                # coasted the run to death). Reject it and keep the old round.
+                #
+                # The check needs a cash figure. A fresh confirmed read is
+                # best, but late-game the box is often momentarily unreadable
+                # at the exact re-sync instant -- and when it returned None the
+                # check saw `cash=None`, defaulted to TRUST, and let the phantom
+                # 27 -> 50 latch anyway (ep-18: no veto fired, then every later
+                # frame read the correct ~$2k but got overridden by the phantom
+                # round-50 income floor). Fall back to the PROVABLE floor
+                # (confirmed-minus-spend, seeded at episode start so it's set
+                # mid-game): floor + spent is a real lower bound on cumulative
+                # earnings that does NOT depend on the suspect new round, so a
+                # jump the money can't have earned is still vetoed with no fresh
+                # read. Only truly unknown cash (floor never seeded, very early)
+                # leaves the counter trusted -- and no +8 jumps happen that early.
+                xcheck_cash = read_cash_confirmed(screen, cfg)
+                if xcheck_cash is None:
+                    xcheck_cash = cash_floor.value
+                if value - last_round >= 8 and not round_supported_by_cash(
+                        value, xcheck_cash, cash_floor.spent, mode):
+                    dbg(f"counter read {value} rejected: the cash on hand "
+                        f"can't support round {value} in CHIMPS -- likely a "
+                        f"misread, holding round {last_round}")
+                else:
+                    dbg(f"counter re-synced after {misreads} misses: "
+                        f"round {last_round} -> {value}")
+                    accepted = value
             prev_read = value
         if accepted is None:
             if detect_panel_side(screen):
@@ -3348,6 +3521,23 @@ def run_episode(screen, cfg, genome, final_round, abort_lives=50,
                             ent["path"][pi] + 1))
                 return known or it.get("est")
 
+            def _saving_desc(it):
+                """Human tag for a pending buy that ALWAYS names the tower: a
+                placement reads as the tower name ('tack#1(carry)'), an upgrade
+                as 'druid#2(carry) path3 t4'. Upgrade queue items carry only
+                ref+path, so the tower name comes from the placed entry when it
+                is down, else from the genome's ref->name map -- never a bare
+                'path3 t4' with no tower."""
+                if it.get("do") == "place":
+                    return it.get("name") or it.get("tower", "?")
+                pi = it["path"].index(1) if 1 in it.get("path", []) else 0
+                lnd = landed_by_ref.get(it.get("ref"))
+                ent = towers.get(tuple(lnd)) if lnd else None
+                name = (ent.get("name") if ent else None) \
+                    or ref_name.get(it.get("ref"), "?")
+                tier = (ent["path"][pi] + 1) if ent else "?"
+                return f"{name} path{pi + 1} t{tier}"
+
             def _gate_ok(it):
                 """Conditional buys: support bases gated on the carry
                 being stable (main path at the gate tier). Overrides
@@ -3470,7 +3660,20 @@ def run_episode(screen, cfg, genome, final_round, abort_lives=50,
                 return nb
 
             cash_now = sane_cash()
-            rush = time.time() < emergency_until[0]
+            # Blind-but-alive: the counter is stuck so last_round is frozen,
+            # and the round-gated schedule would FREEZE the whole build for the
+            # blind stretch -- the field failure was reading cleanly to ~r27,
+            # going blind, and reaching round 50 with only ~12 buys made and a
+            # bare board that the MOAB rounds walk through. So while blind keep
+            # BUILDING on the provable cash floor: drop the round gate and buy
+            # any affordable pending defense in schedule order, so the board
+            # grows through the blind stretch instead of stalling.
+            blind_build = (misreads >= 8 and lives is not None and lives > 0)
+            if blind_build and not blind_building[0]:
+                dbg("counter blind but alive -- building on the cash floor, "
+                    "not freezing the plan")
+            blind_building[0] = blind_build
+            rush = time.time() < emergency_until[0] or blind_build
             try:
                 idx = choose_buy(queue, last_round, cash_now, _cost_of,
                                  time.time(), emergency=rush,
@@ -3485,10 +3688,30 @@ def run_episode(screen, cfg, genome, final_round, abort_lives=50,
                                  time.time(), emergency=rush)
             item = queue[idx] if idx is not None else None
             if item is None:
-                pass                           # all pending buys cooling down
+                # Every wallet held: choose_buy is RESERVING cash for the
+                # scheduled head buy (or waiting for its round). Say what we're
+                # saving toward so a held wallet is never silent about its goal.
+                head = next((it for it in queue
+                             if it.get("round", 0) <= (last_round or 0)), None) \
+                    or min(queue, key=lambda it: (it.get("round", 0),
+                                                  it.get("prio", 1)),
+                           default=None)
+                goal = _cost_of(head) if head is not None else None
+                msg = None
+                if head is not None and cash_now is not None and goal:
+                    if cash_now < goal:
+                        msg = (f"saving toward {_saving_desc(head)} "
+                               f"(${cash_now}/${goal})")
+                    elif head.get("round", 0) > (last_round or 0):
+                        msg = (f"holding ${cash_now} -- next buy "
+                               f"{_saving_desc(head)} opens round "
+                               f"{head['round']}")
+                if msg and saving_toward[0] != msg:
+                    saving_toward[0] = msg
+                    dbg(msg)
             elif item["do"] == "place":
                 ttype = item["tower"].lower()
-                base = PRICES.get(price_key(ttype))
+                base = learned_price(ttype)        # gate: verified price only
                 cash = sane_cash()
                 if base and cash is not None and cash < base:
                     msg = f"{ttype}: saving up (${cash}/${base})"
@@ -3593,10 +3816,11 @@ def run_episode(screen, cfg, genome, final_round, abort_lives=50,
                     elif entry and pi in entry.get("closed_paths", []):
                         dbg(f"{tname} path{pi + 1}: closed, skip")
                         queue.pop(idx)         # path closed on this tower
-                    elif (known := PRICES.get(price_key(ttype, pi, tier))) \
+                    elif (known := learned_price(ttype, pi, tier)) \
                             and (cash := sane_cash()) is not None \
                             and cash < known:
-                        # Known price, can't afford: no menu, just sleep
+                        # VERIFIED price (gate: learned only, never a possibly
+                        # over-stated seed), can't afford: no menu, just sleep
                         # this item and let income build.
                         msg = (f"{tname} path{pi + 1} t{tier}: saving "
                                f"(${cash}/${known})")
@@ -4897,8 +5121,8 @@ def cmd_play(args):
                     st = act_upgrade(screen, cfg, action, entry)
                     if st == "broke" and entry and 1 in action["path"]:
                         pi = action["path"].index(1)
-                        need = PRICES.get(price_key(
-                            entry["tower"].lower(), pi, entry["path"][pi] + 1))
+                        need = learned_price(          # wait target: verified
+                            entry["tower"].lower(), pi, entry["path"][pi] + 1)
                         if need:
                             wait_for_cash(screen, cfg, need, timeout=90)
                             act_upgrade(screen, cfg, action, entry)
@@ -4964,6 +5188,9 @@ def main():
     sub.add_parser("watch", help="debug the round-counter OCR")
     p_play = sub.add_parser("play", help="execute a gameplan")
     p_play.add_argument("plan", help="path to a plan .json file")
+    p_play.add_argument("--no-locks", action="store_true", dest="no_locks",
+                        help="you've unlocked every upgrade with XP: never "
+                             "treat a tier as XP-locked")
     p_play.add_argument("-q", "--quiet", action="store_true",
                         help="suppress per-decision debug output")
     p_scan = sub.add_parser(
@@ -5023,6 +5250,9 @@ def main():
                         dest="no_abilities",
                         help="don't press ability hotkeys on threat "
                              "rounds")
+    p_farm.add_argument("--no-locks", action="store_true", dest="no_locks",
+                        help="you've unlocked every upgrade with XP: never "
+                             "treat a tier as XP-locked")
     p_farm.add_argument("-q", "--quiet", action="store_true",
                         help="suppress per-decision debug output")
     p_solve = sub.add_parser(
@@ -5073,6 +5303,10 @@ def main():
                               "rounds")
     p_solve.add_argument("--pool", choices=["classic", "full"],
                          default="full")
+    p_solve.add_argument("--no-locks", action="store_true", dest="no_locks",
+                         help="you've unlocked every upgrade with XP: never "
+                              "treat a tier as XP-locked (stops a stray buy "
+                              "failure from blocking a path for the run)")
     p_solve.add_argument("-q", "--quiet", action="store_true",
                          help="suppress per-decision debug output")
     p_deploy = sub.add_parser(
@@ -5115,6 +5349,9 @@ def main():
                                "rounds")
     p_deploy.add_argument("--pool", choices=["classic", "full"],
                           default="full")
+    p_deploy.add_argument("--no-locks", action="store_true", dest="no_locks",
+                          help="you've unlocked every upgrade with XP: never "
+                               "treat a tier as XP-locked")
     p_deploy.add_argument("-q", "--quiet", action="store_true",
                           help="suppress per-decision debug output")
     sub.add_parser(
@@ -5147,8 +5384,12 @@ def main():
                          help="open the dashboard in a browser when done")
     args = parser.parse_args()
     print(f"btd6_bot build {BUILD}")
-    global DEBUG
+    global DEBUG, IGNORE_LOCKS
     DEBUG = not getattr(args, "quiet", False)
+    IGNORE_LOCKS = getattr(args, "no_locks", False)
+    if IGNORE_LOCKS:
+        print("      (--no-locks: XP-lock detection OFF -- every upgrade "
+              "treated as unlocked)")
     {"locate": cmd_locate, "watch": cmd_watch,
      "play": cmd_play, "scan": cmd_scan, "farm": cmd_farm,
      "solve": cmd_solve, "deploy": cmd_deploy, "campaign": cmd_campaign,

@@ -170,6 +170,93 @@ def main():
     check(f"the one-life opener gets early teeth (prio-0 upgrade by r9) "
           f"({early_teeth}/{opener_seen})", early_teeth >= 0.8 * opener_seen)
 
+    # --- opener build ROTATION: a line that keeps leaking the opening must
+    #     not be retried forever -- the bot should try a different one -------
+    def leak_row(main_path, final_round=8):
+        path = [0, 0, 0]
+        path[main_path] = 2
+        return {"map": "m", "difficulty": "hard", "mode": "solve",
+                "game_mode": "chimps", "target_round": 100, "start_round": 6,
+                "final_round": final_round, "outcome": "defeat",
+                "towers": [{"tower": "dart", "name": "dart#0(opener)",
+                            "at": [0.4, 0.5], "path": path}]}
+
+    def opener_main_dist(br, n=30):
+        rng2 = random.Random(1)
+        from collections import Counter
+        return Counter(br._pick_build(rng2, "dart", follow_template=True)[0]
+                       for _ in range(n))
+
+    base = brain(mode="chimps", start=6)
+    top_main = opener_main_dist(base).most_common(1)[0][0]      # dart's default
+    rot = brain(mode="chimps", start=6)
+    for _ in range(4):
+        rot.observe(leak_row(top_main), quiet=True)             # it keeps leaking
+    dist = opener_main_dist(rot)
+    check(f"opener rotates OFF a build line that keeps leaking "
+          f"(default main {top_main}; after 4 leaks -> {dict(dist)})",
+          dist.get(top_main, 0) <= 0.5 * sum(dist.values()))
+    # leak the next line too -> it moves on again, never back to the first
+    second = dist.most_common(1)[0][0]
+    for _ in range(4):
+        rot.observe(leak_row(second), quiet=True)
+    dist2 = opener_main_dist(rot)
+    check(f"a second leaking line is also abandoned "
+          f"(-> {dict(dist2)})",
+          dist2.most_common(1)[0][0] not in (top_main, second))
+    # a fresh brain with NO leak history is unchanged (still the meta default)
+    check("no leak history -> opener build is unchanged (the meta default)",
+          opener_main_dist(brain(mode="chimps", start=6)).most_common(1)[0][0]
+          == top_main)
+
+    # --- opener TOWER rotation: when a whole tower's lines keep leaking, try
+    #     a different tower (dart -> tack -> ice), never gamble the cold start
+    from meta import _OPENER_ROSTER                       # noqa: E402
+
+    def tower_leak_row(tower, main, final_round=8):
+        path = [0, 0, 0]
+        path[main] = 2
+        return {"map": "m", "difficulty": "hard", "mode": "solve",
+                "game_mode": "chimps", "target_round": 100, "start_round": 6,
+                "final_round": final_round, "outcome": "defeat",
+                "towers": [{"tower": tower, "name": f"{tower}#0(opener)",
+                            "at": [0.4, 0.5], "path": path}]}
+
+    def opener_tower(br):
+        rng2 = random.Random(1)
+        roster = [t for t in _OPENER_ROSTER
+                  if t in K["towers"] and K["towers"][t].get("builds")]
+        from collections import Counter
+        return Counter(br._pick_opener(rng2, roster)
+                       for _ in range(30)).most_common(1)[0][0]
+
+    check("cold start opens with dart (the reliable round-6 holder)",
+          opener_tower(brain(mode="chimps", start=6)) == "dart")
+    check("ice is NOT an opener (it's a Super Brittle support, added later)",
+          "ice" not in _OPENER_ROSTER)
+    rt = brain(mode="chimps", start=6)
+    for _ in range(3):
+        rt.observe(tower_leak_row("dart", 2), quiet=True)
+    for _ in range(3):
+        rt.observe(tower_leak_row("dart", 1), quiet=True)
+    check("dart leaking on two lines rotates the opener to another popper",
+          opener_tower(rt) != "dart")
+    for _ in range(3):
+        rt.observe(tower_leak_row("tack", 2), quiet=True)
+    for _ in range(3):
+        rt.observe(tower_leak_row("tack", 0), quiet=True)
+    check("dart AND tack leaking rotates the opener onward (to boomerang)",
+          opener_tower(rt) not in ("dart", "tack"))
+    # a tower that HELD the opening is not abandoned over earlier leaks
+    held = brain(mode="chimps", start=6)
+    for _ in range(3):
+        held.observe(tower_leak_row("dart", 2), quiet=True)
+    for _ in range(3):
+        held.observe(tower_leak_row("dart", 1), quiet=True)
+    held.observe(tower_leak_row("dart", 2, final_round=45), quiet=True)  # held
+    check("a tower that once HELD stays the opener (not abandoned)",
+          opener_tower(held) == "dart")
+
     print()
     if _fails:
         print(f"FAILED {len(_fails)} case(s): {', '.join(_fails)}")
