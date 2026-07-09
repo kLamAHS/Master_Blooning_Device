@@ -3027,7 +3027,7 @@ def _selftest():
                     return True
             return False
         cstats = {"camo": 0, "lead": 0, "ceramic": 0, "ddt": 0,
-                  "bad": 0, "endgame": 0}
+                  "bad": 0, "ddt76": 0, "endgame": 0}
         for i in range(20):
             g = bc.next_genome(rng, 5, tpools, tower_pool=pool,
                                track=track, hero=True)
@@ -3039,9 +3039,15 @@ def _selftest():
             cstats["ceramic"] += covered_by(g, "ceramic", 61, cap=4)
             cstats["ddt"] += covered_by(g, "ddt", 88)
             cstats["bad"] += covered_by(g, "bad", 98)
+            # DDTs first arrive at r76 (not 90): the r76 ddt threat must pull
+            # the DDT answer's deadline in so it is scheduled BY ~r74, not
+            # discovered at r88. Locks the timing fix against regression.
+            cstats["ddt76"] += covered_by(g, "ddt", 74)
         for kind in ("camo", "lead", "ceramic", "ddt", "bad"):
             assert cstats[kind] >= 19, \
                 f"chimps genomes missing {kind} coverage: {cstats}"
+        assert cstats["ddt76"] >= 19, \
+            f"chimps DDT answer not scheduled by r74 (first DDTs): {cstats}"
         assert cstats["endgame"] >= 12, \
             f"chimps plans must schedule into the endgame: {cstats}"
 

@@ -1026,6 +1026,17 @@
   },
   {
    "rounds": [
+    76,
+    78
+   ],
+   "threat": "First DDT wave",
+   "kind": "ddt",
+   "tests": "Camo + lead + black + speed",
+   "answers": "MIB, Ninja, Sabotage, PoD, Impale, Sniper",
+   "notes": "DDTs first arrive at 76, not 90 -- DDT-grade camo+lead coverage must be online by then. Same wave is also the dense-ceramic entry above; both kinds apply."
+  },
+  {
+   "rounds": [
     80
    ],
    "threat": "ZOMG",
