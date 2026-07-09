@@ -3311,6 +3311,7 @@ def run_episode(screen, cfg, genome, final_round, abort_lives=50,
     hud_dark_since = None         # when the WHOLE HUD (lives too) went dark
     last_blind_recovery = 0.0     # throttle for clear/recalibrate attempts
     blind_building = [False]      # keep-building-while-blind latch (log once)
+    saving_toward = [None]        # last "saving toward X" note (log once)
     outcome = "hud_lost"
     while True:
         unpause_if_needed(screen, cfg)        # cheap; a paused game shows
@@ -3499,6 +3500,20 @@ def run_episode(screen, cfg, genome, final_round, abort_lives=50,
                             ent["path"][pi] + 1))
                 return known or it.get("est")
 
+            def _saving_desc(it):
+                """Human tag for a pending buy: a placement reads as the tower
+                name ('tack#1(carry)'), an upgrade as 'druid#2(carry) path3 t4'
+                -- the same shape as the per-item saving logs, so the
+                reservation note reads consistently."""
+                name = it.get("name") or it.get("tower", "?")
+                if it.get("do") == "place":
+                    return name
+                pi = it["path"].index(1) if 1 in it.get("path", []) else 0
+                lnd = landed_by_ref.get(it.get("ref"))
+                ent = towers.get(tuple(lnd)) if lnd else None
+                tier = (ent["path"][pi] + 1) if ent else "?"
+                return f"{name} path{pi + 1} t{tier}"
+
             def _gate_ok(it):
                 """Conditional buys: support bases gated on the carry
                 being stable (main path at the gate tier). Overrides
@@ -3649,7 +3664,27 @@ def run_episode(screen, cfg, genome, final_round, abort_lives=50,
                                  time.time(), emergency=rush)
             item = queue[idx] if idx is not None else None
             if item is None:
-                pass                           # all pending buys cooling down
+                # Every wallet held: choose_buy is RESERVING cash for the
+                # scheduled head buy (or waiting for its round). Say what we're
+                # saving toward so a held wallet is never silent about its goal.
+                head = next((it for it in queue
+                             if it.get("round", 0) <= (last_round or 0)), None) \
+                    or min(queue, key=lambda it: (it.get("round", 0),
+                                                  it.get("prio", 1)),
+                           default=None)
+                goal = _cost_of(head) if head is not None else None
+                msg = None
+                if head is not None and cash_now is not None and goal:
+                    if cash_now < goal:
+                        msg = (f"saving toward {_saving_desc(head)} "
+                               f"(${cash_now}/${goal})")
+                    elif head.get("round", 0) > (last_round or 0):
+                        msg = (f"holding ${cash_now} -- next buy "
+                               f"{_saving_desc(head)} opens round "
+                               f"{head['round']}")
+                if msg and saving_toward[0] != msg:
+                    saving_toward[0] = msg
+                    dbg(msg)
             elif item["do"] == "place":
                 ttype = item["tower"].lower()
                 base = learned_price(ttype)        # gate: verified price only
