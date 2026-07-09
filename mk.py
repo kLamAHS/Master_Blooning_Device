@@ -3358,9 +3358,25 @@ def run_episode(screen, cfg, genome, final_round, abort_lives=50,
                 # COUNTER misread, not real progress (the field failure:
                 # 27 -> 50 on ~$1k, which then inflated the income floor and
                 # coasted the run to death). Reject it and keep the old round.
+                #
+                # The check needs a cash figure. A fresh confirmed read is
+                # best, but late-game the box is often momentarily unreadable
+                # at the exact re-sync instant -- and when it returned None the
+                # check saw `cash=None`, defaulted to TRUST, and let the phantom
+                # 27 -> 50 latch anyway (ep-18: no veto fired, then every later
+                # frame read the correct ~$2k but got overridden by the phantom
+                # round-50 income floor). Fall back to the PROVABLE floor
+                # (confirmed-minus-spend, seeded at episode start so it's set
+                # mid-game): floor + spent is a real lower bound on cumulative
+                # earnings that does NOT depend on the suspect new round, so a
+                # jump the money can't have earned is still vetoed with no fresh
+                # read. Only truly unknown cash (floor never seeded, very early)
+                # leaves the counter trusted -- and no +8 jumps happen that early.
+                xcheck_cash = read_cash_confirmed(screen, cfg)
+                if xcheck_cash is None:
+                    xcheck_cash = cash_floor.value
                 if value - last_round >= 8 and not round_supported_by_cash(
-                        value, read_cash_confirmed(screen, cfg),
-                        cash_floor.spent, mode):
+                        value, xcheck_cash, cash_floor.spent, mode):
                     dbg(f"counter read {value} rejected: the cash on hand "
                         f"can't support round {value} in CHIMPS -- likely a "
                         f"misread, holding round {last_round}")

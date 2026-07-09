@@ -169,6 +169,25 @@ def main():
     check("unknown cash is never vetoed",
           round_supported_by_cash(50, None, 6185, "chimps"))
 
+    # The ep-18 fix: at the re-sync instant the live confirmed read was None,
+    # so the check saw cash=None, DIDN'T veto, and the phantom 27->50 latched.
+    # The caller now falls back to the PROVABLE floor (confirmed-minus-spend)
+    # when the fresh read is None -- floor + spent is a real lower bound on
+    # earnings that does NOT depend on the suspect new round, so the SAME jump
+    # that slips through on None is correctly vetoed on the floor. This mirrors
+    # `xcheck_cash = read_cash_confirmed(...) or cash_floor.value` in run_episode.
+    g = CashFloor(income_model=lambda r: {49: 34559}.get(r, 0))
+    g.confirm(2400)                 # last good read was ~$2.4k (really round 27)
+    g.spend(6185)                   # provable floor now 0; spent tracked at 6185
+    check("None confirm alone leaves the phantom jump un-vetoed (the old bug)",
+          round_supported_by_cash(50, None, g.spent, "chimps"))
+    check("...but the provable floor as fallback vetoes it (the fix)",
+          not round_supported_by_cash(50, g.value, g.spent, "chimps"))
+    # A real, SMALL catch-up jump still passes on the same stale floor, because
+    # the loose 0.4 tolerance scales with the (much smaller) jump target.
+    check("a real small catch-up jump still passes on a stale floor",
+          round_supported_by_cash(30, g.value, g.spent, "chimps"))
+
     # --- stuck(): a BROKEN box (constant low read) is distinguished from the
     # odd intermittent misread, so the caller can recalibrate not freeze. -----
     f = CashFloor(income_model=income_model)
